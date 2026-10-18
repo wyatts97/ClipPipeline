@@ -1,0 +1,238 @@
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
+import { cn } from "cn"
+import { useCallback, useEffect, useMemo, useState } from "react"
+import { Link } from "react-router"
+import { toast } from "sonner"
+
+import { ClipThumb } from "@/components/clip-thumb"
+import { Status } from "@/components/status"
+import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
+import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
+import { Textarea } from "@/components/ui/textarea"
+import { api, type Clip, type ClipStatus } from "@/lib/api"
+import { ago, platformName, sourceLabel, tc } from "@/lib/format"
+import type { Platform } from "@/lib/api"
+
+type Draft = Pick<Clip, "title" | "hook" | "description_tiktok" | "description_instagram">
+
+const draftOf = (c: Clip): Draft => ({
+  title: c.title ?? "", hook: c.hook ?? "",
+  description_tiktok: c.description_tiktok ?? "", description_instagram: c.description_instagram ?? "",
+})
+
+function platformOf(url: string | null): Platform {
+  if (!url) return "other"
+  if (url.includes("twitch.tv")) return "twitch"
+  if (url.includes("youtu")) return "youtube"
+  if (url.includes("kick.com")) return "kick"
+  return "other"
+}
+
+export function ReviewPage() {
+  const [status, setStatus] = useState<ClipStatus>("pending")
+  const clips = useQuery({
+    queryKey: ["clips", status],
+    queryFn: () => api.clips(status),
+    refetchInterval: status === "pending" ? 10_000 : false,
+  })
+  const items = useMemo(() => clips.data?.items ?? [], [clips.data])
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  const selected = items.find((c) => c.id === selectedId) ?? items[0] ?? null
+  const index = selected ? items.indexOf(selected) : -1
+
+  const move = useCallback((delta: number) => {
+    if (!items.length) return
+    const next = items[Math.min(items.length - 1, Math.max(0, index + delta))]
+    setSelectedId(next.id)
+  }, [items, index])
+
+  return (
+    <div className="mx-auto flex max-w-7xl min-w-0 flex-col gap-6">
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h1 className="text-2xl font-semibold tracking-tight">Review</h1>
+        <Tabs value={status} onValueChange={(v) => { setStatus(v as ClipStatus); setSelectedId(null) }}>
+          <TabsList>
+            <TabsTrigger value="pending">Needs review</TabsTrigger>
+            <TabsTrigger value="approved">Approved</TabsTrigger>
+            <TabsTrigger value="rejected">Skipped</TabsTrigger>
+          </TabsList>
+        </Tabs>
+      </div>
+
+      {clips.isPending ? null : !items.length ? (
+        <Empty status={status} />
+      ) : (
+        <div className="grid grid-cols-1 gap-6 lg:grid-cols-[15rem_minmax(0,1fr)_22rem]">
+          <ClipList items={items} selected={selected} onSelect={setSelectedId} />
+          {selected && <Station key={selected.id} clip={selected} onNext={() => move(1)} onPrev={() => move(-1)}
+            isLast={index === items.length - 1} />}
+        </div>
+      )}
+    </div>
+  )
+}
+
+function Empty({ status }: { status: ClipStatus }) {
+  return (
+    <div className="rounded-md border border-dashed border-border px-6 py-16 text-center">
+      {status === "pending" ? (
+        <>
+          <p className="text-lg">You're caught up</p>
+          <p className="mt-2 text-sm text-muted-foreground">
+            Clips appear here as soon as OpenShorts finishes them. Pick moments to clip in <Link to="/scans" className="text-primary hover:underline">Scans</Link>.
+          </p>
+        </>
+      ) : (
+        <p className="text-sm text-muted-foreground">No {status === "approved" ? "approved" : "skipped"} clips yet.</p>
+      )}
+    </div>
+  )
+}
+
+function ClipList({ items, selected, onSelect }: { items: Clip[]; selected: Clip | null; onSelect: (id: string) => void }) {
+  return (
+    <ol className="flex gap-2 overflow-x-auto pb-2 lg:max-h-[calc(100vh-11rem)] lg:flex-col lg:overflow-x-visible lg:overflow-y-auto lg:pr-1 lg:pb-0">
+      {items.map((clip, i) => (
+        <li key={clip.id} className="shrink-0">
+          <button onClick={() => onSelect(clip.id)} aria-current={clip.id === selected?.id}
+            className={cn("flex w-56 items-center gap-3 rounded-md border p-2 text-left transition-colors lg:w-full",
+              clip.id === selected?.id ? "border-primary bg-accent" : "border-transparent hover:bg-accent/60")}>
+            <ClipThumb clip={clip} className="w-12 shrink-0" showDuration={false} />
+            <span className="min-w-0">
+              <span className="line-clamp-2 text-sm">{clip.title || `Clip ${i + 1}`}</span>
+              <span className="mt-1 block text-xs text-muted-foreground timecode">{tc(clip.duration)}</span>
+            </span>
+          </button>
+        </li>
+      ))}
+    </ol>
+  )
+}
+
+function isTyping(target: EventTarget | null) {
+  const el = target as HTMLElement | null
+  return !!el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable)
+}
+
+function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => void; onPrev: () => void; isLast: boolean }) {
+  const qc = useQueryClient()
+  const [draft, setDraft] = useState<Draft>(() => draftOf(clip))
+  const dirty = JSON.stringify(draft) !== JSON.stringify(draftOf(clip))
+  const pending = clip.status === "pending"
+
+  const refresh = () => {
+    qc.invalidateQueries({ queryKey: ["clips"] })
+    qc.invalidateQueries({ queryKey: ["overview"] })
+  }
+  const save = useMutation({
+    mutationFn: () => api.editClip(clip.id, draft),
+    onSuccess: () => { toast.success("Saved"); refresh() },
+  })
+  const decide = useMutation({
+    mutationFn: async (decision: "approve" | "reject") => {
+      if (dirty) await api.editClip(clip.id, draft)
+      return api.decide(clip.id, decision)
+    },
+    onSuccess: (res, decision) => {
+      if (decision === "approve") {
+        const file = res.message?.match(/approved\/\S+/)?.[0]
+        toast.success("Approved", { description: file ? `Saved as ${file}` : undefined })
+      }
+      else toast("Skipped", { description: "Moved to rejected/." })
+      if (!isLast) onNext()
+      refresh()
+    },
+  })
+
+  useEffect(() => {
+    function onKey(e: KeyboardEvent) {
+      if (isTyping(e.target) || e.metaKey || e.ctrlKey || e.altKey) return
+      const k = e.key.toLowerCase()
+      if (k === "j" || e.key === "ArrowDown") { e.preventDefault(); onNext() }
+      else if (k === "k" || e.key === "ArrowUp") { e.preventDefault(); onPrev() }
+      else if (pending && k === "a" && !decide.isPending) decide.mutate("approve")
+      else if (pending && k === "s" && !decide.isPending) decide.mutate("reject")
+    }
+    window.addEventListener("keydown", onKey)
+    return () => window.removeEventListener("keydown", onKey)
+  }, [onNext, onPrev, pending, decide])
+
+  const field = (key: keyof Draft) => ({
+    value: draft[key] ?? "",
+    onChange: (e: React.ChangeEvent<HTMLInputElement | HTMLTextAreaElement>) => setDraft({ ...draft, [key]: e.target.value }),
+  })
+
+  return (
+    <>
+      <div className="flex justify-center rounded-md bg-black/40 p-3">
+        <video key={clip.id} src={clip.video_url} controls autoPlay playsInline
+          className="aspect-[9/16] max-h-[calc(100vh-13rem)] w-auto max-w-full rounded-sm bg-black" />
+      </div>
+
+      <div className="space-y-5">
+        <div className="space-y-1.5 text-sm">
+          <Status status={clip.status} />
+          <p className="text-muted-foreground">
+            {platformName[platformOf(clip.source_url)]}{" "}
+            {clip.source_url ? (
+              <a href={clip.source_url} target="_blank" rel="noreferrer" className="text-foreground hover:underline">
+                {sourceLabel(clip.source_url)}
+              </a>
+            ) : "–"}
+            {clip.range && <span className="ml-2 timecode">{tc(clip.range.start)}–{tc(clip.range.end)}</span>}
+          </p>
+          <p className="text-muted-foreground">
+            From <Link to={`/jobs/${clip.job_id}`} className="text-foreground hover:underline">job {clip.job_id}</Link>,
+            finished {ago(clip.created)}
+          </p>
+        </div>
+
+        <div className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="title">Title</Label>
+            <Input id="title" {...field("title")} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="hook">Hook text on the video</Label>
+            <Input id="hook" {...field("hook")} />
+            <p className="text-xs text-muted-foreground">Already burned into this render; editing it updates the saved metadata.</p>
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="tiktok">TikTok caption</Label>
+            <Textarea id="tiktok" rows={3} {...field("description_tiktok")} />
+          </div>
+          <div className="space-y-1.5">
+            <Label htmlFor="instagram">Instagram caption</Label>
+            <Textarea id="instagram" rows={3} {...field("description_instagram")} />
+          </div>
+          {dirty && !pending && (
+            <Button variant="outline" onClick={() => save.mutate()} disabled={save.isPending}>Save changes</Button>
+          )}
+        </div>
+
+        {pending && (
+          <div className="space-y-2 border-t border-border pt-5">
+            <div className="flex gap-2">
+              <Button className="flex-1 bg-success text-[#08140d] hover:bg-success/85" disabled={decide.isPending}
+                onClick={() => decide.mutate("approve")}>
+                Approve <Kbd>A</Kbd>
+              </Button>
+              <Button variant="outline" className="flex-1" disabled={decide.isPending} onClick={() => decide.mutate("reject")}>
+                Skip <Kbd>S</Kbd>
+              </Button>
+            </div>
+            <p className="text-xs text-muted-foreground">
+              {dirty ? "Your edits are saved first. " : ""}J and K move between clips.
+            </p>
+          </div>
+        )}
+      </div>
+    </>
+  )
+}
+
+function Kbd({ children }: { children: React.ReactNode }) {
+  return <kbd className="ml-1.5 rounded-sm border border-current/30 px-1 font-mono text-[10px] opacity-70">{children}</kbd>
+}

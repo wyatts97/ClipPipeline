@@ -1,4 +1,4 @@
-# ClipPipeline (phase 1)
+# ClipPipeline
 
 Send a stream VOD or video link to your Telegram bot. OpenShorts cuts it into vertical clips with
 captions and a hook line, and each clip comes back to Telegram as a preview with **✅ Post / ❌ Skip**
@@ -9,6 +9,9 @@ You don't have to find the good parts yourself: `/scan <VOD>` reads the chat rep
 viewer clips, and sends the stream's top moments with **🎬 Clip it** buttons. `/watch <channel>` does
 that automatically every time a stream ends.
 
+The **web dashboard** (`http://<server-ip>:8090`) shows what the machine is doing, lets you review and
+edit clips at a desk, start and retry jobs, pick moments on a scan's timeline, and read errors.
+
 ```
  You (Telegram) ──► Cloudflare Tunnel ──► n8n ──► clipbot ──► OpenShorts (Whisper + Gemini + ffmpeg)
        ▲                                   │         │
@@ -18,11 +21,11 @@ that automatically every time a stream ends.
 | Service | What it does | Reachable from |
 |---|---|---|
 | `n8n` | Telegram trigger, buttons, the workflow you'll extend | LAN `:5678`; internet only `/webhook/*` via the tunnel |
-| `clipbot` | Parses your messages, scans streams for moments, watches channels, queues jobs, downloads time ranges (yt-dlp), polls OpenShorts, makes Telegram-sized previews, moves files | Docker network only |
+| `clipbot` | Parses your messages, scans streams for moments, watches channels, queues jobs, downloads time ranges (yt-dlp), polls OpenShorts, makes Telegram-sized previews, moves files. Also serves the web dashboard | LAN `:8090` (dashboard, password); Docker network for n8n |
 | `openshorts` | [mutonby/openshorts](https://github.com/mutonby/openshorts) (MIT) at a pinned commit: picks moments, reframes to 9:16, burns captions | Docker network only |
 | `postgres` | n8n's database | Docker network only |
 | Cloudflare Tunnel | Gives Telegram an HTTPS URL without opening ports on your router: your existing `cloudflared` on the host, or the optional `cloudflared` container | outbound only |
-| `dashboard` (optional) | OpenShorts web UI to re-edit clips by hand | LAN `:5175` |
+| `dashboard` (optional) | OpenShorts' own web UI to re-edit clips by hand | LAN `:5175` |
 
 ## What you need
 
@@ -98,7 +101,8 @@ scripts/init-env.sh      # creates .env with random secrets and the data/ folder
 nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME (+ TUNNEL_TOKEN for 4B)
 ```
 
-`PUBLIC_HOSTNAME` is the hostname from step 4 (`clips.example.com`, no `https://`).
+`PUBLIC_HOSTNAME` is the hostname from step 4 (`clips.example.com`, no `https://`). The script also
+prints the generated `DASHBOARD_PASSWORD`; change it in `.env` to anything you like.
 
 ### 6. Build and start
 
@@ -135,6 +139,24 @@ https://www.youtube.com/watch?v=VIDEO_ID 2:00-12:00 clips=2
 ```
 
 You get "👍 Job … queued", later "✅ Job … finished: 2 clip(s)", then one preview per clip with buttons.
+
+### 9. Open the dashboard
+
+`http://<server-ip>:8090`, password `DASHBOARD_PASSWORD` from `.env`. It's only on your LAN: the tunnel
+routes nothing but `/webhook/` to n8n.
+
+## Dashboard
+
+| Page | For |
+|---|---|
+| **Overview** | Clips waiting for you, what OpenShorts is rendering right now (with its latest log line), problems with a one-click fix (retry a job, scan again, resend a Telegram message), the last 7 days and recent activity. The strip at the top is always visible: OpenShorts, queue, Telegram delivery, free disk. |
+| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. |
+| **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
+| **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
+| **Logs & errors** | clipbot's log (errors and warnings by default, click a row for the traceback), Telegram messages that are queued or gave up (send again or delete), and failed n8n runs once `N8N_API_KEY` is set. |
+
+Jobs and scans you start from the dashboard report to your Telegram chat like any other (the first id
+in `ALLOWED_CHAT_IDS`). Signing in lasts 30 days; changing `DASHBOARD_PASSWORD` signs everyone out.
 
 ## Using it
 
@@ -264,7 +286,16 @@ pytest clipbot/tests
 # fake Telegram and OpenShorts. Needs Node 24, ffmpeg and yt-dlp next to that Python.
 npm install -g n8n@2.43.7
 python dev/e2e/run_e2e.py
+
+# Dashboard (clipbot/web: React, Vite, Tailwind, shadcn/ui)
+cd clipbot/web && npm install && npm run build      # what the Docker image does
+python dev/demo/serve.py                            # demo data on :8090, password "demo"
+npm run dev                                         # hot reload on :5173, API proxied to :8080
 ```
+
+`dev/demo/serve.py` seeds jobs, clips, a scored 3-hour scan, log entries and Telegram messages, and
+runs the real API with OpenShorts mocked (`--reseed` starts over). Point `npm run dev` at it with
+`CLIPBOT_DEV_API=http://127.0.0.1:8090 npm run dev`.
 
 ## Next: publishing
 

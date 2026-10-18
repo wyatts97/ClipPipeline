@@ -66,6 +66,19 @@ async def make_preview(src: Path, dst: Path, max_mb: int, height: int) -> Path:
     raise MediaError(f"could not get {src.name} under {max_mb} MB")
 
 
+async def make_thumbnail(src: Path, dst: Path, height: int = 480) -> Path:
+    """A poster frame for the dashboard, one second in (or the first frame of very short clips)."""
+    for seek in ("1", "0"):
+        try:
+            await run(["ffmpeg", "-y", "-v", "error", "-ss", seek, "-i", str(src), "-frames:v", "1",
+                       "-vf", f"scale=-2:{height}", "-q:v", "4", str(dst)], timeout=120)
+        except MediaError:
+            continue
+        if dst.exists() and dst.stat().st_size > 0:
+            return dst
+    raise MediaError(f"no frame could be grabbed from {src.name}")
+
+
 async def download_section(url: str, start: float, end: float, out_dir: Path,
                            cookies: Optional[Path] = None) -> Path:
     """Download only [start, end] of a video with yt-dlp (cuts at the nearest keyframes)."""

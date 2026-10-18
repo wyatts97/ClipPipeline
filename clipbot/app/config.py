@@ -58,6 +58,11 @@ class Settings:
     twitch_client_id: str = ""
     twitch_client_secret: str = ""
     twitch_downloader: str = "TwitchDownloaderCLI"
+    # web dashboard
+    dashboard_password: str = ""
+    n8n_url: str = "http://n8n:5678"
+    n8n_api_key: str = ""
+    web_dir: Path = Path("/app/web")
 
     @property
     def db_path(self) -> Path:
@@ -104,4 +109,8 @@ class Settings:
             twitch_client_id=os.environ.get("TWITCH_CLIENT_ID", "").strip(),
             twitch_client_secret=os.environ.get("TWITCH_CLIENT_SECRET", "").strip(),
             twitch_downloader=os.environ.get("TWITCH_DOWNLOADER", "TwitchDownloaderCLI"),
+            dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
+            n8n_url=os.environ.get("N8N_URL", "http://n8n:5678").rstrip("/"),
+            n8n_api_key=os.environ.get("N8N_API_KEY", "").strip(),
+            web_dir=Path(os.environ.get("CLIPBOT_WEB_DIR", "/app/web")),
         )

@@ -117,9 +117,11 @@ class Pipeline:
         try:
             if job.range_start is not None and job.range_end is not None:
                 self.store.update_job(job.id, status="downloading")
-                log.info("job %s: downloading %s", job.id, range_label(job))
+                log.info("job %s: downloading %s", job.id, range_label(job), extra={"job_id": job.id})
                 source = await media.download_section(job.source_url, job.range_start, job.range_end,
                                                       tmp_dir, self.settings.cookies_file)
+                if self.cancelled(job.id):
+                    return
                 self.store.update_job(job.id, status="submitting")
                 upload_id = await self.openshorts.upload_file(source)
                 os_job = await self.openshorts.process(upload_id=upload_id, options=options)
@@ -127,12 +129,30 @@ class Pipeline:
                 self.store.update_job(job.id, status="submitting")
                 os_job = await self.openshorts.process(url=job.source_url, options=options)
         except (media.MediaError, OpenShortsError, httpx.HTTPError) as e:
-            self.fail(job, str(e) or type(e).__name__)
+            if not self.cancelled(job.id):
+                self.fail(job, str(e) or type(e).__name__)
             return
         finally:
             shutil.rmtree(tmp_dir, ignore_errors=True)
+        if self.cancelled(job.id):
+            log.info("job %s: cancelled; ignoring OpenShorts job %s", job.id, os_job, extra={"job_id": job.id})
+            return
         self.store.update_job(job.id, status="processing", openshorts_job=os_job)
-        log.info("job %s: submitted as OpenShorts job %s", job.id, os_job)
+        log.info("job %s: submitted as OpenShorts job %s", job.id, os_job, extra={"job_id": job.id})
+
+    def cancelled(self, job_id: str) -> bool:
+        job = self.store.get_job(job_id)
+        return job is not None and job.status == "cancelled"
+
+    def cancel(self, job_id: str) -> bool:
+        """Stop a job that hasn't finished. OpenShorts keeps rendering a submitted one; its result
+        is ignored."""
+        job = self.store.get_job(job_id)
+        if not job or job.status not in ("queued", "downloading", "submitting", "processing"):
+            return False
+        self.store.update_job(job_id, status="cancelled", error="Cancelled from the dashboard")
+        log.info("job %s: cancelled from the dashboard", job_id, extra={"job_id": job_id})
+        return True
 
     # ---- polling -----------------------------------------------------------
     async def _poll_all(self) -> None:
@@ -144,7 +164,7 @@ class Pipeline:
         try:
             doc = await self.openshorts.status(job.openshorts_job)
         except (OpenShortsError, httpx.HTTPError) as e:
-            log.warning("job %s: status check failed (%s); will retry", job.id, e)
+            log.warning("job %s: status check failed (%s); will retry", job.id, e, extra={"job_id": job.id})
             return
         if doc is None:
             self.fail(job, "OpenShorts no longer knows this job (its files may have expired).")
@@ -162,7 +182,7 @@ class Pipeline:
     async def collect(self, job: Job, doc: dict[str, Any]) -> None:
         s = self.settings
         results = (doc.get("result") or {}).get("clips") or []
-        pending, previews = s.folder("pending"), s.folder("previews")
+        pending, previews, thumbs = s.folder("pending"), s.folder("previews"), s.folder("thumbs")
         made: list[Clip] = []
         problems: list[str] = []
         for idx, info in enumerate(results):
@@ -181,7 +201,12 @@ class Pipeline:
                 await media.make_preview(master, preview, s.preview_max_mb, s.preview_height)
             except (media.MediaError, OpenShortsError, httpx.HTTPError, OSError) as e:
                 problems.append(f"clip {idx + 1}: {e}")
+                log.warning("job %s: clip %d unusable: %s", job.id, idx + 1, e, extra={"job_id": job.id})
                 continue
+            try:
+                await media.make_thumbnail(master, thumbs / f"{job.id}_{idx}.jpg")
+            except media.MediaError as e:  # the dashboard falls back to the video itself
+                log.warning("job %s: no thumbnail for clip %d: %s", job.id, idx + 1, e, extra={"job_id": job.id})
             meta = {k: info.get(k) for k in (
                 "start", "end", "video_title_for_youtube_short", "video_description_for_tiktok",
                 "video_description_for_instagram", "viral_hook_text")}
@@ -208,10 +233,10 @@ class Pipeline:
                 "approve_data": f"ok:{clip.id}",
                 "skip_data": f"no:{clip.id}",
             })
-        log.info("job %s: collected %d clip(s)", job.id, len(made))
+        log.info("job %s: collected %d clip(s)", job.id, len(made), extra={"job_id": job.id})
 
     def fail(self, job: Job, error: str) -> None:
-        log.warning("job %s failed: %s", job.id, error)
+        log.warning("job %s failed: %s", job.id, error, extra={"job_id": job.id})
         self.store.update_job(job.id, status="failed", error=error[:2000])
         self.store.enqueue_event({"event": "message", "chat_id": job.chat_id,
                                   "text": f"❌ Job {job.id} failed: {error[:3500]}"})

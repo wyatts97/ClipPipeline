@@ -73,6 +73,13 @@ class OpenShorts:
             raise OpenShortsError(f"Upload failed ({resp.status_code}): {_detail(resp)}")
         return upload_id
 
+    async def healthy(self) -> bool:
+        try:
+            resp = await self._client.get(f"{self.base_url}/health", timeout=3)
+            return resp.status_code < 400
+        except httpx.HTTPError:
+            return False
+
     async def status(self, job_id: str) -> Optional[dict[str, Any]]:
         """The job's status document, or None when OpenShorts no longer knows it."""
         resp = await self._client.get(f"{self.base_url}/api/status/{job_id}")

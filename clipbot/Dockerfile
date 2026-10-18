@@ -1,3 +1,11 @@
+# ---- the web dashboard (React + Vite), built to static files ----
+FROM node:24.19.0-alpine AS web
+WORKDIR /web
+COPY web/package.json web/package-lock.json ./
+RUN npm ci --no-audit --no-fund
+COPY web/ ./
+RUN npm run build
+
 FROM python:3.12-slim-trixie
 
 # ffmpeg for previews and loudness, curl for the healthcheck,
@@ -26,8 +34,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "yt-dlp[default]"
 
 COPY app ./app
+COPY --from=web /web/dist ./web
 
 ENV PYTHONUNBUFFERED=1 \
+    CLIPBOT_WEB_DIR=/app/web \
     CLIPBOT_DATA_DIR=/data \
     HOME=/data/.home \
     XDG_CACHE_HOME=/data/.cache

@@ -1,0 +1,132 @@
+@import "tailwindcss";
+@import "tw-animate-css";
+@import "shadcn/tailwind.css";
+@import "@fontsource/ibm-plex-sans/400.css";
+@import "@fontsource/ibm-plex-sans/500.css";
+@import "@fontsource/ibm-plex-sans/600.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+
+@custom-variant dark (&:is(.dark *));
+
+/*
+ * ClipPipeline: an edit bay, not a SaaS admin.
+ * Slate panels, warm paper text, amber for "your move" (actions, in/out selection),
+ * tally red and program green only for state. The heat scale (indigo -> magenta -> amber)
+ * is reserved for the scan timeline.
+ */
+:root,
+.dark {
+  --background: #161a21;
+  --foreground: #e6e2d8;
+  --card: #1d222b;
+  --card-foreground: #e6e2d8;
+  --popover: #232935;
+  --popover-foreground: #e6e2d8;
+  --primary: #f2a541;
+  --primary-foreground: #1a1206;
+  --secondary: #262c37;
+  --secondary-foreground: #e6e2d8;
+  --muted: #232935;
+  --muted-foreground: #9aa3ae;
+  --accent: #2a313d;
+  --accent-foreground: #f1ede4;
+  --destructive: #e5484d;
+  --success: #3dd68c;
+  --border: #2c3340;
+  --input: #343c4a;
+  --ring: #f2a541;
+  --chart-1: #3b2f8f;
+  --chart-2: #7b3fa0;
+  --chart-3: #c2387b;
+  --chart-4: #e8664a;
+  --chart-5: #f2a541;
+  --radius: 0.375rem;
+  --sidebar: #12151b;
+  --sidebar-foreground: #c9c5bb;
+  --sidebar-primary: #f2a541;
+  --sidebar-primary-foreground: #1a1206;
+  --sidebar-accent: #1f242d;
+  --sidebar-accent-foreground: #f1ede4;
+  --sidebar-border: #232935;
+  --sidebar-ring: #f2a541;
+}
+
+@theme inline {
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-heading: var(--font-sans);
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --color-background: var(--background);
+  --color-foreground: var(--foreground);
+  --color-card: var(--card);
+  --color-card-foreground: var(--card-foreground);
+  --color-popover: var(--popover);
+  --color-popover-foreground: var(--popover-foreground);
+  --color-primary: var(--primary);
+  --color-primary-foreground: var(--primary-foreground);
+  --color-secondary: var(--secondary);
+  --color-secondary-foreground: var(--secondary-foreground);
+  --color-muted: var(--muted);
+  --color-muted-foreground: var(--muted-foreground);
+  --color-accent: var(--accent);
+  --color-accent-foreground: var(--accent-foreground);
+  --color-destructive: var(--destructive);
+  --color-success: var(--success);
+  --color-border: var(--border);
+  --color-input: var(--input);
+  --color-ring: var(--ring);
+  --color-chart-1: var(--chart-1);
+  --color-chart-2: var(--chart-2);
+  --color-chart-3: var(--chart-3);
+  --color-chart-4: var(--chart-4);
+  --color-chart-5: var(--chart-5);
+  --color-sidebar: var(--sidebar);
+  --color-sidebar-foreground: var(--sidebar-foreground);
+  --color-sidebar-primary: var(--sidebar-primary);
+  --color-sidebar-primary-foreground: var(--sidebar-primary-foreground);
+  --color-sidebar-accent: var(--sidebar-accent);
+  --color-sidebar-accent-foreground: var(--sidebar-accent-foreground);
+  --color-sidebar-border: var(--sidebar-border);
+  --color-sidebar-ring: var(--sidebar-ring);
+  --radius-sm: calc(var(--radius) * 0.66);
+  --radius-md: var(--radius);
+  --radius-lg: calc(var(--radius) * 1.33);
+  --radius-xl: calc(var(--radius) * 2);
+}
+
+@layer base {
+  * {
+    @apply border-border outline-ring/50;
+  }
+  html {
+    @apply font-sans;
+    font-size: 15px;
+    -webkit-font-smoothing: antialiased;
+  }
+  body {
+    @apply bg-background text-foreground;
+    font-feature-settings: "tnum" 1;  /* timecodes and counts line up */
+  }
+  button:not(:disabled),
+  [role="button"]:not(:disabled) {
+    cursor: pointer;
+  }
+  ::selection {
+    background: color-mix(in oklab, var(--primary) 35%, transparent);
+  }
+}
+
+@layer utilities {
+  .timecode {
+    font-variant-numeric: tabular-nums;
+    letter-spacing: 0.01em;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

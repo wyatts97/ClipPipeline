@@ -1,8 +1,11 @@
-"""HTTP API that n8n calls. Only reachable on the Docker network.
+"""clipbot's HTTP server.
 
+For n8n (X-Clipbot-Token):
 POST /messages   {chat_id, text}  -> {reply}           a Telegram text message
 POST /decisions  {chat_id, data}  -> {toast, reply}    a button press (ok:/no: clips, sc: moments)
 GET  /previews/{clip_id}                               the small preview n8n sends to Telegram
+
+For the browser (DASHBOARD_PASSWORD login): /api/* (dashboard.py) and the dashboard itself at /.
 GET  /health
 """
 from __future__ import annotations
@@ -14,9 +17,10 @@ from pathlib import Path
 from typing import Optional
 
 from fastapi import Depends, FastAPI, Header, HTTPException
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
+from . import dashboard, logbook
 from .config import Settings
 from .openshorts import OpenShorts
 from .parsing import format_timestamp, parse_message
@@ -59,6 +63,7 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = Store(settings.db_path)
+        log_handler = logbook.install(store)
         client = openshorts or OpenShorts(settings.openshorts_url)
         pipeline = pipeline_factory(settings, store, client)
         scout = Scout(settings, store, pipeline)
@@ -75,9 +80,12 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
                 await scout.stop()
                 await pipeline.stop()
             await client.aclose()
+            logbook.uninstall(log_handler)
             store.close()
 
     app = FastAPI(title="clipbot", lifespan=lifespan)
+    app.state.settings = settings
+    app.include_router(dashboard.router)
 
     def require_token(x_clipbot_token: Optional[str] = Header(default=None)) -> None:
         expected = settings.notify_token
@@ -108,6 +116,23 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
         if not clip or not clip.preview_path or not Path(clip.preview_path).is_file():
             raise HTTPException(status_code=404, detail="no preview for this clip")
         return FileResponse(clip.preview_path, media_type="video/mp4", filename=f"{clip_id}.mp4")
+
+    web_dir = settings.web_dir.resolve()
+
+    @app.get("/{path:path}", include_in_schema=False)
+    async def web(path: str):
+        """The dashboard: built files from clipbot/web, index.html for every client-side route."""
+        if path.startswith("api/"):
+            raise HTTPException(404, "No such endpoint.")
+        target = (web_dir / path).resolve()
+        if path and target.is_file() and web_dir in target.parents:
+            cache = "public, max-age=31536000, immutable" if path.startswith("assets/") else "no-cache"
+            return FileResponse(target, headers={"Cache-Control": cache})
+        index = web_dir / "index.html"
+        if index.is_file():
+            return FileResponse(index, headers={"Cache-Control": "no-cache"})
+        return HTMLResponse("<p>The dashboard isn't built. Rebuild the clipbot image: "
+                            "<code>docker compose build clipbot</code></p>", status_code=404)
 
     return app
 

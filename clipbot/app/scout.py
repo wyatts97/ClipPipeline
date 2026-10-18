@@ -22,7 +22,7 @@ from .config import Settings
 from .media import MediaError
 from .parsing import format_timestamp as ts
 from .platforms import Channel, LatestVod, Vod, detect_channel, detect_vod, latest_vod, timestamp_link
-from .scoring import Moment, StreamSignals, find_moments
+from .scoring import Moment, StreamSignals, find_moments, score, timeline
 from .store import Scan, Store, Watch
 
 log = logging.getLogger("clipbot.scout")
@@ -127,13 +127,15 @@ class Scout:
             title = info.get("title") or scan.source_url
             self.store.update_scan(scan.id, title=title, duration=duration)
 
-            sig, notes = await self.gather(vod, info, duration, work)
+            sig, notes = await self.gather(vod, info, duration, work, scan.id)
             if not (sig.messages or sig.loudness_db or sig.markers or sig.heatmap):
                 raise ScanError("no signal could be read (" + "; ".join(notes) + ").")
+            scored = score(sig)
             moments = find_moments(sig, top=s.scan_top, before=s.scan_before_seconds,
-                                   after=s.scan_after_seconds)
+                                   after=s.scan_after_seconds, scored=scored)
+            self.store.save_timeline(scan.id, timeline(sig, *scored))
         except (ScanError, MediaError, httpx.HTTPError, KeyError, ValueError) as e:
-            log.warning("scan %s failed: %s", scan.id, e)
+            log.warning("scan %s failed: %s", scan.id, e, extra={"scan_id": scan.id})
             self.store.update_scan(scan.id, status="failed", error=str(e)[:2000])
             self._event(scan.chat_id, f"❌ Scan {scan.id} failed: {str(e)[:3000]}")
             return
@@ -148,15 +150,19 @@ class Scout:
         self._event(scan.chat_id, head + f"\nTop {len(moments)} moment(s) below. 🎬 clips one; "
                                          "▶️ opens the VOD there so you can check first.")
         for rank, m in enumerate(moments, 1):
-            row = self.store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score)
+            row = self.store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info={
+                "chat_ratio": m.chat_ratio, "loud": m.loud, "clips": m.clips,
+                "clip_views": m.clip_views, "replayed": m.replayed, "top_tokens": m.top_tokens})
             self.store.enqueue_event({
                 "event": "choice", "chat_id": scan.chat_id, "text": moment_text(rank, vod, m),
                 "buttons": [{"text": "🎬 Clip it", "data": f"sc:{row.id}:1"},
                             {"text": "➕ Wider ×2", "data": f"sc:{row.id}:2"}],
             })
-        log.info("scan %s: %d moment(s) from %s", scan.id, len(moments), ", ".join(notes))
+        log.info("scan %s: %d moment(s) from %s", scan.id, len(moments), ", ".join(notes),
+                 extra={"scan_id": scan.id})
 
-    async def gather(self, vod: Vod, info: dict, duration: float, work) -> tuple[StreamSignals, list[str]]:
+    async def gather(self, vod: Vod, info: dict, duration: float, work,
+                     scan_id: Optional[str] = None) -> tuple[StreamSignals, list[str]]:
         """Collect every signal this platform offers; a failing one is noted, not fatal."""
         s = self.settings
         tasks: dict[str, asyncio.Future] = {}
@@ -180,7 +186,7 @@ class Scout:
         notes = []
         for name, result in results.items():
             if isinstance(result, BaseException):
-                log.warning("scan signal %s failed: %s", name, result)
+                log.warning("scan signal %s failed: %s", name, result, extra={"scan_id": scan_id})
                 notes.append(f"{name} unavailable ({str(result)[:120]})")
             elif name == "chat":
                 sig.messages = result

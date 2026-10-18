@@ -4,3 +4,6 @@ vendor/
 __pycache__/
 .pytest_cache/
 roadmap.md
+clipbot/web/node_modules/
+clipbot/web/dist/
+dev/demo/.data/

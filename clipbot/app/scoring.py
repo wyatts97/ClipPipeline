@@ -211,9 +211,29 @@ def top_tokens(messages: Sequence[ChatMessage], start: float, end: float, k: int
     return [(forms[key].most_common(1)[0][0], c) for key, c in counts.most_common(k) if c >= 3]
 
 
+def timeline(sig: StreamSignals, scores: Sequence[float], parts: dict[str, list[float]],
+             max_points: int = 1200) -> dict:
+    """The score and each signal, downsampled for the dashboard chart. Each point is the max of
+    its group, so short peaks survive the downsampling."""
+    n = len(scores)
+    group = max(1, math.ceil(n / max_points))
+
+    def pool(values: Sequence[float]) -> list[float]:
+        return [round(max(values[i:i + group]), 2) for i in range(0, n, group)]
+
+    series = {"score": pool(scores)}
+    for key, name in (("z_uniq", "chat"), ("z_hype", "hype"), ("z_audio", "audio"),
+                      ("clips", "clips"), ("z_heat", "replayed")):
+        if key in parts and any(parts[key]):
+            series[name] = pool(parts[key])
+    return {"step": BUCKET * group, "duration": sig.duration, "series": series,
+            "markers": [{"t": m.t, "duration": m.duration, "views": m.views} for m in sig.markers[:500]]}
+
+
 def find_moments(sig: StreamSignals, top: int = 5, before: float = 90, after: float = 45,
-                 min_score: float = 1.5) -> list[Moment]:
-    scores, parts = score(sig)
+                 min_score: float = 1.5,
+                 scored: Optional[tuple[list[float], dict[str, list[float]]]] = None) -> list[Moment]:
+    scores, parts = scored or score(sig)
     order = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)
     picked: list[float] = []
     moments: list[Moment] = []

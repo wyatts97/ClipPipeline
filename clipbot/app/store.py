@@ -1,4 +1,4 @@
-"""SQLite state: jobs, clips and an outbox of events for n8n.
+"""SQLite state: jobs, clips, scans, watches, the dashboard's log and an outbox of events for n8n.
 
 Everything survives a restart: unfinished jobs are picked up again and
 undelivered events are retried.
@@ -26,7 +26,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     openshorts_job TEXT,
     error TEXT,
     created REAL NOT NULL,
-    updated REAL NOT NULL
+    updated REAL NOT NULL,
+    retry_of TEXT
 );
 CREATE TABLE IF NOT EXISTS clips (
     id TEXT PRIMARY KEY,
@@ -61,7 +62,8 @@ CREATE TABLE IF NOT EXISTS moments (
     start REAL NOT NULL,
     end REAL NOT NULL,
     score REAL NOT NULL,
-    job_id TEXT
+    job_id TEXT,
+    info TEXT
 );
 CREATE TABLE IF NOT EXISTS watches (
     id TEXT PRIMARY KEY,
@@ -81,7 +83,27 @@ CREATE TABLE IF NOT EXISTS outbox (
     next_try REAL NOT NULL,
     dead INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS logs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts REAL NOT NULL,
+    level TEXT NOT NULL,
+    source TEXT NOT NULL,
+    message TEXT NOT NULL,
+    job_id TEXT,
+    scan_id TEXT,
+    detail TEXT
+);
+CREATE INDEX IF NOT EXISTS logs_ts ON logs(ts);
+CREATE TABLE IF NOT EXISTS scan_timelines (
+    scan_id TEXT PRIMARY KEY,
+    data TEXT NOT NULL
+);
 """
+
+# Columns added after the first release; created on older databases at startup.
+MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"))
+LOG_KEEP_DAYS = 14
+LOG_KEEP_ROWS = 20000
 
 # queued -> downloading -> submitting -> processing -> done | failed
 ACTIVE_STATUSES = ("queued", "downloading", "submitting", "processing")
@@ -100,6 +122,7 @@ class Job:
     error: Optional[str]
     created: float
     updated: float
+    retry_of: Optional[str] = None
 
 
 @dataclass
@@ -141,6 +164,11 @@ class MomentRow:
     end: float
     score: float
     job_id: Optional[str]
+    info: Optional[str] = None   # JSON: chat_ratio, loud, clips, top_tokens, ...
+
+    @property
+    def details(self) -> dict[str, Any]:
+        return json.loads(self.info) if self.info else {}
 
 
 @dataclass
@@ -169,21 +197,28 @@ class Store:
         self._lock = threading.Lock()
         with self._lock:
             self._db.executescript(SCHEMA)
+            for table, column, decl in MIGRATIONS:
+                have = {r["name"] for r in self._db.execute(f"PRAGMA table_info({table})")}
+                if column not in have:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        self._log_inserts = 0
 
     def close(self) -> None:
         self._db.close()
 
     # ---- jobs ------------------------------------------------------------
     def create_job(self, chat_id: int, source_url: str, range_start: Optional[float],
-                   range_end: Optional[float], target_clips: int) -> Job:
+                   range_end: Optional[float], target_clips: int,
+                   retry_of: Optional[str] = None) -> Job:
         now = time.time()
         job = Job(new_id(), chat_id, source_url, range_start, range_end, target_clips,
-                  "queued", None, None, now, now)
+                  "queued", None, None, now, now, retry_of)
         with self._lock:
             self._db.execute(
-                "INSERT INTO jobs VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO jobs (id, chat_id, source_url, range_start, range_end, target_clips, "
+                "status, openshorts_job, error, created, updated, retry_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.chat_id, job.source_url, job.range_start, job.range_end,
-                 job.target_clips, job.status, None, None, now, now))
+                 job.target_clips, job.status, None, None, now, now, retry_of))
         return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -203,6 +238,29 @@ class Store:
             rows = self._db.execute(
                 f"SELECT * FROM jobs WHERE status IN ({marks}) ORDER BY created", statuses).fetchall()
         return [Job(**dict(r)) for r in rows]
+
+    def list_jobs(self, status: Optional[str] = None, limit: int = 100) -> list[Job]:
+        sql, args = "SELECT * FROM jobs", []
+        if status:
+            sql, args = sql + " WHERE status=?", [status]
+        with self._lock:
+            rows = self._db.execute(sql + " ORDER BY created DESC LIMIT ?", (*args, limit)).fetchall()
+        return [Job(**dict(r)) for r in rows]
+
+    def count_by_status(self, table: str, since: float = 0) -> dict[str, int]:
+        assert table in ("jobs", "scans", "clips")
+        ts = "decided" if table == "clips" else "created"
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT status, COUNT(*) AS n FROM {table} WHERE COALESCE({ts}, 0) >= ? GROUP BY status",
+                (since,)).fetchall()
+        return {r["status"]: r["n"] for r in rows}
+
+    def retried(self, job_id: str) -> Optional[Job]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM jobs WHERE retry_of=? ORDER BY created DESC LIMIT 1",
+                                   (job_id,)).fetchone()
+        return Job(**dict(row)) if row else None
 
     def recent_jobs(self, chat_id: int, limit: int = 5) -> list[Job]:
         with self._lock:
@@ -237,6 +295,22 @@ class Store:
         data = dict(row)
         data["meta"] = json.loads(data["meta"] or "{}")
         return Clip(**data)
+
+    def list_clips(self, status: Optional[str] = None, limit: int = 200) -> list[Clip]:
+        sql, args = "SELECT id FROM clips", []
+        if status:
+            sql, args = sql + " WHERE status=?", [status]
+        order = (" ORDER BY rowid ASC" if status == "pending"
+                 else " ORDER BY COALESCE(decided, 0) DESC, rowid DESC")
+        with self._lock:
+            ids = [r["id"] for r in self._db.execute(sql + order + " LIMIT ?", (*args, limit))]
+        return [c for c in (self.get_clip(i) for i in ids) if c]
+
+    def update_clip_text(self, clip_id: str, title: Optional[str], hook: Optional[str],
+                         meta: dict[str, Any]) -> None:
+        with self._lock:
+            self._db.execute("UPDATE clips SET title=?, hook=?, meta=? WHERE id=?",
+                             (title, hook, json.dumps(meta), clip_id))
 
     def clips_for_job(self, job_id: str) -> list[Clip]:
         with self._lock:
@@ -284,13 +358,31 @@ class Store:
                 (chat_id, limit)).fetchall()
         return [Scan(**dict(r)) for r in rows]
 
-    def add_moment(self, scan_id: str, rank: int, peak: float, start: float, end: float,
-                   score: float) -> MomentRow:
-        row = MomentRow(new_id(), scan_id, rank, peak, start, end, score, None)
+    def list_scans(self, limit: int = 100) -> list[Scan]:
         with self._lock:
-            self._db.execute("INSERT INTO moments VALUES (?,?,?,?,?,?,?,?)",
-                             (row.id, scan_id, rank, peak, start, end, score, None))
+            rows = self._db.execute("SELECT * FROM scans ORDER BY created DESC LIMIT ?", (limit,)).fetchall()
+        return [Scan(**dict(r)) for r in rows]
+
+    def add_moment(self, scan_id: str, rank: int, peak: float, start: float, end: float,
+                   score: float, info: Optional[dict[str, Any]] = None) -> MomentRow:
+        info_json = json.dumps(info) if info else None
+        row = MomentRow(new_id(), scan_id, rank, peak, start, end, score, None, info_json)
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO moments (id, scan_id, rank, peak, start, end, score, job_id, info) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
+                (row.id, scan_id, rank, peak, start, end, score, None, info_json))
         return row
+
+    def save_timeline(self, scan_id: str, data: dict[str, Any]) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO scan_timelines VALUES (?, ?)",
+                             (scan_id, json.dumps(data)))
+
+    def get_timeline(self, scan_id: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            row = self._db.execute("SELECT data FROM scan_timelines WHERE scan_id=?", (scan_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
 
     def get_moment(self, moment_id: str) -> Optional[MomentRow]:
         with self._lock:
@@ -344,8 +436,51 @@ class Store:
         with self._lock:
             self._db.execute(f"UPDATE watches SET {cols} WHERE id=?", (*fields.values(), watch_id))
 
+    # ---- log (the dashboard's Logs page) ----------------------------------
+    def add_log(self, ts: float, level: str, source: str, message: str, job_id: Optional[str] = None,
+                scan_id: Optional[str] = None, detail: Optional[str] = None) -> None:
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO logs (ts, level, source, message, job_id, scan_id, detail) VALUES (?,?,?,?,?,?,?)",
+                (ts, level, source, message[:4000], job_id, scan_id, detail[:20000] if detail else None))
+            self._log_inserts += 1
+            if self._log_inserts % 500 == 0:
+                self._db.execute("DELETE FROM logs WHERE ts < ?", (time.time() - LOG_KEEP_DAYS * 86400,))
+                self._db.execute("DELETE FROM logs WHERE id <= (SELECT MAX(id) FROM logs) - ?",
+                                 (LOG_KEEP_ROWS,))
+
+    def query_logs(self, levels: Optional[list[str]] = None, source: Optional[str] = None,
+                   text: Optional[str] = None, job_id: Optional[str] = None,
+                   scan_id: Optional[str] = None, before_id: Optional[int] = None,
+                   since: float = 0, limit: int = 100) -> list[dict[str, Any]]:
+        where, args = ["ts >= ?"], [since]
+        if levels:
+            where.append("level IN (%s)" % ",".join("?" for _ in levels))
+            args += levels
+        for column, value in (("source", source), ("job_id", job_id), ("scan_id", scan_id)):
+            if value:
+                where.append(f"{column}=?")
+                args.append(value)
+        if text:
+            where.append("(message LIKE ? OR detail LIKE ?)")
+            args += [f"%{text}%", f"%{text}%"]
+        if before_id:
+            where.append("id < ?")
+            args.append(before_id)
+        with self._lock:
+            rows = self._db.execute(
+                f"SELECT * FROM logs WHERE {' AND '.join(where)} ORDER BY id DESC LIMIT ?",
+                (*args, limit)).fetchall()
+        return [dict(r) for r in rows]
+
+    def log_sources(self) -> list[str]:
+        with self._lock:
+            return [r["source"] for r in self._db.execute("SELECT DISTINCT source FROM logs ORDER BY source")]
+
     # ---- outbox ----------------------------------------------------------
     def enqueue_event(self, payload: dict[str, Any]) -> None:
+        if not payload.get("chat_id"):
+            return  # jobs started from the dashboard when no Telegram chat is configured
         with self._lock:
             self._db.execute("INSERT INTO outbox (payload, next_try) VALUES (?, ?)",
                              (json.dumps(payload), time.time()))
@@ -366,6 +501,22 @@ class Store:
     def event_delivered(self, event_id: int) -> None:
         with self._lock:
             self._db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
+
+    def outbox(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM outbox ORDER BY id").fetchall()
+        return [{**dict(r), "payload": json.loads(r["payload"])} for r in rows]
+
+    def retry_event(self, event_id: int) -> bool:
+        with self._lock:
+            cur = self._db.execute("UPDATE outbox SET dead=0, attempts=0, next_try=? WHERE id=?",
+                                   (time.time(), event_id))
+        return cur.rowcount == 1
+
+    def delete_event(self, event_id: int) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM outbox WHERE id=?", (event_id,))
+        return cur.rowcount == 1
 
     def event_failed(self, event_id: int, attempts: int, retry_in: float, dead: bool) -> None:
         with self._lock:
