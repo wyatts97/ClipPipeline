@@ -36,7 +36,64 @@ edit clips at a desk, start and retry jobs, pick moments on a scan's timeline, a
 
 ## Setup
 
-### 1. Install Docker on the server
+### 1. Get this folder onto the server
+
+It's a git repository, so the simplest route is cloning it on the server (git skips local-only folders
+like `clipbot/web/node_modules`):
+
+```bash
+sudo apt-get install -y git                                      # if git isn't there yet
+git clone https://github.com/<you>/<repo>.git ~/ClipPipeline     # private repo: use a GitHub token or SSH key
+cd ~/ClipPipeline
+```
+
+Without git, copy it from this Windows PC (PowerShell) after deleting `clipbot\web\node_modules` and
+`dev\demo\.data`, which the server doesn't need:
+
+```powershell
+scp -r C:\Users\User\Desktop\ClipPipeline you@homeserver:~/
+```
+
+### 2. Run the guided setup
+
+```bash
+bash setup.sh
+```
+
+It asks for one thing at a time, checks each value before saving it, then builds and starts everything:
+
+| Step | You paste or do | It checks |
+|---|---|---|
+| This server | nothing | Docker (offers to install it), RAM, free disk |
+| Telegram bot | the token from **@BotFather** (`/newbot`) | asks Telegram for the bot's name |
+| Your chat | press **Start** in your new bot | reads your chat id from that message, so only you can use the bot |
+| Gemini | a key from <https://aistudio.google.com/apikey> | a test call to Gemini |
+| Public address | your hostname, plus the tunnel command if this server has no cloudflared | prints the exact Cloudflare route to add ([details](#route-a-hostname-to-n8n-through-cloudflare-tunnel)) |
+| Dashboard | a password, or Enter to generate one | |
+| Defaults | time zone, Whisper model, optional Twitch app keys | the Twitch keys with Twitch |
+
+Then it generates the internal secrets, writes `.env` (readable only by you), fetches OpenShorts, builds
+the images (10 to 30 minutes the first time), starts the stack, and confirms that n8n connected the bot
+and that Telegram can deliver to it.
+
+Run it again any time to change a value; Enter keeps everything else. Later,
+`bash setup.sh --n8n-key` adds the n8n API key that lists failed workflow runs in the dashboard.
+
+### 3. Try it
+
+- **Telegram:** send your bot a link with a short range, so the first run is quick:
+  `https://www.youtube.com/watch?v=VIDEO_ID 2:00-12:00 clips=2`. You get "👍 Job … queued", later
+  "✅ Job … finished: 2 clip(s)", then one preview per clip with buttons.
+- **Dashboard:** `http://<server-ip>:8090` with the password from the setup. It's only on your LAN: the
+  tunnel routes nothing but `/webhook/` to n8n.
+- **n8n editor:** `http://<server-ip>:5678`. Create the owner account on your first visit; the workflow
+  is already there.
+
+## Manual setup (instead of setup.sh)
+
+The same steps by hand, if you'd rather edit `.env` yourself. Then continue with [Try it](#3-try-it).
+
+### Install Docker
 
 ```bash
 sudo apt-get update && sudo apt-get install -y ca-certificates curl git
@@ -47,29 +104,12 @@ sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli container
 sudo usermod -aG docker "$USER"   # log out and back in afterwards
 ```
 
-### 2. Get this folder onto the server
-
-It's a git repository, so the simplest route is cloning it on the server (git skips local-only folders
-like `clipbot/web/node_modules`):
-
-```bash
-git clone https://github.com/<you>/<repo>.git ~/ClipPipeline   # private repo: use a GitHub token or SSH key
-cd ~/ClipPipeline && chmod +x scripts/*.sh
-```
-
-Without git, copy it from this Windows PC (PowerShell) after deleting `clipbot\web\node_modules` and
-`dev\demo\.data`, which the server doesn't need:
-
-```powershell
-scp -r C:\Users\User\Desktop\ClipPipeline you@homeserver:~/
-```
-
-### 3. Make the Telegram bot and get a Gemini key
+### Make the Telegram bot and get a Gemini key
 
 - In Telegram, talk to **@BotFather** → `/newbot` → pick a name and a username → copy the token.
 - Create a Gemini key at <https://aistudio.google.com/apikey>.
 
-### 4. Route a hostname to n8n through Cloudflare Tunnel
+### Route a hostname to n8n through Cloudflare Tunnel
 
 Telegram needs `https://<your hostname>/webhook/…` to reach n8n on port 5678. Pick one:
 
@@ -98,34 +138,32 @@ final catch-all and restart cloudflared (`sudo systemctl restart cloudflared`):
 **B. No cloudflared on the server yet.** Create a tunnel (**Zero Trust → Networks → Tunnels → Create a
 tunnel → Cloudflared**, pick **Docker**) and copy the token (the long string after `--token` in the
 command it shows; you don't run that command). Add the same public hostname as in A, but with
-service `HTTP` → `n8n:5678`. Put the token in `.env` as `TUNNEL_TOKEN=`, and start the stack with
-`docker compose --profile tunnel up -d` in step 6.
+service `HTTP` → `n8n:5678`. In `.env`, set `TUNNEL_TOKEN=` to the token and `COMPOSE_PROFILES=tunnel`,
+which makes `docker compose up -d` start the bundled cloudflared container too.
 
-### 5. Configure
+### Configure .env
 
 ```bash
-scripts/init-env.sh      # creates .env with random secrets and the data/ folders
-nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME (+ TUNNEL_TOKEN for 4B)
+sh scripts/init-env.sh   # creates .env with random secrets and the data/ folders
+nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME (+ TUNNEL_TOKEN for B)
 ```
 
-`PUBLIC_HOSTNAME` is the hostname from step 4 (`clips.example.com`, no `https://`). The script also
-prints the generated `DASHBOARD_PASSWORD`; change it in `.env` to anything you like.
+`PUBLIC_HOSTNAME` is the hostname from the tunnel route (`clips.example.com`, no `https://`). The script
+also prints the generated `DASHBOARD_PASSWORD`; change it in `.env` to anything you like.
 
-### 6. Build and start
+### Build and start
 
 ```bash
-scripts/fetch-openshorts.sh   # clones OpenShorts at the pinned commit into vendor/
-docker compose build          # first build takes a while (OpenShorts pulls in PyTorch, YOLO, Whisper)
-docker compose up -d          # option 4B: docker compose --profile tunnel up -d
+sh scripts/fetch-openshorts.sh   # clones OpenShorts at the pinned commit into vendor/
+docker compose build             # first build takes a while (OpenShorts pulls in PyTorch, YOLO, Whisper)
+docker compose up -d
 docker compose logs n8n-import   # should end with: Imported and published 'ClipPipeline - Telegram approval'.
 ```
 
 The first start of `n8n-import` creates the two credentials (**ClipBot Telegram**, **ClipBot token**)
 and the workflow, and publishes it. n8n then registers the Telegram webhook by itself.
 
-Open `http://<server-ip>:5678` and create the n8n owner account. The workflow is already there.
-
-### 7. Lock the bot to you
+### Lock the bot to you
 
 Send `/start` to your bot. It answers with your chat id (setup mode: `ALLOWED_CHAT_IDS` is still empty).
 Put it in `.env` and restart clipbot:
@@ -136,21 +174,6 @@ docker compose up -d clipbot
 ```
 
 From now on the bot ignores every other chat.
-
-### 8. First clip
-
-Send a link with a short range, so the first run is quick:
-
-```
-https://www.youtube.com/watch?v=VIDEO_ID 2:00-12:00 clips=2
-```
-
-You get "👍 Job … queued", later "✅ Job … finished: 2 clip(s)", then one preview per clip with buttons.
-
-### 9. Open the dashboard
-
-`http://<server-ip>:8090`, password `DASHBOARD_PASSWORD` from `.env`. It's only on your LAN: the tunnel
-routes nothing but `/webhook/` to n8n.
 
 ## Dashboard
 
@@ -293,6 +316,9 @@ pytest clipbot/tests
 # fake Telegram and OpenShorts. Needs Node 24, ffmpeg and yt-dlp next to that Python.
 npm install -g n8n@2.43.7
 python dev/e2e/run_e2e.py
+
+# setup.sh against fake Telegram, Gemini and Twitch APIs (wrong values, re-runs, quoting)
+python dev/setup_check.py
 
 # Dashboard (clipbot/web: React, Vite, Tailwind, shadcn/ui)
 cd clipbot/web && npm install && npm run build      # what the Docker image does

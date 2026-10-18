@@ -2,7 +2,7 @@
 # plus the web dashboard (served by clipbot on :8090).
 #
 #   docker compose up -d                       # core stack
-#   docker compose --profile tunnel up -d      # + a cloudflared container (skip if the host runs cloudflared)
+#   COMPOSE_PROFILES=tunnel in .env            # + a cloudflared container (setup.sh sets it; skip if the host runs cloudflared)
 #   docker compose --profile dashboard up -d   # + OpenShorts web dashboard on :5175
 #
 # Only n8n's /webhook/ paths are reachable from the internet (through a Cloudflare
