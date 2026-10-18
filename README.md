@@ -47,15 +47,22 @@ sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli container
 sudo usermod -aG docker "$USER"   # log out and back in afterwards
 ```
 
-### 2. Copy this folder to the server
+### 2. Get this folder onto the server
 
-From this Windows PC (PowerShell), replacing the user and host:
+It's a git repository, so the simplest route is cloning it on the server (git skips local-only folders
+like `clipbot/web/node_modules`):
+
+```bash
+git clone https://github.com/<you>/<repo>.git ~/ClipPipeline   # private repo: use a GitHub token or SSH key
+cd ~/ClipPipeline && chmod +x scripts/*.sh
+```
+
+Without git, copy it from this Windows PC (PowerShell) after deleting `clipbot\web\node_modules` and
+`dev\demo\.data`, which the server doesn't need:
 
 ```powershell
 scp -r C:\Users\User\Desktop\ClipPipeline you@homeserver:~/
 ```
-
-Then on the server: `cd ~/ClipPipeline && chmod +x scripts/*.sh`
 
 ### 3. Make the Telegram bot and get a Gemini key
 
