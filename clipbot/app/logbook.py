@@ -20,7 +20,7 @@ class DbLogHandler(logging.Handler):
 
     def emit(self, record: logging.LogRecord) -> None:
         try:
-            detail = None
+            detail = getattr(record, "detail", None)  # extra={"detail": ...}: e.g. OpenShorts' full log
             if record.exc_info:
                 detail = "".join(traceback.format_exception(*record.exc_info))
             source = record.name.removeprefix("clipbot.").removeprefix("clipbot") or "api"

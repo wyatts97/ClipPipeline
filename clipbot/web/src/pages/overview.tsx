@@ -130,7 +130,7 @@ function Problems({ problems }: { problems: Problem[] }) {
                   className="font-medium hover:underline">{p.title}</Link>
                 <span className="text-sm text-muted-foreground">{ago(p.ts)}</span>
               </div>
-              {p.detail && <p className="mt-1 line-clamp-2 text-sm break-words text-muted-foreground">{p.detail}</p>}
+              {p.detail && <p className="mt-1 line-clamp-3 text-sm break-words whitespace-pre-line text-muted-foreground">{p.detail}</p>}
             </div>
             <Button size="sm" variant="outline" disabled={fix.isPending} onClick={() => fix.mutate(p)}>
               {p.kind === "job" ? "Retry job" : p.kind === "scan" ? "Scan again" : "Send again"}

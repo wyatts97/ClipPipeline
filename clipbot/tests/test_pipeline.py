@@ -6,7 +6,7 @@ import shutil
 import httpx
 import pytest
 
-from app import media
+from app import logbook, media
 from app.openshorts import OpenShorts
 from app.pipeline import Pipeline
 from app.store import Store
@@ -19,6 +19,7 @@ class FakeOpenShorts:
         self.output_dir, self.sample, self.write_files = output_dir, sample, write_files
         self.process_bodies, self.uploaded_bytes = [], 0
         self.status_value = "completed"
+        self.logs = ["step one", "boom"]
         self.refuse = None
 
     def handler(self, request: httpx.Request) -> httpx.Response:
@@ -40,7 +41,7 @@ class FakeOpenShorts:
             return httpx.Response(200, json={"upload_id": "up1"})
         if method == "GET" and path == f"/api/status/{OS_JOB}":
             return httpx.Response(200, json={
-                "status": self.status_value, "logs": ["step one", "boom"],
+                "status": self.status_value, "logs": self.logs,
                 "result": {"clips": [
                     {"video_url": f"/videos/{OS_JOB}/clip_0.mp4",
                      "video_title_for_youtube_short": "Funny moment",
@@ -182,6 +183,32 @@ def test_openshorts_failure_is_reported(env):
     assert job.status == "failed" and "boom" in job.error
     run(pipeline.flush_outbox())
     assert fake_n8n.events[0]["text"].startswith(f"❌ Job {job.id} failed")
+
+
+def test_openshorts_failure_keeps_the_real_cause(env):
+    pipeline, store, fake_os, fake_n8n = env
+    fake_os.status_value = "failed"
+    fake_os.logs = [f"line {i}" for i in range(200)] + [
+        "❌ Gemini Error: 429 RESOURCE_EXHAUSTED. You exceeded your current quota.",
+        "    raise RuntimeError(",
+        "RuntimeError: Clip detection failed — the AI model did not return usable clips for this video.",
+        "Process failed with exit code 1"]
+    handler = logbook.install(store)  # the app does this at startup
+    try:
+        job = store.create_job(111, "https://youtu.be/abc", None, None, 3)
+        run(pipeline.start_job(job))
+        run(pipeline.poll_job(store.get_job(job.id)))
+    finally:
+        logbook.uninstall(handler)
+    error = store.get_job(job.id).error
+    assert error.startswith("OpenShorts failed: ❌ Gemini Error: 429 RESOURCE_EXHAUSTED")
+    assert "💡 Gemini's quota or rate limit was hit" in error
+    logged = store.query_logs(job_id=job.id)[0]
+    assert logged["level"] == "WARNING"
+    assert logged["detail"].splitlines()[-1] == "Process failed with exit code 1"
+    assert len(logged["detail"].splitlines()) == 150   # the last 150 lines of OpenShorts' log
+    run(pipeline.flush_outbox())
+    assert "💡" in fake_n8n.events[0]["text"]          # the Telegram message carries the hint too
 
 
 def test_openshorts_refusal_is_reported(env):

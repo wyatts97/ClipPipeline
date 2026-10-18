@@ -150,7 +150,7 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
 
             {d.error && (
               <div className="rounded-md border border-destructive/40 bg-destructive/10 px-3 py-2 text-destructive">
-                <p className="break-words">{d.error}</p>
+                <p className="break-words whitespace-pre-line">{d.error}</p>
               </div>
             )}
 

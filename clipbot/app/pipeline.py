@@ -20,6 +20,7 @@ import httpx
 
 from . import media
 from .config import Settings
+from .diagnose import failure_hint, failure_reason
 from .openshorts import OpenShorts, OpenShortsError
 from .parsing import format_timestamp
 from .store import Clip, Job, Store
@@ -173,8 +174,12 @@ class Pipeline:
         if status == "completed":
             await self.collect(job, doc)
         elif status == "failed":
-            logs = [str(line) for line in (doc.get("logs") or [])][-3:]
-            self.fail(job, "OpenShorts failed: " + (" | ".join(logs) or "no log output"))
+            lines = [str(line) for line in (doc.get("logs") or [])]
+            hint = failure_hint(lines)
+            reason = "OpenShorts failed: " + failure_reason(lines)
+            if hint:
+                reason += f"\n💡 {hint}"
+            self.fail(job, reason, detail="\n".join(lines[-150:]) or None)
         elif time.time() - job.created > self.settings.job_timeout_minutes * 60:
             self.fail(job, f"Gave up after {self.settings.job_timeout_minutes} minutes "
                            f"(OpenShorts status: {status}).")
@@ -235,8 +240,8 @@ class Pipeline:
             })
         log.info("job %s: collected %d clip(s)", job.id, len(made), extra={"job_id": job.id})
 
-    def fail(self, job: Job, error: str) -> None:
-        log.warning("job %s failed: %s", job.id, error, extra={"job_id": job.id})
+    def fail(self, job: Job, error: str, detail: Optional[str] = None) -> None:
+        log.warning("job %s failed: %s", job.id, error, extra={"job_id": job.id, "detail": detail})
         self.store.update_job(job.id, status="failed", error=error[:2000])
         self.store.enqueue_event({"event": "message", "chat_id": job.chat_id,
                                   "text": f"❌ Job {job.id} failed: {error[:3500]}"})

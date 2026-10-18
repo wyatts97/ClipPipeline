@@ -393,7 +393,7 @@ async def get_job(job_id: str, request: Request):
     settings, store = settings_of(request), store_of(request)
     job = _job_or_404(store, job_id)
     openshorts = None
-    if job.openshorts_job and job.status == "processing":
+    if job.openshorts_job and job.status in ("processing", "failed"):  # OpenShorts keeps logs ~24 h
         try:
             doc = await asyncio.wait_for(request.app.state.pipeline.openshorts.status(job.openshorts_job), 4)
             openshorts = {"status": (doc or {}).get("status"),

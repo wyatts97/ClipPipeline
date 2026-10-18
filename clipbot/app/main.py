@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Optional
@@ -64,6 +65,13 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
     async def lifespan(app: FastAPI):
         store = Store(settings.db_path)
         log_handler = logbook.install(store)
+        # yt-dlp and TwitchDownloaderCLI expect $HOME to exist; on a fresh ./data it doesn't.
+        for folder in (os.environ.get("HOME"), os.environ.get("XDG_CACHE_HOME")):
+            if folder:
+                try:
+                    Path(folder).mkdir(parents=True, exist_ok=True)
+                except OSError as e:
+                    log.warning("can't create %s: %s", folder, e)
         client = openshorts or OpenShorts(settings.openshorts_url)
         pipeline = pipeline_factory(settings, store, client)
         scout = Scout(settings, store, pipeline)

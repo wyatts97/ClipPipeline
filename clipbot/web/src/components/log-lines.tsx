@@ -41,7 +41,7 @@ export function LogLines({ items, compact = false }: { items: LogItem[]; compact
                 </>
               )}
               <span className="min-w-0">
-                <span className="font-mono text-xs break-words">{item.message}</span>
+                <span className="font-mono text-xs break-words whitespace-pre-wrap">{item.message}</span>
                 {!compact && (item.job_id || item.scan_id) && (
                   <span className="ml-2 inline-flex gap-2 text-xs">
                     {item.job_id && <Link to={`/jobs/${item.job_id}`} onClick={(e) => e.stopPropagation()} className="text-primary hover:underline">job {item.job_id}</Link>}

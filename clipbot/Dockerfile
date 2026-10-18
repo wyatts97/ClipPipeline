@@ -26,6 +26,9 @@ RUN curl -fsSL -o /tmp/td.zip \
     && chmod +x /usr/local/bin/TwitchDownloaderCLI && rm /tmp/td.zip
 # .NET without ICU: chat download needs no culture data.
 ENV DOTNET_SYSTEM_GLOBALIZATION_INVARIANT=1
+# It's a single-file .NET app that unpacks itself on first run; give it a directory any user can write
+# (the default, $HOME/.net, may not exist for the PUID the container runs as).
+ENV DOTNET_BUNDLE_EXTRACT_BASE_DIR=/tmp/dotnet-bundle
 
 WORKDIR /app
 COPY requirements.txt .
