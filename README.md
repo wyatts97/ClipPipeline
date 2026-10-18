@@ -1,0 +1,253 @@
+# ClipPipeline (phase 1)
+
+Send a stream VOD or video link to your Telegram bot. OpenShorts cuts it into vertical clips with
+captions and a hook line, and each clip comes back to Telegram as a preview with **✅ Post / ❌ Skip**
+buttons. Approved clips land in `data/approved/` with a `.json` file holding the title, hook and
+descriptions, ready for publishing.
+
+You don't have to find the good parts yourself: `/scan <VOD>` reads the chat replay, loudness and
+viewer clips, and sends the stream's top moments with **🎬 Clip it** buttons. `/watch <channel>` does
+that automatically every time a stream ends.
+
+```
+ You (Telegram) ──► Cloudflare Tunnel ──► n8n ──► clipbot ──► OpenShorts (Whisper + Gemini + ffmpeg)
+       ▲                                   │         │
+       └──── preview + ✅/❌ buttons ◄──────┘◄────────┘  data/pending → approved/ | rejected/
+```
+
+| Service | What it does | Reachable from |
+|---|---|---|
+| `n8n` | Telegram trigger, buttons, the workflow you'll extend | LAN `:5678`; internet only `/webhook/*` via the tunnel |
+| `clipbot` | Parses your messages, scans streams for moments, watches channels, queues jobs, downloads time ranges (yt-dlp), polls OpenShorts, makes Telegram-sized previews, moves files | Docker network only |
+| `openshorts` | [mutonby/openshorts](https://github.com/mutonby/openshorts) (MIT) at a pinned commit: picks moments, reframes to 9:16, burns captions | Docker network only |
+| `postgres` | n8n's database | Docker network only |
+| `cloudflared` | Gives Telegram an HTTPS URL without opening ports on your router | outbound only |
+| `dashboard` (optional) | OpenShorts web UI to re-edit clips by hand | LAN `:5175` |
+
+## What you need
+
+- The Debian 13 server: **8 GB RAM minimum (16 GB better)**, ~25 GB free disk for images, models and clips.
+  Everything runs on the CPU (see [CPU notes](#cpu-notes)).
+- A Telegram account, a **Gemini API key** (free tier is fine to start), and a **Cloudflare account
+  with a domain** on it (for the tunnel).
+
+## Setup
+
+### 1. Install Docker on the server
+
+```bash
+sudo apt-get update && sudo apt-get install -y ca-certificates curl git
+sudo install -m 0755 -d /etc/apt/keyrings
+sudo curl -fsSL https://download.docker.com/linux/debian/gpg -o /etc/apt/keyrings/docker.asc
+echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.asc] https://download.docker.com/linux/debian $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | sudo tee /etc/apt/sources.list.d/docker.list
+sudo apt-get update && sudo apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+sudo usermod -aG docker "$USER"   # log out and back in afterwards
+```
+
+### 2. Copy this folder to the server
+
+From this Windows PC (PowerShell), replacing the user and host:
+
+```powershell
+scp -r C:\Users\User\Desktop\ClipPipeline you@homeserver:~/
+```
+
+Then on the server: `cd ~/ClipPipeline && chmod +x scripts/*.sh`
+
+### 3. Make the Telegram bot and get a Gemini key
+
+- In Telegram, talk to **@BotFather** → `/newbot` → pick a name and a username → copy the token.
+- Create a Gemini key at <https://aistudio.google.com/apikey>.
+
+### 4. Create the Cloudflare Tunnel
+
+In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared**,
+name it `clippipeline`, pick **Docker**, and copy the token (the long string after `--token` in the
+command it shows; you don't run that command).
+
+Then add a **public hostname** (newer dashboards call it a *published application route*) to the tunnel:
+
+| Field | Value |
+|---|---|
+| Subdomain / Domain | e.g. `clips` / `example.com` |
+| Path | `^/webhook/` (only webhooks are exposed, not the n8n editor) |
+| Service | `HTTP` → `n8n:5678` |
+
+### 5. Configure
+
+```bash
+scripts/init-env.sh      # creates .env with random secrets and the data/ folders
+nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME, TUNNEL_TOKEN
+```
+
+`PUBLIC_HOSTNAME` is the hostname from step 4 (`clips.example.com`, no `https://`).
+
+### 6. Build and start
+
+```bash
+scripts/fetch-openshorts.sh   # clones OpenShorts at the pinned commit into vendor/
+docker compose build          # first build takes a while (OpenShorts pulls in PyTorch, YOLO, Whisper)
+docker compose up -d
+docker compose logs n8n-import   # should end with: Imported and published 'ClipPipeline - Telegram approval'.
+```
+
+The first start of `n8n-import` creates the two credentials (**ClipBot Telegram**, **ClipBot token**)
+and the workflow, and publishes it. n8n then registers the Telegram webhook by itself.
+
+Open `http://<server-ip>:5678` and create the n8n owner account. The workflow is already there.
+
+### 7. Lock the bot to you
+
+Send `/start` to your bot. It answers with your chat id (setup mode: `ALLOWED_CHAT_IDS` is still empty).
+Put it in `.env` and restart clipbot:
+
+```bash
+nano .env                     # ALLOWED_CHAT_IDS=123456789
+docker compose up -d clipbot
+```
+
+From now on the bot ignores every other chat.
+
+### 8. First clip
+
+Send a link with a short range, so the first run is quick:
+
+```
+https://www.youtube.com/watch?v=VIDEO_ID 2:00-12:00 clips=2
+```
+
+You get "👍 Job … queued", later "✅ Job … finished: 2 clip(s)", then one preview per clip with buttons.
+
+## Using it
+
+| Message | Does |
+|---|---|
+| `<link>` | Clips the whole video |
+| `<link> 1:02:00-1:12:30` | Downloads and clips only that range (also `62:00-72:30`, `1h2m-1h12m`) |
+| `<link> clips=5` | Number of clips (1-15, default `TARGET_CLIPS`) |
+| `/scan <VOD link>` | Finds the stream's best moments and sends each with 🎬 buttons ([below](#finding-moments-scan-and-watch)) |
+| `/watch <channel link>` | Scans every new VOD of that channel when the stream ends |
+| `/watching`, `/unwatch <channel>` | List / stop watched channels |
+| `/status` | Your recent jobs and scans |
+| `/help` | Usage |
+
+Links can be anything yt-dlp handles: YouTube, Twitch VODs, Kick VODs, and many more.
+
+Buttons: **✅ Post** moves the clip to `data/approved/YYYY-MM-DD_<title>_<id>.mp4` (plus `.json`),
+**❌ Skip** moves it to `data/rejected/`. Pressing a button twice is harmless.
+
+Defaults live in `.env` (`TARGET_CLIPS`, `CLIP_MIN/MAX_SECONDS`, `OPENSHORTS_LAYOUTS`, `AUTO_HOOK`,
+`CAPTIONS`). After editing: `docker compose up -d`.
+
+**Layouts for streams:** `auto` lets Gemini pick per video. If you keep getting a plain center crop on
+facecam + gameplay streams, try `OPENSHORTS_LAYOUTS=screencast` (screen over the presenter).
+
+## Finding moments: /scan and /watch
+
+`/scan https://www.twitch.tv/videos/123456789` scores the whole stream in 5-second steps, each signal
+compared with that stretch of the stream's own normal level, and sends the top `SCAN_TOP` moments:
+
+```
+#1 🔥 2:30:32  (window 2:29:02–2:31:18)
+chat 10× normal · 🔊 loud · ✂️ 3 viewer clips (1.2k views)
+💬 KEKW ×28 · Clap ×12 · ??? ×6
+▶️ https://www.twitch.tv/videos/123456789?t=2h29m2s
+[🎬 Clip it] [➕ Wider ×2]
+```
+
+- **▶️** opens the VOD at the window, so you can check the moment before spending CPU on it.
+- **🎬 Clip it** queues a normal range job for the window (`SCAN_CLIPS_PER_MOMENT` clips, default 1).
+- **➕ Wider ×2** adds a minute on each side and asks for 2 clips, for moments with a build-up.
+- The window starts `SCAN_BEFORE_SECONDS` (90) before the chat peak, because chat reacts after the moment.
+
+What each platform gives the scan:
+
+| Platform | Chat replay | Loudness | Viewer clips | Other |
+|---|---|---|---|---|
+| Twitch | ✅ (TwitchDownloaderCLI) | ✅ | with `TWITCH_CLIENT_ID/SECRET` | |
+| YouTube stream replays | ✅ | ✅ | | "most replayed" when YouTube has it |
+| Kick | ❌ (not available in bulk) | ✅ | ✅ | |
+| Anything else yt-dlp opens | | ✅ | | |
+
+Chat counts unique chatters (one spammer counts once) and "hype" messages: KEKW, LUL, OMEGALUL, `???`,
+ALL CAPS, 😂/💀, "clip it", and channel emotes built on them (`cohhLUL`, `xqcL`). Add a streamer's own
+emotes with `SCAN_HYPE_WORDS=streamerJAM,streamerHYPE`. Hello and goodbye floods and the first 3 and
+last 2 minutes are ignored.
+
+Measured on this setup's code against real VODs: a 2h51m Twitch VOD scanned in ~3 minutes (chat +
+audio), a 44-minute YouTube replay in 15 s, an 11-hour Kick VOD's viewer clips in seconds (audio
+adds a download of the 160p video). Scans mostly download; they use little CPU compared with an
+OpenShorts job.
+
+**`/watch https://twitch.tv/<name>`** (or `kick.com/<name>`, `youtube.com/@handle`) checks the channel
+every `WATCH_INTERVAL_MINUTES`. When the newest VOD stops growing between two checks, the stream is
+over, and you get "📺 … finished a 4:12:00 stream. Scanning it…" followed by the moments. A stream
+that is live when you send `/watch` is scanned when it ends; older VODs are not (scan those by hand).
+
+Limits: sub-only Twitch VODs have no public chat (the scan says "chat unavailable" and uses the rest).
+Kick's `?t=` links may open at the start of the VOD.
+
+## CPU notes
+
+This box has no NVIDIA GPU, and OpenShorts only accelerates on CUDA/NVENC, so transcription and
+encoding run on the CPU. The weak Ryzen iGPU isn't used.
+
+- **Use `/scan` or time ranges for streams.** A 2-minute moment or a 10-minute range is a short job;
+  a 4-hour VOD sent as a plain link means downloading and transcribing all 4 hours.
+- `WHISPER_MODEL=base` roughly halves transcription time; `small` (default) is more accurate.
+- `OPENSHORTS_CONCURRENT_JOBS=1` (default) runs one job at a time; others wait in clipbot's queue.
+- First job after a fresh start also downloads the Whisper model (kept in a volume afterwards).
+
+## Updating
+
+```bash
+docker compose build --pull clipbot && docker compose up -d clipbot   # refreshes yt-dlp
+scripts/fetch-openshorts.sh main && docker compose build openshorts && docker compose up -d openshorts
+```
+
+The second line moves OpenShorts off the pinned commit. If clipbot can no longer talk to it,
+go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild.
+
+If an update changes `n8n/workflow.template.json`, the running n8n keeps your imported copy. Re-import
+it as described under Troubleshooting (this replaces any edits you made to the workflow in n8n).
+
+## Troubleshooting
+
+- **Bot doesn't answer.** In n8n → *Executions*, see whether anything arrived. If nothing did, check
+  Telegram's view of the webhook (replace the token):
+  `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo`. The URL must be
+  `https://<PUBLIC_HOSTNAME>/webhook/…/webhook` with no `last_error_message`. Then check
+  `docker compose logs cloudflared n8n`.
+- **"Job … failed: OpenShorts refused the job"** shows OpenShorts' reason. YouTube's "confirm you're
+  not a bot" means it wants cookies: put a Netscape `cookies.txt` at `data/cookies.txt` (used for
+  range downloads) and/or `YOUTUBE_COOKIES` in `.env` (used by OpenShorts).
+- **Clip previews never arrive** but the job finished: `docker compose logs clipbot` shows whether n8n
+  accepted the events (clipbot keeps retrying while n8n is down or the workflow is unpublished).
+- **A scan says "chat unavailable (…)"**: the reason is in the brackets. For Twitch, try the chat tool
+  by hand: `docker compose exec clipbot TwitchDownloaderCLI chatdownload --id <vod id> -o /tmp/c.json`.
+- **Re-import the workflow** (e.g. after breaking it): delete the workflow and both ClipBot
+  credentials in n8n, then `docker compose run --rm n8n-import --force && docker compose restart n8n`.
+- Logs: `docker compose logs -f clipbot openshorts`.
+
+Known quirk: OpenShorts' built-in prompt is written for podcasts and sometimes adds a "comment X and
+I'll send you the workflow" call to action to the TikTok/Instagram descriptions in the `.json`.
+Titles and hooks are fine. Rewrite the descriptions before posting.
+
+## Development
+
+```bash
+# clipbot unit + integration tests (needs ffmpeg)
+pip install -r clipbot/requirements.txt pytest
+pytest clipbot/tests
+
+# End-to-end: real n8n + imported workflow + clipbot (incl. a /scan of a local fake VOD),
+# fake Telegram and OpenShorts. Needs Node 24, ffmpeg and yt-dlp next to that Python.
+npm install -g n8n@2.43.7
+python dev/e2e/run_e2e.py
+```
+
+## Next: publishing
+
+Approved clips and their metadata are in `data/approved/`. Publishing (YouTube Shorts, TikTok draft
+upload, Instagram via Postiz or Upload-Post) hooks into the workflow after **Send decision reply**.
+Apply for the TikTok developer app and the Google Cloud API audit early; both take weeks.

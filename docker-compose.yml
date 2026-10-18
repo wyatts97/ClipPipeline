@@ -1,0 +1,172 @@
+# ClipPipeline phase 1: Telegram -> n8n -> clipbot -> OpenShorts -> Telegram approval.
+#
+#   docker compose up -d                       # core stack
+#   docker compose --profile dashboard up -d   # + OpenShorts web dashboard on :5175
+#
+# Only n8n's /webhook/ paths are reachable from the internet (through the
+# Cloudflare Tunnel, configured in the Cloudflare dashboard). Everything else
+# stays on this server's LAN or the internal Docker network.
+
+name: clippipeline
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/init-env.sh first}
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U n8n -d n8n"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+
+  # One-shot: imports the ClipBot credentials + workflow into n8n on first start.
+  n8n-import:
+    image: n8nio/n8n:${N8N_VERSION:-2.43.7}
+    restart: "no"
+    entrypoint: ["/bin/sh", "/import/import.sh"]
+    environment: &n8n-env
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD}
+      N8N_ENCRYPTION_KEY: ${N8N_ENCRYPTION_KEY:?run scripts/init-env.sh first}
+      GENERIC_TIMEZONE: ${TZ:-UTC}
+      TZ: ${TZ:-UTC}
+      # Used only by the import script to fill in the credentials it creates.
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      CLIPBOT_TOKEN: ${CLIPBOT_TOKEN}
+    volumes:
+      - n8n_data:/home/node/.n8n
+      - ./n8n:/import:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  n8n:
+    image: n8nio/n8n:${N8N_VERSION:-2.43.7}
+    restart: unless-stopped
+    ports:
+      - "${N8N_BIND:-0.0.0.0}:5678:5678"   # editor on the LAN: http://<server-ip>:5678
+    environment:
+      <<: *n8n-env
+      TELEGRAM_BOT_TOKEN: ""                # not needed at runtime; lives in the n8n credential
+      # Public URL Telegram calls (the Cloudflare Tunnel hostname).
+      N8N_WEBHOOK_URL: https://${PUBLIC_HOSTNAME:?set PUBLIC_HOSTNAME in .env}/
+      N8N_PROXY_HOPS: "1"
+      # The editor is opened over plain http on the LAN.
+      N8N_SECURE_COOKIE: "false"
+      N8N_DIAGNOSTICS_ENABLED: "false"
+      N8N_PERSONALIZATION_ENABLED: "false"
+      EXECUTIONS_DATA_PRUNE: "true"
+      EXECUTIONS_DATA_MAX_AGE: "336"        # hours (14 days)
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy
+      n8n-import:
+        condition: service_completed_successfully
+
+  openshorts:
+    build:
+      context: ./vendor/openshorts            # fetched by scripts/fetch-openshorts.sh
+    image: clippipeline/openshorts:local
+    restart: unless-stopped
+    environment:
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
+      # Optional: moment picking on an OpenAI-compatible server instead of Gemini.
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      # CPU-only box: small int8 Whisper, x264 (OpenShorts has no VAAPI path), one job at a time.
+      WHISPER_MODEL: ${WHISPER_MODEL:-small}
+      WHISPER_DEVICE: cpu
+      WHISPER_COMPUTE: int8
+      FFMPEG_ENCODER: x264
+      MAX_CONCURRENT_JOBS: ${OPENSHORTS_CONCURRENT_JOBS:-1}
+      # Stream VODs are often < 720p or flagged low quality; don't stop to ask.
+      QUALITY_GATE_MIN_HEIGHT: "0"
+      RATE_LIMIT_ENABLED: "0"
+      YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}
+      JOB_RETENTION_SECONDS: "86400"
+    volumes:
+      - openshorts_output:/app/output
+      - openshorts_uploads:/app/uploads
+      - openshorts_models:/app/.cache/huggingface
+    expose:
+      - "8000"
+
+  clipbot:
+    build: ./clipbot
+    image: clippipeline/clipbot:local
+    restart: unless-stopped
+    user: "${PUID:-1000}:${PGID:-1000}"
+    environment:
+      OPENSHORTS_URL: http://openshorts:8000
+      N8N_EVENTS_URL: http://n8n:5678/webhook/clipbot-events
+      CLIPBOT_TOKEN: ${CLIPBOT_TOKEN:?run scripts/init-env.sh first}
+      ALLOWED_CHAT_IDS: ${ALLOWED_CHAT_IDS:-}
+      TARGET_CLIPS: ${TARGET_CLIPS:-3}
+      CLIP_MIN_SECONDS: ${CLIP_MIN_SECONDS:-15}
+      CLIP_MAX_SECONDS: ${CLIP_MAX_SECONDS:-60}
+      OPENSHORTS_LAYOUTS: ${OPENSHORTS_LAYOUTS:-auto}
+      AUTO_HOOK: ${AUTO_HOOK:-true}
+      CAPTIONS: ${CAPTIONS:-true}
+      MAX_RANGE_MINUTES: ${MAX_RANGE_MINUTES:-90}
+      # /scan and /watch
+      SCAN_TOP: ${SCAN_TOP:-5}
+      SCAN_BEFORE_SECONDS: ${SCAN_BEFORE_SECONDS:-90}
+      SCAN_AFTER_SECONDS: ${SCAN_AFTER_SECONDS:-45}
+      SCAN_CLIPS_PER_MOMENT: ${SCAN_CLIPS_PER_MOMENT:-1}
+      SCAN_AUDIO: ${SCAN_AUDIO:-true}
+      SCAN_HYPE_WORDS: ${SCAN_HYPE_WORDS:-}
+      WATCH_INTERVAL_MINUTES: ${WATCH_INTERVAL_MINUTES:-15}
+      TWITCH_CLIENT_ID: ${TWITCH_CLIENT_ID:-}
+      TWITCH_CLIENT_SECRET: ${TWITCH_CLIENT_SECRET:-}
+      TZ: ${TZ:-UTC}
+    volumes:
+      - ./data:/data                              # pending/ approved/ rejected/ live here
+      - openshorts_output:/openshorts-output:ro
+    expose:
+      - "8080"
+    depends_on:
+      - openshorts
+
+  cloudflared:
+    image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.10.0}
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+    depends_on:
+      - n8n
+
+  # Optional OpenShorts web UI (Vite dev server) for re-editing clips by hand.
+  dashboard:
+    profiles: ["dashboard"]
+    build:
+      context: ./vendor/openshorts/dashboard
+      target: dev
+    image: clippipeline/openshorts-dashboard:local
+    restart: unless-stopped
+    environment:
+      VITE_PROXY_TARGET: http://openshorts:8000
+    ports:
+      - "${N8N_BIND:-0.0.0.0}:5175:5173"
+    depends_on:
+      - openshorts
+
+volumes:
+  postgres_data:
+  n8n_data:
+  openshorts_output:
+  openshorts_uploads:
+  openshorts_models:
