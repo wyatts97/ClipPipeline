@@ -1,11 +1,12 @@
 # ClipPipeline phase 1: Telegram -> n8n -> clipbot -> OpenShorts -> Telegram approval.
 #
 #   docker compose up -d                       # core stack
+#   docker compose --profile tunnel up -d      # + a cloudflared container (skip if the host runs cloudflared)
 #   docker compose --profile dashboard up -d   # + OpenShorts web dashboard on :5175
 #
-# Only n8n's /webhook/ paths are reachable from the internet (through the
-# Cloudflare Tunnel, configured in the Cloudflare dashboard). Everything else
-# stays on this server's LAN or the internal Docker network.
+# Only n8n's /webhook/ paths are reachable from the internet (through a Cloudflare
+# Tunnel route to n8n on :5678). Everything else stays on this server's LAN or the
+# internal Docker network.
 
 name: clippipeline
 
@@ -140,12 +141,14 @@ services:
     depends_on:
       - openshorts
 
+  # Optional: only for servers without their own cloudflared. Its tunnel route points at http://n8n:5678.
   cloudflared:
+    profiles: ["tunnel"]
     image: cloudflare/cloudflared:${CLOUDFLARED_VERSION:-2026.10.0}
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
-      TUNNEL_TOKEN: ${TUNNEL_TOKEN:?set TUNNEL_TOKEN in .env}
+      TUNNEL_TOKEN: ${TUNNEL_TOKEN:-}
     depends_on:
       - n8n
 

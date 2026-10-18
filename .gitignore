@@ -3,3 +3,4 @@ data/
 vendor/
 __pycache__/
 .pytest_cache/
+roadmap.md

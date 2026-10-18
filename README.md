@@ -21,7 +21,7 @@ that automatically every time a stream ends.
 | `clipbot` | Parses your messages, scans streams for moments, watches channels, queues jobs, downloads time ranges (yt-dlp), polls OpenShorts, makes Telegram-sized previews, moves files | Docker network only |
 | `openshorts` | [mutonby/openshorts](https://github.com/mutonby/openshorts) (MIT) at a pinned commit: picks moments, reframes to 9:16, burns captions | Docker network only |
 | `postgres` | n8n's database | Docker network only |
-| `cloudflared` | Gives Telegram an HTTPS URL without opening ports on your router | outbound only |
+| Cloudflare Tunnel | Gives Telegram an HTTPS URL without opening ports on your router: your existing `cloudflared` on the host, or the optional `cloudflared` container | outbound only |
 | `dashboard` (optional) | OpenShorts web UI to re-edit clips by hand | LAN `:5175` |
 
 ## What you need
@@ -59,25 +59,43 @@ Then on the server: `cd ~/ClipPipeline && chmod +x scripts/*.sh`
 - In Telegram, talk to **@BotFather** → `/newbot` → pick a name and a username → copy the token.
 - Create a Gemini key at <https://aistudio.google.com/apikey>.
 
-### 4. Create the Cloudflare Tunnel
+### 4. Route a hostname to n8n through Cloudflare Tunnel
 
-In the Cloudflare dashboard: **Zero Trust → Networks → Tunnels → Create a tunnel → Cloudflared**,
-name it `clippipeline`, pick **Docker**, and copy the token (the long string after `--token` in the
-command it shows; you don't run that command).
+Telegram needs `https://<your hostname>/webhook/…` to reach n8n on port 5678. Pick one:
 
-Then add a **public hostname** (newer dashboards call it a *published application route*) to the tunnel:
+**A. The server already runs cloudflared (simplest).** In the Cloudflare dashboard open your existing
+tunnel (**Zero Trust → Networks → Tunnels**) and add a **public hostname** (newer dashboards call it a
+*published application route*):
 
 | Field | Value |
 |---|---|
 | Subdomain / Domain | e.g. `clips` / `example.com` |
 | Path | `^/webhook/` (only webhooks are exposed, not the n8n editor) |
-| Service | `HTTP` → `n8n:5678` |
+| Service | `HTTP` → `localhost:5678` |
+
+Use `localhost`, not `n8n`: the host's cloudflared isn't on the Docker network, it reaches n8n through
+the port Docker publishes. (If you set `N8N_BIND` to the LAN IP, use that IP instead of `localhost`.)
+
+If your tunnel is managed with a local `config.yml` instead of the dashboard, add this rule above the
+final catch-all and restart cloudflared (`sudo systemctl restart cloudflared`):
+
+```yaml
+  - hostname: clips.example.com
+    path: ^/webhook/
+    service: http://localhost:5678
+```
+
+**B. No cloudflared on the server yet.** Create a tunnel (**Zero Trust → Networks → Tunnels → Create a
+tunnel → Cloudflared**, pick **Docker**) and copy the token (the long string after `--token` in the
+command it shows; you don't run that command). Add the same public hostname as in A, but with
+service `HTTP` → `n8n:5678`. Put the token in `.env` as `TUNNEL_TOKEN=`, and start the stack with
+`docker compose --profile tunnel up -d` in step 6.
 
 ### 5. Configure
 
 ```bash
 scripts/init-env.sh      # creates .env with random secrets and the data/ folders
-nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME, TUNNEL_TOKEN
+nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNAME (+ TUNNEL_TOKEN for 4B)
 ```
 
 `PUBLIC_HOSTNAME` is the hostname from step 4 (`clips.example.com`, no `https://`).
@@ -87,7 +105,7 @@ nano .env                # set TELEGRAM_BOT_TOKEN, GEMINI_API_KEY, PUBLIC_HOSTNA
 ```bash
 scripts/fetch-openshorts.sh   # clones OpenShorts at the pinned commit into vendor/
 docker compose build          # first build takes a while (OpenShorts pulls in PyTorch, YOLO, Whisper)
-docker compose up -d
+docker compose up -d          # option 4B: docker compose --profile tunnel up -d
 docker compose logs n8n-import   # should end with: Imported and published 'ClipPipeline - Telegram approval'.
 ```
 
@@ -216,8 +234,10 @@ it as described under Troubleshooting (this replaces any edits you made to the w
 - **Bot doesn't answer.** In n8n → *Executions*, see whether anything arrived. If nothing did, check
   Telegram's view of the webhook (replace the token):
   `curl https://api.telegram.org/bot<TOKEN>/getWebhookInfo`. The URL must be
-  `https://<PUBLIC_HOSTNAME>/webhook/…/webhook` with no `last_error_message`. Then check
-  `docker compose logs cloudflared n8n`.
+  `https://<PUBLIC_HOSTNAME>/webhook/…/webhook` with no `last_error_message`. Then check the tunnel
+  (`journalctl -u cloudflared` for the host install, `docker compose logs cloudflared` for the
+  container) and `docker compose logs n8n`. From the server, `curl -s localhost:5678/healthz` should
+  answer `{"status":"ok"}`.
 - **"Job … failed: OpenShorts refused the job"** shows OpenShorts' reason. YouTube's "confirm you're
   not a bot" means it wants cookies: put a Netscape `cookies.txt` at `data/cookies.txt` (used for
   range downloads) and/or `YOUTUBE_COOKIES` in `.env` (used by OpenShorts).
