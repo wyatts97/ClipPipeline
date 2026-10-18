@@ -20,7 +20,7 @@ import httpx
 
 from . import media
 from .config import Settings
-from .diagnose import failure_hint, failure_reason
+from .diagnose import failure_hint, failure_reason, retry_delay
 from .openshorts import OpenShorts, OpenShortsError
 from .parsing import format_timestamp
 from .store import Clip, Job, Store
@@ -101,8 +101,13 @@ class Pipeline:
             options["captions"] = False
         return options
 
+    def ready_jobs(self) -> list[Job]:
+        """Queued jobs whose start time has come (automatic retries are queued for later)."""
+        now = time.time()
+        return [j for j in self.store.jobs_with_status("queued") if j.created <= now]
+
     async def _start_next(self) -> None:
-        queued = self.store.jobs_with_status("queued")
+        queued = self.ready_jobs()
         if not queued:
             self._wake.clear()
             try:
@@ -179,6 +184,9 @@ class Pipeline:
             reason = "OpenShorts failed: " + failure_reason(lines)
             if hint:
                 reason += f"\n💡 {hint}"
+            retry = self.auto_retry(job, retry_delay(lines))
+            if retry:
+                reason += f"\n🔁 Retrying automatically in {retry_delay(lines) // 60} min as job {retry.id}."
             self.fail(job, reason, detail="\n".join(lines[-150:]) or None)
         elif time.time() - job.created > self.settings.job_timeout_minutes * 60:
             self.fail(job, f"Gave up after {self.settings.job_timeout_minutes} minutes "
@@ -239,6 +247,17 @@ class Pipeline:
                 "skip_data": f"no:{clip.id}",
             })
         log.info("job %s: collected %d clip(s)", job.id, len(made), extra={"job_id": job.id})
+
+    def auto_retry(self, job: Job, delay: Optional[int]) -> Optional[Job]:
+        """Queue one delayed retry for a passing failure. A job that is itself a retry (automatic
+        or from the dashboard) isn't retried again, so a lasting problem stops after one go."""
+        if not delay or not self.settings.auto_retry or job.retry_of:
+            return None
+        retry = self.store.create_job(job.chat_id, job.source_url, job.range_start, job.range_end,
+                                      job.target_clips, retry_of=job.id)
+        self.store.update_job(retry.id, created=time.time() + delay)
+        log.info("job %s: retrying in %ds as job %s", job.id, delay, retry.id, extra={"job_id": job.id})
+        return retry
 
     def fail(self, job: Job, error: str, detail: Optional[str] = None) -> None:
         log.warning("job %s failed: %s", job.id, error, extra={"job_id": job.id, "detail": detail})

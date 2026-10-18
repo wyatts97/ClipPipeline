@@ -1,7 +1,9 @@
 """Pipeline tests against a fake OpenShorts and a fake n8n (httpx MockTransport), real ffmpeg."""
 import asyncio
+import dataclasses
 import json
 import shutil
+import time
 
 import httpx
 import pytest
@@ -209,6 +211,52 @@ def test_openshorts_failure_keeps_the_real_cause(env):
     assert len(logged["detail"].splitlines()) == 150   # the last 150 lines of OpenShorts' log
     run(pipeline.flush_outbox())
     assert "💡" in fake_n8n.events[0]["text"]          # the Telegram message carries the hint too
+
+
+def fail_with(pipeline, store, fake_os, last_line, retry_of=None):
+    fake_os.status_value = "failed"
+    fake_os.logs = ["Built 2 scoring window(s).", last_line, "    raise RuntimeError(",
+                    "RuntimeError: Clip detection failed — the AI model did not return usable clips for this video.",
+                    "Process failed with exit code 1"]
+    job = store.create_job(111, "https://youtu.be/abc", None, None, 2, retry_of=retry_of)
+    run(pipeline.start_job(job))
+    run(pipeline.poll_job(store.get_job(job.id)))
+    job = store.get_job(job.id)
+    assert job.status == "failed" and job.error.startswith("OpenShorts failed: ")
+    return job
+
+
+def test_network_failure_is_retried_once_later(env):
+    pipeline, store, fake_os, _ = env
+    job = fail_with(pipeline, store, fake_os, "❌ Gemini Error: [Errno 101] Network is unreachable")
+    retry = store.retried(job.id)
+    assert retry and retry.status == "queued"
+    assert (retry.chat_id, retry.source_url, retry.target_clips) == (111, "https://youtu.be/abc", 2)
+    assert 100 < retry.created - time.time() <= 120     # waits two minutes
+    assert retry.id not in [j.id for j in pipeline.ready_jobs()]
+    assert f"Retrying automatically in 2 min as job {retry.id}" in job.error
+
+    store.update_job(retry.id, created=time.time() - 1)  # two minutes later
+    assert retry.id in [j.id for j in pipeline.ready_jobs()]
+
+
+def test_a_retry_is_not_retried_again(env):
+    pipeline, store, fake_os, _ = env
+    job = fail_with(pipeline, store, fake_os, "❌ Gemini Error: 503 UNAVAILABLE", retry_of="earlier")
+    assert store.retried(job.id) is None and "Retrying" not in job.error
+
+
+def test_lasting_failures_are_not_retried(env):
+    pipeline, store, fake_os, _ = env
+    job = fail_with(pipeline, store, fake_os, "⚠️ 2-pass returned no clips.")
+    assert store.retried(job.id) is None and "Wider" in job.error
+
+
+def test_auto_retry_can_be_turned_off(env, settings):
+    pipeline, store, fake_os, _ = env
+    pipeline.settings = dataclasses.replace(settings, auto_retry=False)
+    job = fail_with(pipeline, store, fake_os, "❌ Gemini Error: [Errno 101] Network is unreachable")
+    assert store.retried(job.id) is None
 
 
 def test_openshorts_refusal_is_reported(env):

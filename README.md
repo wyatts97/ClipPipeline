@@ -293,6 +293,13 @@ it as described under Troubleshooting (this replaces any edits you made to the w
 - **"Job … failed: OpenShorts refused the job"** shows OpenShorts' reason. YouTube's "confirm you're
   not a bot" means it wants cookies: put a Netscape `cookies.txt` at `data/cookies.txt` (used for
   range downloads) and/or `YOUTUBE_COOKIES` in `.env` (used by OpenShorts).
+- **"Job … failed: OpenShorts failed: …"** quotes the line in OpenShorts' log that explains it, with a
+  💡 hint. Passing causes (network drop, Gemini overloaded or rate-limited) are retried once
+  automatically a few minutes later (`AUTO_RETRY`). The dashboard's job page has the full log. For
+  `Network is unreachable`, check that the container reaches Google:
+  `docker compose exec openshorts curl -sS -o /dev/null -w '%{http_code}
+' https://generativelanguage.googleapis.com/`
+  (any number, even 404, means it's reachable).
 - **Clip previews never arrive** but the job finished: `docker compose logs clipbot` shows whether n8n
   accepted the events (clipbot keeps retrying while n8n is down or the workflow is unpublished).
 - **A scan says "chat unavailable (…)"**: the reason is in the brackets. For Twitch, try the chat tool

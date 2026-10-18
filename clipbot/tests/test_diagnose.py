@@ -1,5 +1,5 @@
 """Reading OpenShorts' log of a failed job (the lines are modelled on OpenShorts' own prints)."""
-from app.diagnose import failure_hint, failure_reason
+from app.diagnose import failure_hint, failure_reason, retry_delay
 
 TAIL = [
     "Traceback (most recent call last):",
@@ -40,6 +40,32 @@ def test_little_speech():
     reason = failure_reason(lines)
     assert "🔇 Only 3 word(s)" in reason and "Vision pass returned no usable clips" in reason
     assert "nothing it rated clip-worthy" in failure_hint(lines)
+
+
+def test_network_error_from_the_real_log():
+    # Tail of the log from job d9f1fb76 on the server (2026-10-18).
+    lines = ["[132.94s -> 133.76s]  I swear on everything I love",
+             "🤖  Analyzing with Gemini (2-pass: score → detail)...",
+             "🤖  Model: gemini-3.1-flash-lite | language: en",
+             "Built 2 scoring window(s).",
+             "❌ Gemini Error: [Errno 101] Network is unreachable"] + TAIL
+    assert failure_reason(lines).startswith("❌ Gemini Error: [Errno 101] Network is unreachable")
+    assert "couldn't reach Google" in failure_hint(lines)
+    assert retry_delay(lines) == 120
+
+
+def test_retry_delays():
+    assert retry_delay(["❌ Gemini Error: 429 RESOURCE_EXHAUSTED"] + TAIL) == 300
+    assert retry_delay(["❌ Gemini Error: 503 UNAVAILABLE. The model is overloaded."] + TAIL) == 120
+    assert retry_delay(["⚠️ 2-pass returned no clips."] + TAIL) is None
+    assert retry_delay(["❌ Gemini Error: 400 INVALID_ARGUMENT. API key not valid."] + TAIL) is None
+
+
+def test_transcript_words_dont_trigger_hints():
+    lines = ["[10.0s -> 12.0s]  bro the server timed out, 503 again, network is unreachable lol",
+             "⚠️ 2-pass returned no clips."] + TAIL
+    assert "nothing it rated clip-worthy" in failure_hint(lines)
+    assert retry_delay(lines) is None
 
 
 def test_unknown_failure_falls_back_to_last_lines():

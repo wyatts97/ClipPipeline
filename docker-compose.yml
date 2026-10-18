@@ -123,6 +123,7 @@ services:
       AUTO_HOOK: ${AUTO_HOOK:-true}
       CAPTIONS: ${CAPTIONS:-true}
       MAX_RANGE_MINUTES: ${MAX_RANGE_MINUTES:-90}
+      AUTO_RETRY: ${AUTO_RETRY:-true}
       # /scan and /watch
       SCAN_TOP: ${SCAN_TOP:-5}
       SCAN_BEFORE_SECONDS: ${SCAN_BEFORE_SECONDS:-90}

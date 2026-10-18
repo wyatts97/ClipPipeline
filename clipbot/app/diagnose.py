@@ -9,9 +9,20 @@ from __future__ import annotations
 _REASON_MARKERS = ("❌", "🚫", "🔇", "returned no clips", "returned no usable clips", "RESOURCE_EXHAUSTED")
 _NOISE = ("raise RuntimeError(", "Process failed with exit code", "Traceback (most recent call last)")
 
+_NETWORK = ("Network is unreachable", "Errno 101", "Temporary failure in name resolution",
+            "Name or service not known", "Connection reset", "ConnectError", "ConnectTimeout",
+            "ReadTimeout", "timed out")
+_BUSY = ("503", "UNAVAILABLE", "overloaded", "500 INTERNAL", "Internal error encountered")
+_RATE = ("RESOURCE_EXHAUSTED", "429 Too Many", "code: 429", "exceeded your current quota")
+
 # (substring in the log, advice) - first match wins.
 _HINTS = (
-    (("RESOURCE_EXHAUSTED", "429 Too Many", "code: 429", "exceeded your current quota"),
+    (_NETWORK,
+     "OpenShorts couldn't reach Google (network). Usually a short drop on the server's connection; "
+     "if it repeats, test from the container: docker compose exec openshorts curl -sI https://generativelanguage.googleapis.com"),
+    (_BUSY,
+     "Gemini was overloaded for a moment. A retry usually works."),
+    (_RATE,
      "Gemini's quota or rate limit was hit. Wait a few minutes and retry, or enable billing on the "
      "key at aistudio.google.com (flash-lite costs cents per stream)."),
     (("API key not valid", "API_KEY_INVALID", "PERMISSION_DENIED", "GEMINI_API_KEY not found"),
@@ -44,8 +55,21 @@ def failure_reason(lines: list[str]) -> str:
     return " | ".join(picked[-4:])[:1500] or "no log output"
 
 
+def retry_delay(lines: list[str]) -> int | None:
+    """Seconds to wait before retrying when the failure was passing (network, overload, rate
+    limit), else None. Only the lines that explain the failure count, not the whole transcript."""
+    text = failure_reason(lines)
+    if any(n in text for n in _RATE):
+        return 300
+    if any(n in text for n in _NETWORK + _BUSY):
+        return 120
+    return None
+
+
 def failure_hint(lines: list[str]) -> str | None:
-    text = "\n".join(str(line) for line in lines[-80:])
+    # Only the explaining lines: the log also holds the transcript, where a streamer saying
+    # "it timed out" must not count.
+    text = failure_reason(lines)
     for needles, hint in _HINTS:
         if any(n in text for n in needles):
             return hint
