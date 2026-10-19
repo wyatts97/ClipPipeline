@@ -1,4 +1,5 @@
-"""SQLite state: jobs, clips, scans, watches, the dashboard's log and an outbox of events for n8n.
+"""SQLite state: jobs, clips, scans, watches, scheduled posts, the dashboard's log and an outbox of
+events for n8n.
 
 Everything survives a restart: unfinished jobs are picked up again and
 undelivered events are retried.
@@ -98,6 +99,33 @@ CREATE TABLE IF NOT EXISTS scan_timelines (
     scan_id TEXT PRIMARY KEY,
     data TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS publish_queue (
+    clip_id TEXT PRIMARY KEY,
+    chat_id INTEGER NOT NULL,
+    status TEXT NOT NULL,
+    publish_at REAL,
+    now INTEGER NOT NULL DEFAULT 0,
+    error TEXT,
+    attempts INTEGER NOT NULL DEFAULT 0,
+    next_try REAL NOT NULL,
+    created REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS posts (
+    id TEXT PRIMARY KEY,
+    clip_id TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    platform TEXT NOT NULL,
+    channel_name TEXT,
+    status TEXT NOT NULL,
+    publish_at REAL NOT NULL,
+    media_id TEXT,
+    media_path TEXT,
+    url TEXT,
+    error TEXT,
+    created REAL NOT NULL,
+    updated REAL NOT NULL
+);
+CREATE INDEX IF NOT EXISTS posts_clip ON posts(clip_id);
 """
 
 # Columns added after the first release; created on older databases at startup.
@@ -169,6 +197,36 @@ class MomentRow:
     @property
     def details(self) -> dict[str, Any]:
         return json.loads(self.info) if self.info else {}
+
+
+@dataclass
+class PublishRequest:
+    clip_id: str
+    chat_id: int
+    status: str            # waiting -> scheduled | failed | cancelled
+    publish_at: Optional[float]   # a time picked in the dashboard; None = the next free slot
+    now: int               # 1 = post right away
+    error: Optional[str]
+    attempts: int
+    next_try: float
+    created: float
+
+
+@dataclass
+class Post:
+    id: str                # Postiz post id; one per channel
+    clip_id: str
+    channel_id: str
+    platform: str          # youtube | tiktok | instagram
+    channel_name: Optional[str]
+    status: str            # scheduled -> published | failed | cancelled
+    publish_at: float
+    media_id: Optional[str]
+    media_path: Optional[str]
+    url: Optional[str]
+    error: Optional[str]
+    created: float
+    updated: float
 
 
 @dataclass
@@ -435,6 +493,69 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         with self._lock:
             self._db.execute(f"UPDATE watches SET {cols} WHERE id=?", (*fields.values(), watch_id))
+
+    # ---- publishing (Postiz) -----------------------------------------------
+    def queue_publish(self, clip_id: str, chat_id: int, publish_at: Optional[float] = None,
+                      now: bool = False) -> PublishRequest:
+        req = PublishRequest(clip_id, chat_id, "waiting", publish_at, int(now), None, 0, time.time(), time.time())
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO publish_queue VALUES (?,?,?,?,?,?,?,?,?)",
+                             (clip_id, chat_id, "waiting", publish_at, int(now), None, 0, req.next_try, req.created))
+        return req
+
+    def get_publish(self, clip_id: str) -> Optional[PublishRequest]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM publish_queue WHERE clip_id=?", (clip_id,)).fetchone()
+        return PublishRequest(**dict(row)) if row else None
+
+    def publish_requests(self, *statuses: str) -> list[PublishRequest]:
+        sql, args = "SELECT * FROM publish_queue", ()
+        if statuses:
+            sql, args = sql + " WHERE status IN (%s)" % ",".join("?" for _ in statuses), statuses
+        with self._lock:
+            rows = self._db.execute(sql + " ORDER BY created", args).fetchall()
+        return [PublishRequest(**dict(r)) for r in rows]
+
+    def due_publish_requests(self) -> list[PublishRequest]:
+        return [r for r in self.publish_requests("waiting") if r.next_try <= time.time()]
+
+    def update_publish(self, clip_id: str, **fields: Any) -> None:
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self._db.execute(f"UPDATE publish_queue SET {cols} WHERE clip_id=?", (*fields.values(), clip_id))
+
+    def add_post(self, post_id: str, clip_id: str, channel_id: str, platform: str,
+                 channel_name: Optional[str], publish_at: float, media_id: Optional[str],
+                 media_path: Optional[str]) -> Post:
+        now = time.time()
+        post = Post(post_id, clip_id, channel_id, platform, channel_name, "scheduled", publish_at,
+                    media_id, media_path, None, None, now, now)
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO posts VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                             (post_id, clip_id, channel_id, platform, channel_name, "scheduled", publish_at,
+                              media_id, media_path, None, None, now, now))
+        return post
+
+    def update_post(self, post_id: str, **fields: Any) -> None:
+        fields["updated"] = time.time()
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self._db.execute(f"UPDATE posts SET {cols} WHERE id=?", (*fields.values(), post_id))
+
+    def posts_for_clip(self, clip_id: str) -> list[Post]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM posts WHERE clip_id=? ORDER BY platform", (clip_id,)).fetchall()
+        return [Post(**dict(r)) for r in rows]
+
+    def list_posts(self, *statuses: str, since: float = 0, limit: int = 1000) -> list[Post]:
+        where, args = ["publish_at >= ?"], [since]
+        if statuses:
+            where.append("status IN (%s)" % ",".join("?" for _ in statuses))
+            args += statuses
+        with self._lock:
+            rows = self._db.execute(f"SELECT * FROM posts WHERE {' AND '.join(where)} "
+                                    "ORDER BY publish_at DESC LIMIT ?", (*args, limit)).fetchall()
+        return [Post(**dict(r)) for r in rows]
 
     # ---- log (the dashboard's Logs page) ----------------------------------
     def add_log(self, ts: float, level: str, source: str, message: str, job_id: Optional[str] = None,

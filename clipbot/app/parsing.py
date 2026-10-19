@@ -5,6 +5,7 @@ Accepted forms (anything else gets the help text):
     /status
     /scan <url>                   find the best moments of a VOD
     /watch <channel>, /unwatch <channel>, /watching
+    /cleanup                      offer to delete the files of finished jobs
     <url>                         clip the whole video
     <url> 1:02:00-1:12:30         clip only that part (also 62:00-72:30, 1h2m-1h12m)
     <url> clips=5                 how many clips to make (1-15)
@@ -22,7 +23,7 @@ RANGE_RE = re.compile(
 CLIPS_RE = re.compile(r"\b(?:clips?|n)\s*[=:]\s*(\d{1,2})\b", re.IGNORECASE)
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
 
-Kind = Literal["help", "status", "clip", "scan", "watch", "unwatch", "watching", "invalid"]
+Kind = Literal["help", "status", "clip", "scan", "watch", "unwatch", "watching", "cleanup", "invalid"]
 
 
 @dataclass(frozen=True)
@@ -78,6 +79,8 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
             return Command("help")
         if command == "/watching":
             return Command("watching")
+        if command in ("/cleanup", "/storage"):
+            return Command("cleanup")
         if command in ("/watch", "/unwatch"):
             if not arg:
                 return Command("invalid", error=f"Usage: {command} https://twitch.tv/<channel> "

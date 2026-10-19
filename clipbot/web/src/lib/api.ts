@@ -36,10 +36,20 @@ export interface LogItem {
   detail: string | null
 }
 
+export interface JobFiles {
+  openshorts: number
+  rejected: number
+  pending: number
+  approved: number
+  freeable: number
+  deleting: boolean
+}
+
 export interface JobDetail extends Job {
   clips: Clip[]
   logs: LogItem[]
   openshorts: { status: string | null; logs: string[] } | null
+  files: JobFiles
 }
 
 export interface Clip {
@@ -129,6 +139,7 @@ export interface Activity {
 }
 
 export interface Overview {
+  scheduled_posts: number
   working: Job[]
   queued_jobs: number
   scans: Scan[]
@@ -143,8 +154,70 @@ export interface Overview {
     n8n: boolean
     telegram_waiting: number
     telegram_failed: number
+    postiz: boolean | null
+    janitor_stuck: boolean
     disk: { total: number; free: number }
   }
+}
+
+export interface StorageReport {
+  disk: { total: number; free: number }
+  folders: Record<"pending" | "approved" | "rejected" | "previews" | "thumbs" | "tmp", number>
+  openshorts: { work: number; sources: number }
+  jobs: (Job & { files: JobFiles })[]
+  janitor_stuck: boolean
+}
+
+export type PublishPlatform = "youtube" | "tiktok" | "instagram"
+export type PostStatus = "scheduled" | "published" | "failed" | "cancelled"
+
+export interface Channel {
+  id: string
+  name: string
+  identifier: string
+  platform: PublishPlatform
+  picture: string | null
+  disabled: boolean
+}
+
+export interface PostItem {
+  id: string
+  platform: PublishPlatform
+  channel: string | null
+  status: PostStatus
+  publish_at: number
+  url: string | null
+  error: string | null
+}
+
+export interface PostGroup {
+  clip: Clip
+  status: PostStatus
+  publish_at: number
+  posts: PostItem[]
+}
+
+export interface PublishQueueItem {
+  clip: Clip
+  status: "waiting" | "failed"
+  error: string | null
+  attempts: number
+  next_try: number
+}
+
+export interface Publishing {
+  configured: boolean
+  postiz_url: string | null
+  slots: string
+  timezone: string
+  tiktok_mode: string
+  channels?: Channel[]
+  error?: string | null
+  next_slot?: number
+  upcoming?: PostGroup[]
+  recent?: PostGroup[]
+  queue?: PublishQueueItem[]
+  unscheduled?: Clip[]
 }
 
 export interface OutboxItem {
@@ -228,6 +301,15 @@ export const api = {
   createJob: (body: { url: string; start?: string; end?: string; clips?: number }) => post<Job>("/api/jobs", body),
   retryJob: (id: string) => post<Job>(`/api/jobs/${id}/retry`),
   cancelJob: (id: string) => post<Job>(`/api/jobs/${id}/cancel`),
+  deleteJobFiles: (id: string) => post<{ freed: number }>(`/api/jobs/${id}/delete-files`),
+
+  storage: () => request<StorageReport>("/api/storage"),
+  cleanup: () => post<{ jobs: number; freed: number }>("/api/storage/cleanup"),
+
+  publishing: () => request<Publishing>("/api/publishing"),
+  publish: (clipId: string, body: { at?: number | null; now?: boolean }) =>
+    post<{ queued: boolean }>(`/api/clips/${clipId}/publish`, body),
+  unschedule: (clipId: string) => post<{ cancelled: number }>(`/api/clips/${clipId}/unschedule`),
 
   scans: () => request<{ items: Scan[] }>("/api/scans"),
   scan: (id: string) => request<ScanDetail>(`/api/scans/${id}`),

@@ -14,8 +14,9 @@ import { Label } from "@/components/ui/label"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { api, type Job } from "@/lib/api"
-import { ago, clock, elapsed, parseTc, platformName, sourceLabel, tc } from "@/lib/format"
+import { api, type Job, type JobDetail } from "@/lib/api"
+import { ago, clock, elapsed, parseTc, platformName, size, sourceLabel, tc } from "@/lib/format"
+import { useDeleteJobFiles } from "@/pages/storage"
 
 type Filter = "all" | "active" | "done" | "failed"
 
@@ -177,6 +178,8 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
               </section>
             )}
 
+            <JobFilesSection job={d} />
+
             {d.openshorts && (
               <section>
                 <h3 className="mb-2 font-medium">OpenShorts log</h3>
@@ -194,6 +197,32 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
         )}
       </SheetContent>
     </Sheet>
+  )
+}
+
+function JobFilesSection({ job }: { job: JobDetail }) {
+  const remove = useDeleteJobFiles()
+  const f = job.files
+  if (!f.openshorts && !f.rejected && !f.approved && !f.pending) return null
+  const finished = ["done", "failed", "cancelled"].includes(job.status)
+  return (
+    <section>
+      <h3 className="mb-2 font-medium">Files</h3>
+      <dl className="grid grid-cols-[7rem_1fr] gap-y-1">
+        <dt className="text-muted-foreground">Source + work</dt><dd className="tabular-nums">{size(f.openshorts)}</dd>
+        <dt className="text-muted-foreground">Skipped clips</dt><dd className="tabular-nums">{size(f.rejected)}</dd>
+        <dt className="text-muted-foreground">Kept clips</dt><dd className="tabular-nums">{size(f.approved + f.pending)}</dd>
+      </dl>
+      <div className="mt-3 flex items-center gap-3">
+        {f.deleting ? <span className="text-muted-foreground">Deleting…</span> : (
+          <Button variant="outline" size="sm" disabled={!finished || !f.freeable || remove.isPending}
+            onClick={() => remove.mutate(job.id)}>
+            Delete {f.freeable ? size(f.freeable) : "files"}
+          </Button>
+        )}
+        <span className="text-xs text-muted-foreground">{finished ? "Approved and unreviewed clips stay." : "Available once the job has finished."}</span>
+      </div>
+    </section>
   )
 }
 

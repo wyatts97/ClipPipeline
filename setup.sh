@@ -8,6 +8,7 @@
 #   bash setup.sh             full guided setup
 #   bash setup.sh --env-only  only write .env (no Docker, no build)
 #   bash setup.sh --n8n-key   add the n8n API key later (failed n8n runs in the dashboard)
+#   bash setup.sh --publish   set up Postiz, which posts approved clips (add --env-only to skip Docker)
 set -euo pipefail
 
 cd "$(dirname "$0")"
@@ -16,6 +17,7 @@ TELEGRAM_API=${TELEGRAM_API:-https://api.telegram.org}
 GEMINI_API=${GEMINI_API:-https://generativelanguage.googleapis.com}
 TWITCH_ID_API=${TWITCH_ID_API:-https://id.twitch.tv}
 N8N_LOCAL=${N8N_LOCAL:-http://localhost:5678}
+POSTIZ_LOCAL=${POSTIZ_LOCAL:-http://localhost:4007}
 DOCKER=(docker)
 BOT_USERNAME=""
 ENV_ONLY=""
@@ -100,6 +102,16 @@ env_set() {  # replace KEY=..., or its "# KEY=" placeholder, or append it
     END { if (!done) print k "=" v }' "$ENV_FILE" > "$tmp"
   cat "$tmp" > "$ENV_FILE"
   rm -f "$tmp"
+}
+profile_set() {  # profile_set NAME on|off: edit COMPOSE_PROFILES, keeping the other profiles
+  local list=() current=() p
+  IFS=',' read -ra current <<<"$(env_get COMPOSE_PROFILES)"
+  for p in "${current[@]}"; do
+    p=$(trim "$p")
+    [[ -n $p && $p != "$1" ]] && list+=("$p")
+  done
+  [[ $2 == on ]] && list+=("$1")
+  env_set COMPOSE_PROFILES "$(IFS=,; printf '%s' "${list[*]}")"
 }
 
 # ---- 0. this server ----------------------------------------------------------------------------
@@ -309,7 +321,7 @@ setup_tunnel() {
     ok "cloudflared is already running on this server."
   fi
   if yes_no "Use the cloudflared already installed on this server?" "$have"; then
-    env_set COMPOSE_PROFILES ""
+    profile_set tunnel off
     ask_hostname
     route_instructions "localhost:5678"
     hint "localhost, because your cloudflared runs outside Docker and reaches n8n through its published port."
@@ -326,7 +338,7 @@ setup_tunnel() {
       cur=""
     done
     env_set TUNNEL_TOKEN "$token"
-    env_set COMPOSE_PROFILES tunnel
+    profile_set tunnel on
     ask_hostname
     route_instructions "n8n:5678"
     hint "n8n:5678, because this tunnel runs as a container next to n8n."
@@ -410,13 +422,13 @@ setup_extras() {
 # ---- generated values --------------------------------------------------------------------------------
 setup_secrets() {
   local key
-  for key in POSTGRES_PASSWORD N8N_ENCRYPTION_KEY CLIPBOT_TOKEN; do
+  for key in POSTGRES_PASSWORD N8N_ENCRYPTION_KEY CLIPBOT_TOKEN POSTIZ_JWT_SECRET; do
     # Never replaced once set: a new N8N_ENCRYPTION_KEY would lock n8n out of its saved credentials.
     if [[ -z $(env_get "$key") ]]; then env_set "$key" "$(rand_hex 32)"; ok "Generated $key"; fi
   done
   env_set PUID "$(id -u)"
   env_set PGID "$(id -g)"
-  mkdir -p data/pending data/previews data/approved data/rejected data/thumbs
+  mkdir -p data/pending data/previews data/approved data/rejected data/thumbs data/purge
 }
 
 summary() {
@@ -432,7 +444,8 @@ summary() {
     "Dashboard" "http://$(lan_ip):$(env_get DASHBOARD_PORT | grep . || echo 8090)" \
     "Time zone" "$(env_get TZ)" \
     "Whisper model" "$(env_get WHISPER_MODEL)" \
-    "Twitch clips" "$( [[ -n $(env_get TWITCH_CLIENT_ID) ]] && echo on || echo off)"
+    "Twitch clips" "$( [[ -n $(env_get TWITCH_CLIENT_ID) ]] && echo on || echo off)" \
+    "Publishing" "$( [[ -n $(env_get POSTIZ_API_KEY) ]] && echo "Postiz at https://$(env_get POSTIZ_HOSTNAME)" || echo 'off (bash setup.sh --publish)')"
 }
 
 # ---- build, start, verify -----------------------------------------------------------------------------
@@ -531,8 +544,111 @@ setup_n8n_key() {
   fi
 }
 
+# ---- publishing through Postiz (bash setup.sh --publish) ---------------------------------------------
+ask_postiz_hostname() {
+  local h
+  while true; do
+    ask "Hostname for Postiz, e.g. postiz.example.com" "$(env_get POSTIZ_HOSTNAME)"
+    h=${ANSWER#http://}
+    h=${h#https://}
+    h=${h%%/*}
+    h=${h,,}
+    if [[ $h == "$(env_get PUBLIC_HOSTNAME)" ]]; then
+      fail "Use a different hostname than Telegram's ($h): Postiz needs the whole hostname."
+    elif [[ $h =~ ^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$ ]]; then
+      env_set POSTIZ_HOSTNAME "$h"
+      return 0
+    else
+      fail "That isn't a hostname. Use a (sub)domain on Cloudflare, like postiz.example.com"
+    fi
+  done
+}
+
+ask_app_keys() {  # ask_app_keys "YouTube" ID_KEY SECRET_KEY "where to get them" "redirect path"
+  local name=$1 id_key=$2 secret_key=$3 where=$4 path=$5
+  say ""
+  say "${B}$name${N}: $where"
+  say "  Redirect URL to enter there: ${B}https://$(env_get POSTIZ_HOSTNAME)$path${N}"
+  if [[ -n $(env_get "$id_key") ]] && ! yes_no "  $name keys are set. Replace them?" N; then return 0; fi
+  ask "  $name client ID (Enter skips for now)" "$(env_get "$id_key")"
+  [[ -z $ANSWER ]] && return 0
+  env_set "$id_key" "$ANSWER"
+  ask_secret "  $name client secret" "$(env_get "$secret_key")"
+  env_set "$secret_key" "$ANSWER"
+}
+
+postiz_up() { curl -sf -o /dev/null "$POSTIZ_LOCAL/"; }
+
+setup_postiz_key() {
+  local host key code
+  host=$(env_get POSTIZ_HOSTNAME)
+  say ""
+  say "In Postiz (${B}https://$host${N}):"
+  say "  1. Sign up. Only the first account can, so that's yours."
+  say "  2. ${B}Add Channel${N} for YouTube, TikTok and Instagram (needs the keys above)."
+  say "  3. ${B}Settings → Public API${N}: copy the API key."
+  while true; do
+    ask_secret "Postiz API key (Enter skips; run bash setup.sh --publish again later)" "$(env_get POSTIZ_API_KEY)"
+    key=$ANSWER
+    [[ -z $key ]] && return 0
+    code=$(http -o /dev/null -w '%{http_code}' -H "Authorization: $key" "$POSTIZ_LOCAL/api/public/v1/is-connected")
+    if [[ $code == 200 ]]; then ok "Postiz accepted the key"; break; fi
+    fail "Postiz refused it (HTTP ${code:-no answer})."
+  done
+  env_set POSTIZ_API_KEY "$key"
+}
+
+setup_publish() {
+  step "Publishing: Postiz posts approved clips to YouTube, TikTok and Instagram"
+  hint "Postiz runs as 4 more containers (about 2-3 GB of RAM) and needs its own public hostname:"
+  hint "the platforms' login pages send you back to it, and Instagram downloads the video from it."
+  [[ -n $(env_get PUBLIC_HOSTNAME) ]] || die "Run bash setup.sh first."
+  ask_postiz_hostname
+  [[ -n $(env_get POSTIZ_JWT_SECRET) ]] || { env_set POSTIZ_JWT_SECRET "$(rand_hex 32)"; ok "Generated POSTIZ_JWT_SECRET"; }
+
+  local service="localhost:4007"
+  [[ $(env_get COMPOSE_PROFILES) == *tunnel* ]] && service="postiz:5000"
+  say "Add a second route to your tunnel (${B}Zero Trust → Networks → Tunnels${N} → your tunnel → Public hostname → Add):"
+  say "  Subdomain + Domain:  ${B}$(env_get POSTIZ_HOSTNAME)${N}"
+  say "  Path:                (empty: Postiz needs the whole hostname)"
+  say "  Service:             ${B}HTTP${N}  ${B}$service${N}"
+  yes_no "Added the route? (No is fine; add it before signing in to Postiz)" Y || true
+
+  step "Developer apps (one per platform; Enter skips any of them for now)"
+  hint "Until a platform reviews your app, posts stay private (YouTube) or go to your TikTok drafts. README → Publishing."
+  ask_app_keys "YouTube" YOUTUBE_CLIENT_ID YOUTUBE_CLIENT_SECRET \
+    "console.cloud.google.com → new project → enable YouTube Data API v3 → OAuth client (Web application)" \
+    "/integrations/social/youtube"
+  ask_app_keys "TikTok" TIKTOK_CLIENT_ID TIKTOK_CLIENT_SECRET \
+    "developers.tiktok.com → Manage apps → Connect an app; add Login Kit + Content Posting API" \
+    "/integrations/social/tiktok"
+  ask_app_keys "Instagram" INSTAGRAM_APP_ID INSTAGRAM_APP_SECRET \
+    "developers.facebook.com → Create app → Instagram API with Instagram Login (needs a creator/business account)" \
+    "/integrations/social/instagram-standalone"
+
+  step "Posting times"
+  hint "Approved clips go into the next free time of day, one clip per time, in $(env_get TZ | grep . || echo UTC)."
+  ask "Daily posting times" "$(env_get PUBLISH_SLOTS | grep . || echo 12:00,17:00,21:00)"
+  env_set PUBLISH_SLOTS "${ANSWER// /}"
+
+  profile_set publish on
+  if [[ -z $ENV_ONLY ]]; then
+    pick_docker
+    step "Start Postiz"
+    "${DOCKER[@]}" compose up -d
+    wait_for "Postiz (its first start takes a few minutes)" 600 postiz_up || {
+      hint "Check: ${DOCKER[*]} compose logs postiz-db temporal postiz"; return 0; }
+  fi
+  setup_postiz_key
+  if [[ -z $ENV_ONLY && -n $(env_get POSTIZ_API_KEY) ]]; then
+    "${DOCKER[@]}" compose up -d clipbot && ok "clipbot restarted: ✅ Post now schedules clips"
+  fi
+  say ""
+  hint "The dashboard's Publishing page shows what's scheduled. Re-run bash setup.sh --publish to change any of this."
+}
+
 usage() {
-  sed -n '2,10p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,11p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 finish() {
@@ -548,15 +664,23 @@ finish() {
   fi
   hint "Run bash setup.sh again any time to change a key; Enter keeps everything else."
   hint "Later, for failed n8n runs in the dashboard: bash setup.sh --n8n-key"
+  hint "To post approved clips to YouTube, TikTok and Instagram: bash setup.sh --publish"
 }
 
 main() {
-  case ${1:-} in
-    -h|--help) usage; return 0 ;;
-    --env-only) ENV_ONLY=1 ;;
-    --n8n-key) [[ -f $ENV_FILE ]] || die "Run bash setup.sh first."; setup_n8n_key; return 0 ;;
-    "") ;;
-    *) usage; return 2 ;;
+  local mode=full arg
+  for arg in "$@"; do
+    case $arg in
+      -h|--help) usage; return 0 ;;
+      --env-only) ENV_ONLY=1 ;;
+      --n8n-key) mode=n8n ;;
+      --publish) mode=publish ;;
+      *) usage; return 2 ;;
+    esac
+  done
+  case $mode in
+    n8n) [[ -f $ENV_FILE ]] || die "Run bash setup.sh first."; setup_n8n_key; return 0 ;;
+    publish) [[ -f $ENV_FILE ]] || die "Run bash setup.sh first."; setup_publish; return 0 ;;
   esac
   [[ -t 0 ]] || warn "Not reading from a terminal; answers come from standard input."
   printf '%sClipPipeline setup%s\n' "$B" "$N"

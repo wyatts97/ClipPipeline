@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { Activity, AlertTriangle, Clapperboard, Film, LogOut, ScanSearch } from "lucide-react"
+import { Activity, AlertTriangle, CalendarClock, Clapperboard, Film, HardDrive, LogOut, ScanSearch } from "lucide-react"
 import type { ReactNode } from "react"
 import { NavLink, Outlet } from "react-router"
 
@@ -16,8 +16,10 @@ export function useOverview() {
 const NAV = [
   { to: "/", label: "Overview", icon: Activity, end: true },
   { to: "/review", label: "Review", icon: Film, count: "pending" as const },
+  { to: "/publishing", label: "Publishing", icon: CalendarClock, count: "scheduled" as const },
   { to: "/jobs", label: "Jobs", icon: Clapperboard },
   { to: "/scans", label: "Scans", icon: ScanSearch },
+  { to: "/storage", label: "Storage", icon: HardDrive },
   { to: "/logs", label: "Logs & errors", icon: AlertTriangle, count: "errors" as const },
 ]
 
@@ -25,7 +27,11 @@ export function Shell() {
   const overview = useOverview()
   const qc = useQueryClient()
   const logout = useMutation({ mutationFn: api.logout, onSuccess: () => qc.invalidateQueries({ queryKey: ["session"] }) })
-  const counts = { pending: overview.data?.pending_clips ?? 0, errors: overview.data?.errors_24h ?? 0 }
+  const counts = {
+    pending: overview.data?.pending_clips ?? 0,
+    errors: overview.data?.errors_24h ?? 0,
+    scheduled: overview.data?.scheduled_posts ?? 0,
+  }
 
   return (
     <div className="flex min-h-screen flex-col md:flex-row">
@@ -49,7 +55,8 @@ export function Shell() {
                   <span className="flex-1">{label}</span>
                   {count && counts[count] > 0 && (
                     <span className={cn("rounded-sm px-1.5 text-xs tabular-nums",
-                      count === "errors" ? "bg-destructive/15 text-destructive" : "bg-primary/15 text-primary")}>
+                      count === "errors" ? "bg-destructive/15 text-destructive"
+                        : count === "scheduled" ? "bg-muted text-muted-foreground" : "bg-primary/15 text-primary")}>
                       {counts[count]}
                     </span>
                   )}
@@ -120,8 +127,18 @@ function StatusStrip() {
                 : "Telegram delivered"}
         </span>
       </Item>
-      <Item className={cn("ml-auto", h.disk.free / h.disk.total < 0.1 ? "text-destructive" : "text-muted-foreground")}>
-        {bytes(h.disk.free)} free
+      {h.postiz !== null && (
+        <Item>
+          <Light tone={h.postiz ? "ok" : "bad"} />
+          <span className={h.postiz ? "text-muted-foreground" : "text-destructive"}>
+            {h.postiz ? `${data.scheduled_posts} post${data.scheduled_posts === 1 ? "" : "s"} scheduled` : "Postiz unreachable"}
+          </span>
+        </Item>
+      )}
+      <Item className={cn("ml-auto", h.disk.free / h.disk.total < 0.1 || h.janitor_stuck ? "text-destructive" : "text-muted-foreground")}>
+        <NavLink to="/storage" className="hover:underline">
+          {h.janitor_stuck ? "Deletions waiting for the janitor · " : ""}{bytes(h.disk.free)} free
+        </NavLink>
       </Item>
     </div>
   )

@@ -28,6 +28,7 @@ def settings(tmp_path) -> Settings:
         data_dir=tmp_path / "data",
         openshorts_url="http://openshorts:8000",
         openshorts_output_dir=tmp_path / "os-output",
+        openshorts_uploads_dir=tmp_path / "os-uploads",
         notify_url="http://n8n:5678/webhook/clipbot-events",
         notify_token="test-token",
         self_url="http://clipbot:8080",

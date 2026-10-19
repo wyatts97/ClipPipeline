@@ -59,6 +59,16 @@ class Settings:
     twitch_client_secret: str = ""
     twitch_downloader: str = "TwitchDownloaderCLI"
     auto_retry: bool = True       # retry once, delayed, after a network / overload / rate-limit failure
+    openshorts_uploads_dir: Path = Path("/openshorts-uploads")
+    # publishing through Postiz (empty API key = off)
+    postiz_url: str = "http://postiz:5000/api"
+    postiz_api_key: str = ""
+    postiz_public_url: str = ""
+    publish_slots: str = "12:00,17:00,21:00"
+    publish_to: str = "youtube,tiktok,instagram"
+    tiktok_post_mode: str = "UPLOAD"      # UPLOAD = your TikTok inbox, DIRECT_POST = publish
+    youtube_visibility: str = "public"
+    timezone: str = "UTC"
     # web dashboard
     dashboard_password: str = ""
     n8n_url: str = "http://n8n:5678"
@@ -111,6 +121,16 @@ class Settings:
             twitch_client_secret=os.environ.get("TWITCH_CLIENT_SECRET", "").strip(),
             twitch_downloader=os.environ.get("TWITCH_DOWNLOADER", "TwitchDownloaderCLI"),
             auto_retry=_bool("AUTO_RETRY", True),
+            openshorts_uploads_dir=Path(os.environ.get("OPENSHORTS_UPLOADS_DIR", "/openshorts-uploads")),
+            postiz_url=os.environ.get("POSTIZ_URL", "http://postiz:5000/api").rstrip("/"),
+            postiz_api_key=os.environ.get("POSTIZ_API_KEY", "").strip(),
+            postiz_public_url=(f"https://{os.environ['POSTIZ_HOSTNAME'].strip()}"
+                               if os.environ.get("POSTIZ_HOSTNAME", "").strip() else ""),
+            publish_slots=os.environ.get("PUBLISH_SLOTS", "12:00,17:00,21:00"),
+            publish_to=os.environ.get("PUBLISH_TO", "youtube,tiktok,instagram"),
+            tiktok_post_mode=os.environ.get("TIKTOK_POST_MODE", "UPLOAD").strip().upper(),
+            youtube_visibility=os.environ.get("YOUTUBE_VISIBILITY", "public").strip().lower(),
+            timezone=os.environ.get("TZ", "UTC").strip() or "UTC",
             dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
             n8n_url=os.environ.get("N8N_URL", "http://n8n:5678").rstrip("/"),
             n8n_api_key=os.environ.get("N8N_API_KEY", "").strip(),

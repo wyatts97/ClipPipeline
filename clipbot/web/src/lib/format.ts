@@ -46,6 +46,36 @@ export function bytes(n: number): string {
   return gb >= 10 ? `${Math.round(gb)} GB` : `${gb.toFixed(1)} GB`
 }
 
+/** File sizes: "820 MB", "1.4 GB", "–" for nothing. */
+export function size(n: number | null | undefined): string {
+  if (!n) return "–"
+  if (n >= 1024 ** 3) return bytes(n)
+  if (n >= 1024 ** 2) return `${Math.round(n / 1024 ** 2)} MB`
+  return "< 1 MB"
+}
+
+/** "Tue 21 Oct, 17:00" in the browser's time zone. */
+export function when(ts: number | null | undefined): string {
+  if (!ts) return "–"
+  const date = new Date(ts * 1000)
+  const day = date.toLocaleDateString([], { weekday: "short", day: "numeric", month: "short" })
+  return `${day}, ${date.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`
+}
+
+/** For <input type="datetime-local">: local "YYYY-MM-DDTHH:mm" and back. */
+export function toLocalInput(ts: number): string {
+  const d = new Date(ts * 1000)
+  const pad = (n: number) => String(n).padStart(2, "0")
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}`
+}
+
+export function fromLocalInput(value: string): number | null {
+  const t = new Date(value).getTime()
+  return Number.isFinite(t) ? t / 1000 : null
+}
+
+export const publishPlatformName = { youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram" } as const
+
 export function elapsed(since: number, now = Date.now() / 1000): string {
   return tc(Math.max(0, now - since))
 }

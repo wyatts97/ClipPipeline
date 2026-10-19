@@ -3,19 +3,23 @@
 Send a stream VOD or video link to your Telegram bot. OpenShorts cuts it into vertical clips with
 captions and a hook line, and each clip comes back to Telegram as a preview with **✅ Post / ❌ Skip**
 buttons. Approved clips land in `data/approved/` with a `.json` file holding the title, hook and
-descriptions, ready for publishing.
+descriptions. With [publishing](#publishing-postiz-posts-approved-clips) on, ✅ Post also schedules the
+clip on YouTube Shorts, TikTok and Instagram Reels through a self-hosted Postiz.
 
 You don't have to find the good parts yourself: `/scan <VOD>` reads the chat replay, loudness and
 viewer clips, and sends the stream's top moments with **🎬 Clip it** buttons. `/watch <channel>` does
 that automatically every time a stream ends.
 
 The **web dashboard** (`http://<server-ip>:8090`) shows what the machine is doing, lets you review and
-edit clips at a desk, start and retry jobs, pick moments on a scan's timeline, and read errors.
+edit clips at a desk, start and retry jobs, pick moments on a scan's timeline, see what's scheduled,
+free disk space, and read errors.
 
 ```
  You (Telegram) ──► Cloudflare Tunnel ──► n8n ──► clipbot ──► OpenShorts (Whisper + Gemini + ffmpeg)
        ▲                                   │         │
        └──── preview + ✅/❌ buttons ◄──────┘◄────────┘  data/pending → approved/ | rejected/
+                                                    │
+                                    approved clips  └──► Postiz ──► YouTube / TikTok / Instagram
 ```
 
 | Service | What it does | Reachable from |
@@ -23,13 +27,16 @@ edit clips at a desk, start and retry jobs, pick moments on a scan's timeline, a
 | `n8n` | Telegram trigger, buttons, the workflow you'll extend | LAN `:5678`; internet only `/webhook/*` via the tunnel |
 | `clipbot` | Parses your messages, scans streams for moments, watches channels, queues jobs, downloads time ranges (yt-dlp), polls OpenShorts, makes Telegram-sized previews, moves files. Also serves the web dashboard | LAN `:8090` (dashboard, password); Docker network for n8n |
 | `openshorts` | [mutonby/openshorts](https://github.com/mutonby/openshorts) (MIT) at a pinned commit: picks moments, reframes to 9:16, burns captions | Docker network only |
-| `postgres` | n8n's database | Docker network only |
+| `postgres` | n8n's database (and Postiz's and Temporal's when publishing is on) | Docker network only |
+| `janitor` | Deletes OpenShorts' files of finished jobs when you ask ([Freeing disk space](#freeing-disk-space)) | no network |
+| `postiz` + `temporal`, `postiz-redis` (optional, `publish` profile) | [Postiz](https://github.com/gitroomhq/postiz-app) (AGPL-3.0): posts approved clips on a schedule. Temporal is its scheduling engine | internet via its own tunnel hostname |
 | Cloudflare Tunnel | Gives Telegram an HTTPS URL without opening ports on your router: your existing `cloudflared` on the host, or the optional `cloudflared` container | outbound only |
 | `dashboard` (optional) | OpenShorts' own web UI to re-edit clips by hand | LAN `:5175` |
 
 ## What you need
 
-- The Debian 13 server: **8 GB RAM minimum (16 GB better)**, ~25 GB free disk for images, models and clips.
+- The Debian 13 server: **8 GB RAM minimum (16 GB better, and needed for publishing)**, ~25 GB free disk
+  for images, models and clips (Postiz adds about 6 GB of images).
   Everything runs on the CPU (see [CPU notes](#cpu-notes)).
 - A Telegram account, a **Gemini API key** (free tier is fine to start), and a **Cloudflare account
   with a domain** on it (for the tunnel).
@@ -183,6 +190,8 @@ From now on the bot ignores every other chat.
 | **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
+| **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
+| **Storage** | Free disk, what takes the space, and every job with files left: **Delete files** per job or **Clean up finished jobs**. |
 | **Logs & errors** | clipbot's log (errors and warnings by default, click a row for the traceback), Telegram messages that are queued or gave up (send again or delete), and failed n8n runs once `N8N_API_KEY` is set. |
 
 Jobs and scans you start from the dashboard report to your Telegram chat like any other (the first id
@@ -199,12 +208,13 @@ in `ALLOWED_CHAT_IDS`). Signing in lasts 30 days; changing `DASHBOARD_PASSWORD` 
 | `/watch <channel link>` | Scans every new VOD of that channel when the stream ends |
 | `/watching`, `/unwatch <channel>` | List / stop watched channels |
 | `/status` | Your recent jobs and scans |
+| `/cleanup` | Offers to delete the sources and leftovers of finished jobs ([below](#freeing-disk-space)) |
 | `/help` | Usage |
 
 Links can be anything yt-dlp handles: YouTube, Twitch VODs, Kick VODs, and many more.
 
-Buttons: **✅ Post** moves the clip to `data/approved/YYYY-MM-DD_<title>_<id>.mp4` (plus `.json`),
-**❌ Skip** moves it to `data/rejected/`. Pressing a button twice is harmless.
+Buttons: **✅ Post** moves the clip to `data/approved/YYYY-MM-DD_<title>_<id>.mp4` (plus `.json`) and,
+with publishing on, schedules it. **❌ Skip** moves it to `data/rejected/`. Pressing a button twice is harmless.
 
 Defaults live in `.env` (`TARGET_CLIPS`, `CLIP_MIN/MAX_SECONDS`, `OPENSHORTS_LAYOUTS`, `AUTO_HOOK`,
 `CAPTIONS`). After editing: `docker compose up -d`.
@@ -257,6 +267,66 @@ that is live when you send `/watch` is scanned when it ends; older VODs are not 
 Limits: sub-only Twitch VODs have no public chat (the scan says "chat unavailable" and uses the rest).
 Kick's `?t=` links may open at the start of the VOD.
 
+## Publishing: Postiz posts approved clips
+
+[Postiz](https://github.com/gitroomhq/postiz-app) is a free, self-hosted social media scheduler. With it
+running, every ✅ Post goes out on its own:
+
+1. clipbot uploads the approved clip to Postiz and schedules it on every connected YouTube, TikTok and
+   Instagram channel at the next free time of day (`PUBLISH_SLOTS`, default `12:00,17:00,21:00` in
+   `TZ`, one clip per time). Telegram confirms with **⚡ Post now** and **✖️ Unschedule**.
+2. When a post goes live, Telegram sends its link and a reminder to submit it to the campaign. TikTok
+   clips land in your TikTok inbox instead (see below), and failures get a message too.
+3. The dashboard's **Publishing** page shows all of it. Posts moved or deleted in Postiz's own calendar
+   are picked up within a few minutes.
+
+Captions come from OpenShorts: the YouTube title is its Shorts title and the description is the hook
+plus `#shorts`; TikTok and Instagram get its descriptions. Edit them in **Review** before approving.
+The podcast-style "comment X and I'll send you…" line OpenShorts sometimes writes is dropped.
+
+### Set it up
+
+Run `bash setup.sh --publish` on the server (again any time to change something):
+
+| Step | You do |
+|---|---|
+| Hostname | Pick one for Postiz, e.g. `postiz.example.com`, and add a second route to your tunnel: Path empty, Service `HTTP` → `localhost:4007` (`postiz:5000` with the tunnel container). The platforms' login pages send you back there, and Instagram downloads videos from it. |
+| Developer apps | Paste the client ID and secret of each platform's app (table below). Enter skips one for now. |
+| Posting times | The daily times, e.g. `12:00,17:00,21:00`. |
+| Start | Postiz, Temporal and Redis start. The first start takes a few minutes. |
+| Postiz account | Open `https://postiz.example.com` and sign up (only the first account can). **Add Channel** for each platform, then **Settings → Public API**, copy the key and paste it. clipbot restarts with publishing on. |
+
+One developer app per platform. The redirect URL uses your Postiz hostname:
+
+| Platform | Create it at | Redirect URL | Until the platform reviews your app |
+|---|---|---|---|
+| YouTube | [console.cloud.google.com](https://console.cloud.google.com): new project → enable **YouTube Data API v3** → OAuth consent screen (External; add yourself as a test user) → Credentials → OAuth client ID, type Web application | `https://<postiz-host>/integrations/social/youtube` | Uploads stay **private** until Google audits the project (YouTube API Services audit form). Apply early; it takes weeks. |
+| TikTok | [developers.tiktok.com](https://developers.tiktok.com) → Manage apps → Connect an app: add **Login Kit** and **Content Posting API**, platform Web, terms and privacy pages on your domain | `https://<postiz-host>/integrations/social/tiktok` | clipbot sends clips to your **TikTok inbox** (`TIKTOK_POST_MODE=UPLOAD`): open TikTok, add the campaign's sound if it asks for one, post within 24 h. Direct posting (`DIRECT_POST`) stays private until TikTok audits the app. |
+| Instagram | [developers.facebook.com](https://developers.facebook.com) → Create app → use case **Instagram API with Instagram login**; add your Instagram account (creator or business) as an Instagram tester | `https://<postiz-host>/integrations/social/instagram-standalone` | Works for your own account while the app is in development mode. |
+
+Postiz uses the stack's Postgres (its own database) plus Temporal and Redis: about 2-3 GB of RAM in
+all. Sign-up is closed after the first account (`DISABLE_REGISTRATION`). Other settings:
+`PUBLISH_TO` (which platforms get clips), `YOUTUBE_VISIBILITY`, and `POSTIZ_VERSION` (pinned image).
+
+## Freeing disk space
+
+Each job leaves OpenShorts' copy of its source (the downloaded range, or the whole video for a plain
+link) plus OpenShorts' work files. Those are the big files. OpenShorts deletes them itself after
+24 hours and caps them at 15 GB of sources and 25 GB of work files. To free them sooner:
+
+- **Telegram:** once you've decided every clip of a job, the bot asks
+  "🧹 … take 1.4 GB" with **🗑 Delete files** and **Keep**. `/cleanup` offers the same for every
+  finished job at once.
+- **Dashboard:** **Storage** shows free disk, what takes the space, and every job with files left.
+  **Delete files** per job, or **Clean up finished jobs**. The job page has the button too.
+
+A delete removes the source, OpenShorts' work files and the skipped clips. Approved clips, clips still
+waiting for review, thumbnails and the job's history stay. Clipping the same stream again downloads its
+part again.
+
+The `janitor` container does the deleting: OpenShorts' files belong to its own user, so clipbot only
+hands it the job's id. If the dashboard says deletions are waiting, start it: `docker compose up -d janitor`.
+
 ## CPU notes
 
 This box has no NVIDIA GPU, and OpenShorts only accelerates on CUDA/NVENC, so transcription and
@@ -277,6 +347,10 @@ scripts/fetch-openshorts.sh main && docker compose build openshorts && docker co
 
 The second line moves OpenShorts off the pinned commit. If clipbot can no longer talk to it,
 go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild.
+
+**From a version before publishing and cleanup:** `git pull`, then
+`docker compose build clipbot && docker compose up -d`. That restarts Postgres once (it allows more
+connections now) and starts the janitor. Publishing stays off until you run `bash setup.sh --publish`.
 
 If an update changes `n8n/workflow.template.json`, the running n8n keeps your imported copy. Re-import
 it as described under Troubleshooting (this replaces any edits you made to the workflow in n8n).
@@ -304,6 +378,13 @@ it as described under Troubleshooting (this replaces any edits you made to the w
   accepted the events (clipbot keeps retrying while n8n is down or the workflow is unpublished).
 - **A scan says "chat unavailable (…)"**: the reason is in the brackets. For Twitch, try the chat tool
   by hand: `docker compose exec clipbot TwitchDownloaderCLI chatdownload --id <vod id> -o /tmp/c.json`.
+- **Postiz doesn't come up:** `docker compose logs postiz-db temporal postiz`. `postiz-db` stops with a
+  message when `POSTIZ_HOSTNAME` or `POSTIZ_JWT_SECRET` is missing (`bash setup.sh --publish` sets
+  both). Temporal takes about a minute on its first start, Postiz a few minutes.
+- **Clips aren't scheduled:** the dashboard's Publishing page shows why (no channel connected, a
+  setting Postiz refused, Postiz down) with a **Retry** button; Telegram says so too.
+- **A post failed:** Postiz's calendar shows the platform's reason under the post. An expired login
+  means reconnecting that channel in Postiz.
 - **Re-import the workflow** (e.g. after breaking it): delete the workflow and both ClipBot
   credentials in n8n, then `docker compose run --rm n8n-import --force && docker compose restart n8n`.
 - Logs: `docker compose logs -f clipbot openshorts`.
@@ -337,8 +418,8 @@ npm run dev                                         # hot reload on :5173, API p
 runs the real API with OpenShorts mocked (`--reseed` starts over). Point `npm run dev` at it with
 `CLIPBOT_DEV_API=http://127.0.0.1:8090 npm run dev`.
 
-## Next: publishing
+## Next: campaign tooling
 
-Approved clips and their metadata are in `data/approved/`. Publishing (YouTube Shorts, TikTok draft
-upload, Instagram via Postiz or Upload-Post) hooks into the workflow after **Send decision reply**.
-Apply for the TikTok developer app and the Google Cloud API audit early; both take weeks.
+Campaigns from Content Rewards (which also runs Reach's) and Discord as cards in Telegram, their rules
+(hashtags, sound, watermark, length) applied to captions and checked before posting, and daily view
+counts with an earnings estimate.

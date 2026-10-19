@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 import httpx
 
-from . import media
+from . import media, storage
 from .config import Settings
 from .diagnose import failure_hint, failure_reason, retry_delay
 from .openshorts import OpenShorts, OpenShortsError
@@ -55,6 +55,7 @@ class Pipeline:
         self.store = store
         self.openshorts = openshorts
         self.notify_client = notify_client or httpx.AsyncClient(timeout=20)
+        self.publisher = None   # set by main.create_app when publishing is configured
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
@@ -297,7 +298,13 @@ class Pipeline:
         if clip.preview_path:
             Path(clip.preview_path).unlink(missing_ok=True)
         self.store.decide_clip(clip.id, status, str(dest))
-        return status.capitalize(), reply.format(name=dest.name, id=clip.id)
+        reply = reply.format(name=dest.name, id=clip.id)
+        if status == "approved" and self.publisher:
+            line = self.publisher.on_approved(self.store.get_clip(clip.id), job.chat_id)
+            if line:
+                reply += "\n" + line
+        storage.offer_cleanup(self.settings, self.store, job)
+        return status.capitalize(), reply
 
     # ---- outbox ------------------------------------------------------------
     async def flush_outbox(self) -> None:

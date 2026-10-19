@@ -16,6 +16,9 @@ const STATUS: Record<string, { label: string; tone: Tone }> = {
   pending: { label: "Needs review", tone: "yours" },
   approved: { label: "Approved", tone: "ok" },
   rejected: { label: "Skipped", tone: "idle" },
+  waiting: { label: "Scheduling", tone: "working" },
+  scheduled: { label: "Scheduled", tone: "idle" },
+  published: { label: "Posted", tone: "ok" },
 }
 
 const LIGHT: Record<Tone, string> = {

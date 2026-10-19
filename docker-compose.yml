@@ -3,11 +3,12 @@
 #
 #   docker compose up -d                       # core stack
 #   COMPOSE_PROFILES=tunnel in .env            # + a cloudflared container (setup.sh sets it; skip if the host runs cloudflared)
+#   COMPOSE_PROFILES=publish in .env           # + Postiz, the scheduler that posts approved clips (combine: tunnel,publish)
 #   docker compose --profile dashboard up -d   # + OpenShorts web dashboard on :5175
 #
-# Only n8n's /webhook/ paths are reachable from the internet (through a Cloudflare
-# Tunnel route to n8n on :5678). Everything else stays on this server's LAN or the
-# internal Docker network.
+# Reachable from the internet (through Cloudflare Tunnel routes): n8n's /webhook/ paths,
+# and Postiz on its own hostname when publishing is on. Everything else stays on this
+# server's LAN or the internal Docker network.
 
 name: clippipeline
 
@@ -19,6 +20,8 @@ services:
       POSTGRES_USER: n8n
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run scripts/init-env.sh first}
       POSTGRES_DB: n8n
+    # Also holds Postiz's and Temporal's databases when publishing is on; Temporal keeps many connections.
+    command: ["postgres", "-c", "max_connections=200"]
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
@@ -138,13 +141,147 @@ services:
       DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
       N8N_API_KEY: ${N8N_API_KEY:-}
       TZ: ${TZ:-UTC}
+      # publishing through Postiz (off while POSTIZ_API_KEY is empty)
+      POSTIZ_API_KEY: ${POSTIZ_API_KEY:-}
+      POSTIZ_HOSTNAME: ${POSTIZ_HOSTNAME:-}
+      PUBLISH_SLOTS: ${PUBLISH_SLOTS:-12:00,17:00,21:00}
+      PUBLISH_TO: ${PUBLISH_TO:-youtube,tiktok,instagram}
+      TIKTOK_POST_MODE: ${TIKTOK_POST_MODE:-UPLOAD}
+      YOUTUBE_VISIBILITY: ${YOUTUBE_VISIBILITY:-public}
     volumes:
       - ./data:/data                              # pending/ approved/ rejected/ live here
-      - openshorts_output:/openshorts-output:ro
+      - openshorts_output:/openshorts-output:ro   # read-only: sizes for the Storage page;
+      - openshorts_uploads:/openshorts-uploads:ro #   the janitor does the deleting
     ports:
       - "${N8N_BIND:-0.0.0.0}:${DASHBOARD_PORT:-8090}:8080"   # dashboard on the LAN: http://<server-ip>:8090
     depends_on:
       - openshorts
+
+  # Deletes OpenShorts' files of finished jobs when you ask (🗑 in Telegram, the Storage page).
+  # clipbot can't: they belong to OpenShorts' own user. No network, nothing else to do.
+  janitor:
+    image: busybox:${BUSYBOX_VERSION:-1.38.0}
+    restart: unless-stopped
+    network_mode: none
+    command: ["sh", "/janitor.sh"]
+    environment:
+      PURGE: /data/purge
+    volumes:
+      - ./scripts/janitor.sh:/janitor.sh:ro
+      - ./data:/data
+      - openshorts_output:/output
+      - openshorts_uploads:/uploads
+
+  # ---- publishing (COMPOSE_PROFILES=publish): Postiz + what it needs ----------------------------
+  # Postiz posts approved clips to YouTube / TikTok / Instagram. It needs its own public hostname
+  # (POSTIZ_HOSTNAME, a Cloudflare Tunnel route to http://localhost:4007): the platforms' login
+  # pages send you back there, and Instagram fetches the video from it.
+  postiz:
+    profiles: ["publish"]
+    image: ghcr.io/gitroomhq/postiz-app:${POSTIZ_VERSION:-v2.25.0}
+    restart: unless-stopped
+    environment:
+      MAIN_URL: https://${POSTIZ_HOSTNAME:-postiz.invalid}
+      FRONTEND_URL: https://${POSTIZ_HOSTNAME:-postiz.invalid}
+      NEXT_PUBLIC_BACKEND_URL: https://${POSTIZ_HOSTNAME:-postiz.invalid}/api
+      BACKEND_INTERNAL_URL: http://localhost:3000
+      JWT_SECRET: ${POSTIZ_JWT_SECRET:-}
+      DATABASE_URL: postgresql://n8n:${POSTGRES_PASSWORD}@postgres:5432/postiz
+      REDIS_URL: redis://postiz-redis:6379
+      TEMPORAL_ADDRESS: temporal:7233
+      IS_GENERAL: "true"
+      DISABLE_REGISTRATION: "true"      # only the first account (yours) can sign up
+      RUN_CRON: "true"
+      STORAGE_PROVIDER: local
+      UPLOAD_DIRECTORY: /uploads
+      NEXT_PUBLIC_UPLOAD_DIRECTORY: /uploads
+      API_LIMIT: "300"                  # clipbot's posts per hour through the public API
+      TZ: ${TZ:-UTC}
+      # Your developer apps (README → Publishing). Empty = that platform's button does nothing.
+      YOUTUBE_CLIENT_ID: ${YOUTUBE_CLIENT_ID:-}
+      YOUTUBE_CLIENT_SECRET: ${YOUTUBE_CLIENT_SECRET:-}
+      TIKTOK_CLIENT_ID: ${TIKTOK_CLIENT_ID:-}
+      TIKTOK_CLIENT_SECRET: ${TIKTOK_CLIENT_SECRET:-}
+      INSTAGRAM_APP_ID: ${INSTAGRAM_APP_ID:-}
+      INSTAGRAM_APP_SECRET: ${INSTAGRAM_APP_SECRET:-}
+      FACEBOOK_APP_ID: ${FACEBOOK_APP_ID:-}
+      FACEBOOK_APP_SECRET: ${FACEBOOK_APP_SECRET:-}
+    volumes:
+      - postiz_config:/config
+      - postiz_uploads:/uploads
+    ports:
+      - "127.0.0.1:${POSTIZ_PORT:-4007}:5000"   # for the host's cloudflared; open it through its hostname
+    healthcheck:
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 180s
+    depends_on:
+      postiz-db:
+        condition: service_completed_successfully
+      postiz-redis:
+        condition: service_healthy
+      temporal:
+        condition: service_healthy
+
+  # One-shot: checks the settings Postiz needs and creates its database in the shared Postgres.
+  postiz-db:
+    profiles: ["publish"]
+    image: postgres:17-alpine
+    restart: "no"
+    environment:
+      PGPASSWORD: ${POSTGRES_PASSWORD}
+      POSTIZ_HOSTNAME: ${POSTIZ_HOSTNAME:-}
+      POSTIZ_JWT_SECRET: ${POSTIZ_JWT_SECRET:-}
+    entrypoint:
+      - sh
+      - -c
+      - |
+        [ -n "$$POSTIZ_HOSTNAME" ] || { echo "Set POSTIZ_HOSTNAME in .env (bash setup.sh --publish does)"; exit 1; }
+        [ -n "$$POSTIZ_JWT_SECRET" ] || { echo "Set POSTIZ_JWT_SECRET in .env (bash setup.sh --publish does)"; exit 1; }
+        psql -h postgres -U n8n -d n8n -tAc "SELECT 1 FROM pg_database WHERE datname='postiz'" | grep -q 1 \
+          || psql -h postgres -U n8n -d n8n -c 'CREATE DATABASE postiz'
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  postiz-redis:
+    profiles: ["publish"]
+    image: redis:${REDIS_VERSION:-7.4.11-alpine}
+    restart: unless-stopped
+    volumes:
+      - postiz_redis:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli ping | grep -q PONG"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # Postiz runs scheduled posts as Temporal workflows. Search lives in Postgres here, so the
+  # Elasticsearch container from Postiz's own compose file isn't needed.
+  temporal:
+    profiles: ["publish"]
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.28.1}
+    restart: unless-stopped
+    environment:
+      DB: postgres12
+      DB_PORT: "5432"
+      POSTGRES_USER: n8n
+      POSTGRES_PWD: ${POSTGRES_PASSWORD}
+      POSTGRES_SEEDS: postgres
+      DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+    volumes:
+      - ./postiz/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
+    healthcheck:
+      test: ["CMD", "temporal", "operator", "cluster", "health", "--address", "temporal:7233"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+      start_period: 60s
+    depends_on:
+      postgres:
+        condition: service_healthy
 
   # Optional: only for servers without their own cloudflared. Its tunnel route points at http://n8n:5678.
   cloudflared:
@@ -178,3 +315,6 @@ volumes:
   openshorts_output:
   openshorts_uploads:
   openshorts_models:
+  postiz_config:
+  postiz_uploads:
+  postiz_redis:

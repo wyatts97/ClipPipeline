@@ -1,4 +1,5 @@
-"""Exercise setup.sh --env-only against fake Telegram, Gemini and Twitch APIs.
+"""Exercise setup.sh --env-only (and --publish --env-only) against fake Telegram, Gemini, Twitch and
+Postiz APIs.
 
     python dev/setup_check.py
 
@@ -25,6 +26,7 @@ BASH = os.environ.get("SETUP_BASH") or (str(GIT_BASH) if GIT_BASH.exists() else 
 GOOD_TOKEN = "123456789:AAHgoodtokengoodtokengoodtoken1234"
 GEMINI_KEY = "AIzaGoodGeminiKey_1234567890"
 TUNNEL = "eyJhIjoiYWJjZGVmIiwidCI6IjEyMzQ1Njc4LTkwYWItY2RlZiIsInMiOiJzZWNyZXQifQ=="
+POSTIZ_KEY = "postiz-good-key-0123456789"
 STATE = {"acked": False}
 
 
@@ -64,6 +66,9 @@ class Fake(BaseHTTPRequestHandler):
                 if offset == "102":
                     STATE["acked"] = True
                 return self.reply(200, {"ok": True, "result": []})
+        if url.path == "/api/public/v1/is-connected":
+            good = self.headers.get("Authorization") == POSTIZ_KEY
+            return self.reply(200 if good else 401, {"connected": True} if good else {"msg": "Invalid API key"})
         if url.path == "/v1beta/models":
             good = self.headers.get("x-goog-api-key") == GEMINI_KEY
             return self.reply(200 if good else 400, {"models": []} if good else {"error": {"code": 400}})
@@ -78,11 +83,12 @@ class Fake(BaseHTTPRequestHandler):
         return self.reply(404, {})
 
 
-def run(workdir: Path, answers: list[str], port: int) -> str:
+def run(workdir: Path, answers: list[str], port: int, *flags: str) -> str:
     env = {"TELEGRAM_API": f"http://127.0.0.1:{port}", "GEMINI_API": f"http://127.0.0.1:{port}",
-           "TWITCH_ID_API": f"http://127.0.0.1:{port}", "NO_COLOR": "1"}
+           "TWITCH_ID_API": f"http://127.0.0.1:{port}", "POSTIZ_LOCAL": f"http://127.0.0.1:{port}",
+           "NO_COLOR": "1"}
     # Bytes, not text: in text mode Windows would send every newline as \r\n.
-    proc = subprocess.run([BASH, "setup.sh", "--env-only"], cwd=workdir,
+    proc = subprocess.run([BASH, "setup.sh", *flags, "--env-only"], cwd=workdir,
                           input=("\n".join(answers) + "\n").encode("utf-8"),
                           capture_output=True, timeout=120, env={**os.environ, **env})
     out = proc.stdout.decode("utf-8", errors="replace")
@@ -132,7 +138,7 @@ def main() -> None:
         }
         for key, value in expect.items():
             assert env.get(key) == value, (key, env.get(key), out)
-        for key in ("POSTGRES_PASSWORD", "N8N_ENCRYPTION_KEY", "CLIPBOT_TOKEN"):
+        for key in ("POSTGRES_PASSWORD", "N8N_ENCRYPTION_KEY", "CLIPBOT_TOKEN", "POSTIZ_JWT_SECRET"):
             assert re.fullmatch(r"[0-9a-f]{64}", env[key]), (key, env[key])
         assert "Token works: @clip_test_bot" in out and "Got it: Wyatt (4242)" in out
         assert "That doesn't look like a bot token" in out and "Telegram refused it: Unauthorized" in out
@@ -153,6 +159,34 @@ def main() -> None:
         assert env["COMPOSE_PROFILES"] == "" and env["PUBLIC_HOSTNAME"] == "clips.example.com"
         assert "localhost:5678" in out
         print("✓ switching to the server's own cloudflared clears the tunnel profile")
+
+        out = run(work, [
+            "clips.example.com",                     # Telegram's hostname: refused
+            "https://Postiz.Example.com/",           # normalised
+            "y",                                     # route added
+            "yt-id", "yt-secret",                    # YouTube
+            "",                                      # TikTok: skipped for now
+            "ig-id", "ig-secret",                    # Instagram
+            "9:00, 18:30",                           # posting times
+            "wrong-key", POSTIZ_KEY,                 # Postiz: refused, then fine
+        ], port, "--publish")
+        env = env_of(work)
+        expect = {"POSTIZ_HOSTNAME": "postiz.example.com", "YOUTUBE_CLIENT_ID": "yt-id",
+                  "YOUTUBE_CLIENT_SECRET": "yt-secret", "TIKTOK_CLIENT_ID": "", "INSTAGRAM_APP_ID": "ig-id",
+                  "INSTAGRAM_APP_SECRET": "ig-secret", "PUBLISH_SLOTS": "9:00,18:30",
+                  "POSTIZ_API_KEY": POSTIZ_KEY, "COMPOSE_PROFILES": "publish"}
+        for key, value in expect.items():
+            assert env.get(key) == value, (key, env.get(key), out)
+        assert "Use a different hostname than Telegram's" in out and "Postiz refused it (HTTP 401)" in out
+        assert "https://postiz.example.com/integrations/social/youtube" in out and "localhost:4007" in out
+        print("✓ --publish: hostname check, app keys, posting times, Postiz key check, publish profile")
+
+        before = (work / ".env").read_bytes()
+        run(work, [""] * 20, port, "--publish")
+        assert (work / ".env").read_bytes() == before, "re-run of --publish with Enter changed .env"
+        run(work, [""] * 40, port)                  # full setup again: back to the tunnel container
+        assert env_of(work)["COMPOSE_PROFILES"] == "publish,tunnel", env_of(work)["COMPOSE_PROFILES"]
+        print("✓ re-runs keep the publishing settings and the publish profile")
         print("\nSETUP CHECKS PASSED")
     finally:
         server.shutdown()

@@ -18,10 +18,13 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from . import storage
 from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
 from .platforms import detect_vod, timestamp_link
-from .store import Clip, Job, MomentRow, Scan, Store
+from .postiz import PostizError
+from .publisher import next_free_slot
+from .store import Clip, Job, MomentRow, Post, Scan, Store
 
 COOKIE = "cp_session"
 SESSION_DAYS = 30
@@ -211,7 +214,10 @@ async def overview(request: Request):
     settings, store = settings_of(request), store_of(request)
     pipeline = request.app.state.pipeline
     now = time.time()
-    openshorts_ok, n8n_ok = await asyncio.gather(pipeline.openshorts.healthy(), _n8n_ok(settings))
+    publisher = request.app.state.publisher
+    openshorts_ok, n8n_ok, postiz_ok = await asyncio.gather(
+        pipeline.openshorts.healthy(), _n8n_ok(settings),
+        publisher.postiz.healthy() if publisher.enabled else asyncio.sleep(0, None))
 
     working = []
     for job in store.jobs_with_status("downloading", "submitting", "processing"):
@@ -270,7 +276,9 @@ async def overview(request: Request):
         "week": {"approved": decided.get("approved", 0), "rejected": decided.get("rejected", 0),
                  "jobs": sum(store.count_by_status("jobs", since=week).values()),
                  "scans": sum(store.count_by_status("scans", since=week).values())},
-        "health": {"openshorts": openshorts_ok, "n8n": n8n_ok,
+        "scheduled_posts": len(store.list_posts("scheduled", since=now)),
+        "health": {"openshorts": openshorts_ok, "n8n": n8n_ok, "postiz": postiz_ok,
+                   "janitor_stuck": storage.janitor_stuck(settings),
                    "telegram_waiting": sum(1 for e in outbox if not e["dead"]),
                    "telegram_failed": sum(1 for e in outbox if e["dead"]),
                    "disk": {"total": disk.total, "free": disk.free}},
@@ -400,9 +408,12 @@ async def get_job(job_id: str, request: Request):
                           "logs": [str(line)[:500] for line in ((doc or {}).get("logs") or [])][-80:]}
         except Exception as e:
             openshorts = {"status": "unreachable", "logs": [str(e) or type(e).__name__]}
+    usage = storage.job_usage(settings, store, job)
     return {**job_out(store, job),
             "clips": [clip_out(settings, c, job) for c in store.clips_for_job(job.id)],
-            "logs": store.query_logs(job_id=job.id, limit=200), "openshorts": openshorts}
+            "logs": store.query_logs(job_id=job.id, limit=200), "openshorts": openshorts,
+            "files": {**usage, "freeable": storage.freeable(usage),
+                      "deleting": storage.purge_requested(settings, job.openshorts_job)}}
 
 
 @router.post("/jobs", dependencies=authed, status_code=201)
@@ -440,6 +451,137 @@ async def cancel_job(job_id: str, request: Request):
     if not request.app.state.pipeline.cancel(job_id):
         raise HTTPException(409, "This job has already finished.")
     return job_out(store, store.get_job(job_id))
+
+
+@router.post("/jobs/{job_id}/delete-files", dependencies=authed)
+async def delete_job_files(job_id: str, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    job = _job_or_404(store, job_id)
+    try:
+        freed = storage.delete_job_files(settings, store, job)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"freed": freed}
+
+
+# ---- storage --------------------------------------------------------------------
+@router.get("/storage", dependencies=authed)
+async def storage_report(request: Request):
+    settings, store = settings_of(request), store_of(request)
+    report = await asyncio.to_thread(storage.usage_report, settings, store)
+    jobs = [{**job_out(store, item["job"]),
+             "files": {**item["usage"], "freeable": storage.freeable(item["usage"]), "deleting": item["deleting"]}}
+            for item in report["jobs"]]
+    jobs.sort(key=lambda j: j["files"]["freeable"], reverse=True)
+    return {**report, "jobs": jobs}
+
+
+@router.post("/storage/cleanup", dependencies=authed)
+async def storage_cleanup(request: Request):
+    settings, store = settings_of(request), store_of(request)
+    candidates = storage.cleanup_candidates(settings, store)
+    freed = sum(storage.delete_job_files(settings, store, job) for job, _ in candidates)
+    return {"jobs": len(candidates), "freed": freed}
+
+
+# ---- publishing -----------------------------------------------------------------
+class PublishIn(BaseModel):
+    at: Optional[float] = None     # unix time; empty = the next free slot
+    now: bool = False
+
+
+def post_out(post: Post) -> dict[str, Any]:
+    return {"id": post.id, "platform": post.platform, "channel": post.channel_name, "status": post.status,
+            "publish_at": post.publish_at, "url": post.url, "error": post.error}
+
+
+def _group_status(posts: list[Post]) -> str:
+    states = {p.status for p in posts}
+    for status in ("failed", "scheduled", "published"):
+        if status in states:
+            return status
+    return "cancelled"
+
+
+@router.get("/publishing", dependencies=authed)
+async def publishing(request: Request):
+    settings, store = settings_of(request), store_of(request)
+    publisher = request.app.state.publisher
+    base = {"configured": publisher.enabled, "postiz_url": settings.postiz_public_url or None,
+            "slots": publisher.slot_label(), "timezone": settings.timezone,
+            "tiktok_mode": settings.tiktok_post_mode}
+    if not publisher.enabled:
+        return base
+    channels, error = [], None
+    try:
+        channels = await asyncio.wait_for(publisher.postiz.channels(), 6)
+    except (PostizError, asyncio.TimeoutError) as e:
+        error = str(e) or "Postiz didn't answer in time."
+    now = time.time()
+    by_clip: dict[str, list[Post]] = {}
+    for post in store.list_posts(since=now - 30 * 86400, limit=1000):
+        by_clip.setdefault(post.clip_id, []).append(post)
+    groups = []
+    for clip_id, posts in by_clip.items():
+        clip = store.get_clip(clip_id)
+        if not clip:
+            continue
+        live = [p for p in posts if p.status != "cancelled"] or posts
+        groups.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id)),
+                       "status": _group_status(live), "publish_at": min(p.publish_at for p in live),
+                       "posts": [post_out(p) for p in sorted(live, key=lambda p: p.platform)]})
+    upcoming = sorted((g for g in groups if g["status"] == "scheduled"), key=lambda g: g["publish_at"])
+    recent = sorted((g for g in groups if g["status"] != "scheduled"), key=lambda g: g["publish_at"], reverse=True)
+    queue = []
+    for req in store.publish_requests("waiting", "failed"):
+        clip = store.get_clip(req.clip_id)
+        if clip:
+            queue.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id)), "status": req.status,
+                          "error": req.error, "attempts": req.attempts, "next_try": req.next_try})
+    busy = {q["clip"]["id"] for q in queue} | {
+        clip_id for clip_id, posts in by_clip.items() if any(p.status in ("scheduled", "published") for p in posts)}
+    unscheduled = [clip_out(settings, c, store.get_job(c.job_id))
+                   for c in store.list_clips("approved", limit=100) if c.id not in busy]
+    taken = {int(p.publish_at // 60) for p in store.list_posts("scheduled", since=now)}
+    return {**base, "channels": channels, "error": error,
+            "next_slot": next_free_slot(publisher.slots, publisher.tz, now, taken),
+            "upcoming": upcoming, "recent": recent[:50], "queue": queue, "unscheduled": unscheduled[:50]}
+
+
+def _publisher(request: Request):
+    publisher = request.app.state.publisher
+    if not publisher.enabled:
+        raise HTTPException(503, "Publishing is off. Set POSTIZ_API_KEY in .env (see the README's Publishing section).")
+    return publisher
+
+
+@router.post("/clips/{clip_id}/publish", dependencies=authed)
+async def publish_clip(clip_id: str, body: PublishIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    publisher = _publisher(request)
+    clip = _clip_or_404(store, clip_id)
+    job = store.get_job(clip.job_id)
+    chat_id = job.chat_id if job else default_chat(settings)
+    try:
+        if any(p.status == "scheduled" for p in store.posts_for_clip(clip.id)):
+            await publisher.reschedule(clip.id, chat_id, body.at, body.now)
+        else:
+            publisher.queue(clip, chat_id, body.at, body.now)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except PostizError as e:
+        raise HTTPException(502, str(e))
+    return {"queued": True}
+
+
+@router.post("/clips/{clip_id}/unschedule", dependencies=authed)
+async def unschedule_clip(clip_id: str, request: Request):
+    publisher = _publisher(request)
+    _clip_or_404(store_of(request), clip_id)
+    try:
+        return {"cancelled": await publisher.unschedule(clip_id)}
+    except PostizError as e:
+        raise HTTPException(502, str(e))
 
 
 # ---- scans ----------------------------------------------------------------------

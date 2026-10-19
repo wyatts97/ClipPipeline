@@ -7,8 +7,10 @@ import { JobsPage } from "@/pages/jobs"
 import { LoginPage } from "@/pages/login"
 import { LogsPage } from "@/pages/logs"
 import { OverviewPage } from "@/pages/overview"
+import { PublishingPage } from "@/pages/publishing"
 import { ReviewPage } from "@/pages/review"
 import { ScansPage } from "@/pages/scans"
+import { StoragePage } from "@/pages/storage"
 
 export function App() {
   const session = useQuery({ queryKey: ["session"], queryFn: api.session, staleTime: 60_000 })
@@ -30,10 +32,12 @@ export function App() {
       <Route element={<Shell />}>
         <Route index element={<OverviewPage />} />
         <Route path="review" element={<ReviewPage />} />
+        <Route path="publishing" element={<PublishingPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="jobs/:jobId" element={<JobsPage />} />
         <Route path="scans" element={<ScansPage />} />
         <Route path="scans/:scanId" element={<ScansPage />} />
+        <Route path="storage" element={<StoragePage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Route>

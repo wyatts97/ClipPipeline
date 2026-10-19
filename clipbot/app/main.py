@@ -2,7 +2,8 @@
 
 For n8n (X-Clipbot-Token):
 POST /messages   {chat_id, text}  -> {reply}           a Telegram text message
-POST /decisions  {chat_id, data}  -> {toast, reply}    a button press (ok:/no: clips, sc: moments)
+POST /decisions  {chat_id, data}  -> {toast, reply}    a button press: ok:/no: clips, sc: moments,
+                                                       rm:/kp: cleanup, pn:/pu: scheduled posts
 GET  /previews/{clip_id}                               the small preview n8n sends to Telegram
 
 For the browser (DASHBOARD_PASSWORD login): /api/* (dashboard.py) and the dashboard itself at /.
@@ -21,11 +22,12 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from . import dashboard, logbook
+from . import dashboard, logbook, storage
 from .config import Settings
 from .openshorts import OpenShorts
 from .parsing import format_timestamp, parse_message
 from .pipeline import Pipeline, range_label
+from .publisher import Publisher
 from .scout import Scout
 from .store import Store
 
@@ -43,8 +45,9 @@ https://youtu.be/VIDEO_ID clips=5
 🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips) and sends each with a 🎬 button.
 👀 /watch <channel link> scans every new VOD when the stream ends. /watching lists them, /unwatch <channel> stops.
 📋 /status lists your recent jobs and scans.
+🧹 /cleanup offers to delete the sources and leftovers of finished jobs.
 
-✅ Post moves a clip to approved/, ❌ Skip moves it to rejected/."""
+✅ Post moves a clip to approved/ (and, with Postiz set up, schedules it for the next free slot); ❌ Skip moves it to rejected/."""
 
 
 class MessageIn(BaseModel):
@@ -58,7 +61,8 @@ class DecisionIn(BaseModel):
 
 
 def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenShorts] = None,
-               pipeline_factory=Pipeline, run_background: bool = True) -> FastAPI:
+               pipeline_factory=Pipeline, run_background: bool = True,
+               publisher_factory=Publisher) -> FastAPI:
     settings = settings or Settings.from_env()
 
     @asynccontextmanager
@@ -75,15 +79,20 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
         client = openshorts or OpenShorts(settings.openshorts_url)
         pipeline = pipeline_factory(settings, store, client)
         scout = Scout(settings, store, pipeline)
+        publisher = publisher_factory(settings, store)
+        pipeline.publisher = publisher
         app.state.store, app.state.pipeline, app.state.scout = store, pipeline, scout
+        app.state.publisher = publisher
         if run_background:
             await pipeline.start()
             await scout.start()
+            await publisher.start()
         if not settings.notify_token:
             log.warning("CLIPBOT_TOKEN is empty: the API is unauthenticated")
         try:
             yield
         finally:
+            await publisher.stop()
             if run_background:
                 await scout.stop()
                 await pipeline.stop()
@@ -114,6 +123,10 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
             return {"toast": "Not allowed", "reply": None}
         if body.data.startswith("sc:"):
             toast, reply = app.state.scout.choose(body.chat_id, body.data)
+        elif body.data.startswith(("rm:", "kp:")):
+            toast, reply = storage.button(settings, app.state.store, body.chat_id, body.data)
+        elif body.data.startswith(("pn:", "pu:")):
+            toast, reply = await app.state.publisher.button(body.chat_id, body.data)
         else:
             toast, reply = app.state.pipeline.decide(body.chat_id, body.data)
         return {"toast": toast, "reply": reply}
@@ -188,6 +201,8 @@ async def handle_message(app: FastAPI, settings: Settings, chat_id: int, text: s
         return scout.remove_watch(chat_id, cmd.arg or "")
     if cmd.kind == "watching":
         return scout.list_watches(chat_id)
+    if cmd.kind == "cleanup":
+        return storage.offer_cleanup_all(settings, store, chat_id)
 
     job = store.create_job(chat_id, cmd.url, cmd.start, cmd.end,
                            cmd.target_clips or settings.target_clips)
