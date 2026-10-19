@@ -10,12 +10,14 @@ import hmac
 import json
 import shutil
 import time
+import zipfile
+from datetime import date
 from pathlib import Path
-from typing import Any, Optional, Union
+from typing import Any, Iterator, Optional, Union
 
 import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
 from . import captions, fonts, media, storage, templates
@@ -23,7 +25,7 @@ from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
 from .platforms import detect_vod, timestamp_link
 from .postiz import PostizError
-from .publisher import next_free_slot
+from .publisher import caption_for, next_free_slot, youtube_title
 from .store import Clip, Job, MomentRow, Post, Scan, Store
 
 COOKIE = "cp_session"
@@ -149,6 +151,9 @@ def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional
         "sfx": clip.manual_sfx(), "render_state": clip.render_state, "render_error": clip.render_error,
         "can_render": clip.status == "pending" and clean.is_file(), "credit": meta.get("credit"),
         "word_count": len(clip.word_list()),
+        "download_url": f"/api/clips/{clip.id}/download",
+        "post_text": {"youtube_title": youtube_title(clip), "youtube": caption_for("youtube", clip),
+                      "tiktok": caption_for("tiktok", clip), "instagram": caption_for("instagram", clip)},
         "id": clip.id, "job_id": clip.job_id, "index": clip.idx, "status": clip.status,
         "title": clip.title, "hook": clip.hook, "duration": clip.duration, "decided": clip.decided,
         "description_tiktok": meta.get("video_description_for_tiktok"),
@@ -373,6 +378,77 @@ async def clip_video(clip_id: str, request: Request):
     if not Path(clip.path).is_file():
         raise HTTPException(404, "The clip's file is gone.")
     return FileResponse(clip.path, media_type="video/mp4")
+
+
+def download_name(clip: Clip) -> str:
+    """Approved clips keep their approved/ name; others get title + id."""
+    if clip.status == "approved":
+        return Path(clip.path).name
+    return f"{media.slugify(clip.title)}_{clip.id}.mp4"
+
+
+@router.get("/clips/{clip_id}/download", dependencies=authed)
+async def clip_download(clip_id: str, request: Request):
+    clip = _clip_or_404(store_of(request), clip_id)
+    if not Path(clip.path).is_file():
+        raise HTTPException(404, "The clip's file is gone.")
+    return FileResponse(clip.path, media_type="video/mp4", filename=download_name(clip))
+
+
+class _ZipSink:
+    """A write-only file for zipfile that hands back what was written, so the zip streams out
+    without a temporary file (zipfile handles the missing seek/tell itself)."""
+
+    def __init__(self) -> None:
+        self._chunks: list[bytes] = []
+
+    def write(self, data: bytes) -> int:
+        self._chunks.append(bytes(data))
+        return len(data)
+
+    def flush(self) -> None:
+        pass
+
+    def take(self) -> bytes:
+        data = b"".join(self._chunks)
+        self._chunks.clear()
+        return data
+
+
+def zip_stream(files: list[tuple[Path, str]]) -> Iterator[bytes]:
+    """Stored (not compressed: video already is) zip of (path, name in the zip) pairs."""
+    sink = _ZipSink()
+    with zipfile.ZipFile(sink, "w", compression=zipfile.ZIP_STORED, allowZip64=True) as archive:
+        for path, name in files:
+            info = zipfile.ZipInfo.from_file(path, name)
+            with path.open("rb") as src, archive.open(info, "w", force_zip64=True) as dst:
+                while chunk := src.read(1024 * 1024):
+                    dst.write(chunk)
+                    yield sink.take()
+            yield sink.take()
+    yield sink.take()
+
+
+@router.get("/clips/download.zip", dependencies=authed)
+async def clips_zip(request: Request, status: str = "approved", ids: Optional[str] = None):
+    """Every clip with this status (or just `ids`, comma separated) as one zip, approved ones with
+    their .json (title, hook, captions)."""
+    store = store_of(request)
+    wanted = {i for i in (ids or "").split(",") if i}
+    clips = [c for c in store.list_clips(status, limit=1000)
+             if (not wanted or c.id in wanted) and Path(c.path).is_file()]
+    if not clips:
+        raise HTTPException(404, f"No {status} clips to download.")
+    files: list[tuple[Path, str]] = []
+    for clip in clips:
+        name = download_name(clip)
+        files.append((Path(clip.path), name))
+        sidecar = Path(clip.path).with_suffix(".json")
+        if sidecar.is_file():
+            files.append((sidecar, Path(name).with_suffix(".json").name))
+    filename = f"clippipeline-{status}-{date.today().isoformat()}.zip"
+    return StreamingResponse(zip_stream(files), media_type="application/zip",
+                             headers={"Content-Disposition": f'attachment; filename="{filename}"'})
 
 
 @router.get("/clips/{clip_id}/thumb", dependencies=authed)
@@ -652,7 +728,7 @@ async def list_templates(request: Request):
             "presets": captions.PRESETS, "effects": list(captions.EFFECTS), "positions": list(captions.POSITIONS),
             "triggers": list(templates.TRIGGERS), "fonts": fonts.list_fonts(settings),
             "sounds": [s["name"] for s in await _sound_items(settings)],
-            "punchlines": bool(settings.gemini_api_key)}
+            "kinds": templates.MOMENT_KINDS, "gemini": bool(settings.gemini_api_key)}
 
 
 @router.post("/templates", dependencies=authed, status_code=201)

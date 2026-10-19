@@ -190,7 +190,7 @@ From now on the bot ignores every other chat.
 | Page | For |
 |---|---|
 | **Overview** | Clips waiting for you, what OpenShorts is rendering right now (with its latest log line), problems with a one-click fix (retry a job, scan again, resend a Telegram message), the last 7 days and recent activity. The strip at the top is always visible: OpenShorts, queue, Telegram delivery, free disk. |
-| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**. |
+| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**: the new version is sent to Telegram again with fresh ✅/❌ buttons. **Post it yourself** downloads the clip and copies its TikTok, Instagram and YouTube text (what publishing would post, credit line included). The **Approved** tab downloads all approved clips as one zip, with their `.json` files. |
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
@@ -345,7 +345,7 @@ Five come built in (edit, copy or delete them on the **Templates** page):
 |---|---|---|
 | **Standard** (default) | Anton, yellow active word, pop: the look clips had before templates | none |
 | **Hormozi** | Montserrat ExtraBold, words appear as they're said | none |
-| **Meme** | Luckiest Guy, one big word at a time | `vine-boom` on up to 2 punchlines |
+| **Meme** | Luckiest Guy, one big word at a time | `vine-boom` on up to 2 punchlines or shocks |
 | **Sneaky** | soft, sentence case | `sneaky-snitch` under the voice, quieter while someone talks; adds the credit line |
 | **Hype** | box behind the active word | `vine-boom` where chat exploded |
 
@@ -369,10 +369,13 @@ a sound by its file name without the extension, so `vine-boom.mp3` is `vine-boom
 | at the start / at the end | first frame / last second |
 | where chat exploded | the `/scan` chat peak (clips made from a scan moment) |
 | on certain words | whenever one of your words is said, e.g. `what, no way` |
-| on punchlines | where Gemini thinks the joke lands (uses `GEMINI_API_KEY`, a few cents per thousand clips) |
+| on moments | moments Gemini finds in the clip's words, by kind: punchlines, shocks, fails, awkward, hype, sneaky (uses `GEMINI_API_KEY`, a few cents per thousand clips) |
 | by hand | Review → Look → **Add at playhead** |
 
-Effects stay at least 1.5 seconds apart. **Fonts:** Anton, Bangers, Bebas Neue, Luckiest Guy,
+Give each kind of moment its own rule: a vine boom on punchlines, a sad trombone on fails, an airhorn on
+hype. A rule can hold several sounds; each effect picks one (never the same twice in a row, and the same
+picks every time that clip renders), so a batch of clips doesn't all sound alike. Each rule has its own
+volume. Effects stay at least 1.5 seconds apart. **Fonts:** Anton, Bangers, Bebas Neue, Luckiest Guy,
 Montserrat ExtraBold and Poppins ExtraBold are built in (open licenses, in `clipbot/fonts`); add your own
 `.ttf`/`.otf` on the Templates page. A template only with music or effects takes seconds to render;
 captions mean one more video encode, about as long as the clip on this CPU.
@@ -435,7 +438,7 @@ it as described under Troubleshooting (this replaces any edits you made to the w
   its transcript was empty (music-only footage, or its files expired before the clip was collected).
 - **A template's music or effect is missing:** Telegram and the Review page name the sound; upload a file
   with that name on the Templates page and re-render the clip.
-- **Punchline effects never land:** clipbot needs `GEMINI_API_KEY` (the same key as OpenShorts), then
+- **Moment effects never land:** clipbot needs `GEMINI_API_KEY` (the same key as OpenShorts), then
   `docker compose up -d clipbot`.
 - **Postiz doesn't come up:** `docker compose logs postiz-db temporal postiz`. `postiz-db` stops with a
   message when `POSTIZ_HOSTNAME` or `POSTIZ_JWT_SECRET` is missing (`bash setup.sh --publish` sets

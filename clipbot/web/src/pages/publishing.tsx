@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { ExternalLink } from "lucide-react"
+import { Download, ExternalLink } from "lucide-react"
 import { useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
@@ -184,6 +184,9 @@ function Upcoming({ groups, onMove }: { groups: PostGroup[]; onMove: (clip: Clip
                 <Button size="sm" variant="outline" onClick={() => publish.mutate({ clip: g.clip, now: true })} disabled={publish.isPending}>Post now</Button>
                 <Button size="sm" variant="outline" onClick={() => onMove(g.clip, g.publish_at)}>Move</Button>
                 <Button size="sm" variant="ghost" onClick={() => unschedule.mutate(g.clip)} disabled={unschedule.isPending}>Unschedule</Button>
+                <Button size="icon" variant="ghost" asChild aria-label="Download the clip">
+                  <a href={g.clip.download_url} download><Download /></a>
+                </Button>
               </div>
             </li>
           ))}
@@ -234,6 +237,9 @@ function Recent({ groups }: { groups: PostGroup[] }) {
             </div>
             <PostChips posts={g.posts} />
             <Status status={g.status} className="w-24" />
+            <Button size="icon" variant="ghost" asChild aria-label="Download the clip">
+              <a href={g.clip.download_url} download><Download /></a>
+            </Button>
           </li>
         ))}
       </ul>

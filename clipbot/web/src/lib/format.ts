@@ -76,6 +76,28 @@ export function fromLocalInput(value: string): number | null {
 
 export const publishPlatformName = { youtube: "YouTube", tiktok: "TikTok", instagram: "Instagram" } as const
 
+/** Copy text, also on plain-http LAN pages (no navigator.clipboard there) and where the browser
+ * refuses clipboard permission: both fall back to the older copy command. */
+export async function copyText(text: string): Promise<void> {
+  if (window.isSecureContext && navigator.clipboard) {
+    try {
+      return await navigator.clipboard.writeText(text)
+    } catch {
+      /* permission refused: fall through */
+    }
+  }
+  const area = document.createElement("textarea")
+  area.value = text
+  area.setAttribute("readonly", "")
+  area.style.position = "fixed"
+  area.style.opacity = "0"
+  document.body.appendChild(area)
+  area.select()
+  const ok = document.execCommand("copy")
+  area.remove()
+  if (!ok) throw new Error("Copy failed")
+}
+
 export function elapsed(since: number, now = Date.now() / 1000): string {
   return tc(Math.max(0, now - since))
 }

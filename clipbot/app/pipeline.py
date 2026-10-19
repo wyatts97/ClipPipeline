@@ -54,7 +54,7 @@ def clip_caption(job: Job, clip: Clip, total: int, template_name: Optional[str] 
 class Rendered:
     template_id: str
     template: dict[str, Any]
-    punchlines: Optional[list[float]] = None
+    moments: Optional[list[dict[str, Any]]] = None   # Gemini's moments, cached on the clip
     notes: list[str] = field(default_factory=list)   # e.g. a sound that isn't in data/sounds
     error: Optional[str] = None                      # the render failed; the clip has no template
 
@@ -232,7 +232,7 @@ class Pipeline:
                 duration = await media.probe_duration(source)
                 words, splits = await self.clip_text(job, idx, local)
                 done = await self.render_clip_files(job, source, master, words, splits, job.template,
-                                                    [], meta, duration)
+                                                    [], meta, duration, seed=f"{job.id}_{idx}")
                 await media.make_preview(master, preview, s.preview_max_mb, s.preview_height)
             except (media.MediaError, OpenShortsError, httpx.HTTPError, OSError) as e:
                 problems.append(f"clip {idx + 1}: {e}")
@@ -249,8 +249,8 @@ class Pipeline:
                                 "it has no captions. Re-render it from the dashboard's Review page.")
             if not words and s.captions and done.template["captions"]["enabled"]:
                 problems.append(f"clip {idx + 1}: no words from OpenShorts, so no captions")
-            if done.punchlines is not None:
-                meta["punchlines"] = done.punchlines
+            if done.moments is not None:
+                meta["moments"] = done.moments
             if done.template.get("credit"):
                 meta["credit"] = done.template["credit"]
             title = info.get("title") or info.get("video_title_for_youtube_short")
@@ -311,12 +311,12 @@ class Pipeline:
     async def render_clip_files(self, job: Job, source: Path, dst: Path, words: list[dict[str, Any]],
                                 splits: list[tuple[float, float]], template_id: Optional[str],
                                 manual_sfx: list[dict[str, Any]], meta: dict[str, Any],
-                                duration: float) -> Rendered:
+                                duration: float, seed: str = "") -> Rendered:
         """Render source (no captions) into dst with a template. A failed render copies the source,
         so the clip still exists; the error says why."""
         s = self.settings
         tid, template = self.resolve_template(template_id)
-        done = Rendered(tid, template, punchlines=meta.get("punchlines"))
+        done = Rendered(tid, template, moments=templates.cached_moments(meta))
         work = s.folder("tmp") / f"render-{dst.stem}"
         work.mkdir(parents=True, exist_ok=True)
         plan = render.Plan(duration=duration, voice_volume=template["voice_volume"])
@@ -334,16 +334,17 @@ class Pipeline:
                 else:
                     done.notes.append(f"the {template['name']} template's music ({music['sound']}) isn't in "
                                       "data/sounds; upload it on the dashboard's Templates page")
-            wants_punchlines = any(r["at"] == "punchline" for r in template["sfx"])
-            if wants_punchlines and done.punchlines is None and words:
-                done.punchlines = await templates.find_punchlines(
-                    s, words, max([r["max"] for r in template["sfx"] if r["at"] == "punchline"] or [2]))
+            if templates.wants_moments(template) and done.moments is None and words:
+                done.moments = await templates.find_moments(s, words)
+                if done.moments is None:     # asked again on the next render
+                    done.notes.append("moment effects were skipped: " + (
+                        "Gemini didn't answer" if s.gemini_api_key else "clipbot needs GEMINI_API_KEY"))
             moment = self.store.moment_for_job(job.id)
             peak = templates.peak_in_clip(moment.peak if moment else None,
                                           (job.range_start or 0.0) + float(meta.get("start") or 0.0)
                                           if moment else None)
             missing = set()
-            for event in templates.place_effects(template, words, duration, peak, done.punchlines, manual_sfx):
+            for event in templates.place_effects(template, words, duration, peak, done.moments, manual_sfx, seed):
                 path = templates.find_sound(s, event["sound"])
                 if path:
                     plan.effects.append(render.Effect(path, event["t"], event["volume"]))
@@ -384,11 +385,14 @@ class Pipeline:
         tmp = Path(clip.path).with_name(f"{clip.job_id}_{clip.idx}.rendering.mp4")
         try:
             done = await self.render_clip_files(job, source, tmp, clip.word_list(), clip.split_list(), template_id,
-                                                manual, dict(clip.meta), clip.duration or await media.probe_duration(source))
+                                                manual, dict(clip.meta), clip.duration or await media.probe_duration(source),
+                                                seed=f"{clip.job_id}_{clip.idx}")
             tmp.replace(clip.path)
-            if clip.preview_path:
-                await media.make_preview(Path(clip.path), Path(clip.preview_path), self.settings.preview_max_mb,
-                                         self.settings.preview_height)
+            preview = Path(clip.preview_path or self.settings.folder("previews") / f"{clip.job_id}_{clip.idx}.mp4")
+            await media.make_preview(Path(clip.path), preview, self.settings.preview_max_mb,
+                                     self.settings.preview_height)
+            if not clip.preview_path:
+                self.store.update_clip(clip.id, preview_path=str(preview))
             await media.make_thumbnail(Path(clip.path), self.settings.folder("thumbs") / f"{clip.job_id}_{clip.idx}.jpg")
         except (media.MediaError, OSError) as e:
             tmp.unlink(missing_ok=True)
@@ -396,8 +400,9 @@ class Pipeline:
             log.warning("clip %s: re-render failed: %s", clip.id, e, extra={"job_id": job.id})
             return
         meta = dict(clip.meta)
-        if done.punchlines is not None:
-            meta["punchlines"] = done.punchlines
+        if done.moments is not None:
+            meta["moments"] = done.moments
+            meta.pop("punchlines", None)
         meta.pop("credit", None)
         if done.template.get("credit"):
             meta["credit"] = done.template["credit"]
@@ -406,6 +411,26 @@ class Pipeline:
                                meta=meta, render_state="failed" if done.error else None,
                                render_error=error[:1000] if error else None)
         log.info("clip %s: rendered with the %s template", clip.id, done.template["name"], extra={"job_id": job.id})
+        self.resend_clip(job, self.store.get_clip(clip.id), done)
+
+    def resend_clip(self, job: Job, clip: Clip, done: Rendered) -> None:
+        """Send a re-rendered clip to Telegram again, with fresh ✅/❌ buttons. The earlier message's
+        buttons keep working; they act on the same clip, which now is this render."""
+        if not clip.preview_path or not Path(clip.preview_path).is_file():
+            return
+        total = len(self.store.clips_for_job(job.id))
+        lines = ["🔁 Re-rendered"]
+        if done.error:
+            lines.append(f"⚠️ The {done.template['name']} template failed, so this one has no captions.")
+        elif done.notes:
+            lines += [f"⚠️ {note}" for note in done.notes]
+        caption = "\n".join(lines) + "\n" + clip_caption(job, clip, total, done.template["name"])
+        self.store.enqueue_event({
+            "event": "clip_ready", "chat_id": job.chat_id, "job_id": job.id, "clip_id": clip.id,
+            "caption": caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…",
+            "preview_url": f"{self.settings.self_url}/previews/{clip.id}",
+            "approve_data": f"ok:{clip.id}", "skip_data": f"no:{clip.id}",
+        })
 
     def auto_retry(self, job: Job, delay: Optional[int]) -> Optional[Job]:
         """Queue one delayed retry for a passing failure. A job that is itself a retry (automatic

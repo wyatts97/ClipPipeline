@@ -78,11 +78,14 @@ export interface Clip {
   can_render: boolean
   credit: string | null
   word_count: number
+  download_url: string
+  post_text: { youtube_title: string; youtube: string; tiktok: string; instagram: string }
 }
 
 export interface HandEffect { sound: string; t: number; volume?: number }
 
-export type Trigger = "start" | "end" | "peak" | "word" | "punchline"
+export type Trigger = "start" | "end" | "peak" | "word" | "moment"
+export type MomentKind = "punchline" | "shock" | "fail" | "awkward" | "hype" | "sneaky"
 export type CaptionEffect = "none" | "pop" | "glow" | "box" | "highlight"
 export type CaptionPosition = "bottom" | "middle" | "top"
 
@@ -106,7 +109,14 @@ export interface CaptionStyle {
   bg_color: string
 }
 
-export interface SfxRule { sound: string; at: Trigger; words: string[]; volume: number; max: number }
+export interface SfxRule {
+  sounds: string[]      // one is picked per effect (never the same twice in a row)
+  at: Trigger
+  kinds: MomentKind[]   // for at = "moment"
+  words: string[]       // for at = "word"
+  volume: number
+  max: number
+}
 
 export interface TemplateBody {
   name: string
@@ -135,7 +145,8 @@ export interface TemplatesResponse {
   triggers: Trigger[]
   fonts: FontItem[]
   sounds: string[]
-  punchlines: boolean
+  kinds: Record<MomentKind, string>
+  gemini: boolean
 }
 
 export interface Scan {
@@ -354,6 +365,10 @@ function query(params: Record<string, string | number | null | undefined>): stri
 }
 
 export type LogLevel = "error" | "warning" | "info"
+
+/** Zip of every clip with this status (or just these ids), approved ones with their .json. */
+export const clipsZipUrl = (status: ClipStatus, ids?: string[]) =>
+  `/api/clips/download.zip?status=${status}${ids?.length ? `&ids=${ids.join(",")}` : ""}`
 
 export const api = {
   session: () => request<{ configured: boolean; authenticated: boolean }>("/api/session"),

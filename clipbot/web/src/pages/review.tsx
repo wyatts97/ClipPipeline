@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
+import { Copy, Download } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
@@ -12,8 +13,8 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
-import { api, type Clip, type ClipStatus, type HandEffect } from "@/lib/api"
-import { ago, platformName, sourceLabel, tc } from "@/lib/format"
+import { api, clipsZipUrl, type Clip, type ClipStatus, type HandEffect } from "@/lib/api"
+import { ago, copyText, platformName, sourceLabel, tc } from "@/lib/format"
 import type { Platform } from "@/lib/api"
 import { SoundSelect } from "@/pages/templates"
 
@@ -53,8 +54,13 @@ export function ReviewPage() {
 
   return (
     <div className="mx-auto flex max-w-7xl min-w-0 flex-col gap-6">
-      <div className="flex flex-wrap items-center justify-between gap-4">
-        <h1 className="text-2xl font-semibold tracking-tight">Review</h1>
+      <div className="flex flex-wrap items-center gap-4">
+        <h1 className="mr-auto text-2xl font-semibold tracking-tight">Review</h1>
+        {status === "approved" && items.length > 0 && (
+          <Button variant="outline" asChild>
+            <a href={clipsZipUrl("approved")} download><Download /> Download all {items.length} (zip)</a>
+          </Button>
+        )}
         <Tabs value={status} onValueChange={(v) => { setStatus(v as ClipStatus); setSelectedId(null) }}>
           <TabsList>
             <TabsTrigger value="pending">Needs review</TabsTrigger>
@@ -216,6 +222,8 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
           )}
         </div>
 
+        <Posting clip={clip} />
+
         {clip.can_render && <Look key={`${clip.template}-${JSON.stringify(clip.sfx)}`} clip={clip} video={video} />}
 
         {pending && (
@@ -318,6 +326,30 @@ function Look({ clip, video }: { clip: Clip; video: React.RefObject<HTMLVideoEle
       {clip.word_count === 0 && (
         <p className="text-xs text-muted-foreground">OpenShorts sent no words for this clip, so it can't get captions.</p>
       )}
+    </div>
+  )
+}
+
+/** Download the clip and copy its post text, for posting by hand. */
+function Posting({ clip }: { clip: Clip }) {
+  const copy = (label: string, text: string) =>
+    copyText(text).then(() => toast.success(`${label} copied`), () => toast.error("Couldn't copy; select the text instead."))
+  const t = clip.post_text
+  return (
+    <div className="space-y-2 border-t border-border pt-5 text-sm">
+      <div className="flex items-baseline justify-between">
+        <h3 className="font-medium">Post it yourself</h3>
+        <a href={clip.download_url} download className="inline-flex items-center gap-1.5 text-primary hover:underline">
+          <Download className="size-4" /> Download
+        </a>
+      </div>
+      <div className="flex flex-wrap gap-1.5">
+        <Button size="sm" variant="outline" onClick={() => copy("TikTok caption", t.tiktok)}><Copy /> TikTok</Button>
+        <Button size="sm" variant="outline" onClick={() => copy("Instagram caption", t.instagram)}><Copy /> Instagram</Button>
+        <Button size="sm" variant="outline" onClick={() => copy("YouTube title", t.youtube_title)}><Copy /> YouTube title</Button>
+        <Button size="sm" variant="outline" onClick={() => copy("YouTube description", t.youtube)}><Copy /> YouTube description</Button>
+      </div>
+      <p className="text-xs text-muted-foreground">The same text publishing uses: the captions above, plus the template's credit line.</p>
     </div>
   )
 }

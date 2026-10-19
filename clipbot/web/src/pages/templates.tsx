@@ -14,7 +14,8 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  api, type CaptionStyle, type SfxRule, type SoundItem, type Template, type TemplateBody, type TemplatesResponse, type Trigger,
+  api, type CaptionStyle, type MomentKind, type SfxRule, type SoundItem, type Template, type TemplateBody,
+  type TemplatesResponse, type Trigger,
 } from "@/lib/api"
 import { size, tc } from "@/lib/format"
 
@@ -23,7 +24,11 @@ export const TRIGGER_LABEL: Record<Trigger, string> = {
   end: "at the end",
   peak: "where chat exploded",
   word: "on certain words",
-  punchline: "on punchlines (Gemini)",
+  moment: "on moments (Gemini)",
+}
+
+const KIND_LABEL: Record<MomentKind, string> = {
+  punchline: "Punchlines", shock: "Shocks", fail: "Fails", awkward: "Awkward", hype: "Hype", sneaky: "Sneaky",
 }
 
 const EFFECT_LABEL: Record<string, string> = {
@@ -95,13 +100,16 @@ export function TemplatesPage() {
 function Summary({ t }: { t: Template }) {
   const parts = [t.captions.enabled ? `${t.captions.font_name}, ${EFFECT_LABEL[t.captions.effect]?.toLowerCase()}` : "No captions"]
   if (t.music.sound) parts.push(`♪ ${t.music.sound}`)
-  for (const r of t.sfx) parts.push(`🔊 ${r.sound} ${TRIGGER_LABEL[r.at]}`)
+  for (const r of t.sfx) {
+    const where = r.at === "moment" ? `on ${r.kinds.map((k) => KIND_LABEL[k].toLowerCase()).join(", ")}` : TRIGGER_LABEL[r.at]
+    parts.push(`🔊 ${r.sounds.join(" / ")} ${where}`)
+  }
   return <ul className="space-y-0.5 text-xs text-muted-foreground">{parts.map((p) => <li key={p} className="truncate">{p}</li>)}</ul>
 }
 
 const bodyOf = (t: Template): TemplateBody => ({
   name: t.name, captions: { ...t.captions }, music: { ...t.music }, voice_volume: t.voice_volume,
-  sfx: t.sfx.map((r) => ({ ...r, words: [...r.words] })), credit: t.credit,
+  sfx: t.sfx.map((r) => ({ ...r, sounds: [...r.sounds], kinds: [...r.kinds], words: [...r.words] })), credit: t.credit,
 })
 
 const blank = (d: TemplatesResponse): TemplateBody => ({
@@ -223,32 +231,20 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
           <fieldset className="space-y-3">
             <legend className="mb-2 font-medium">Sound effects</legend>
             {body.sfx.map((r, i) => (
-              <div key={i} className="grid grid-cols-[minmax(0,1fr)_minmax(0,1.3fr)_4.5rem_auto] items-end gap-2">
-                <Field label="Sound" id={`t-sfx-${i}`}><SoundSelect id={`t-sfx-${i}`} sounds={data.sounds} value={r.sound} onChange={(v) => v && setRule(i, { sound: v })} /></Field>
-                <Field label="When" id={`t-at-${i}`}>
-                  <NativeSelect id={`t-at-${i}`} value={r.at} onChange={(e) => setRule(i, { at: e.target.value as Trigger })}>
-                    {data.triggers.map((x) => <option key={x} value={x}>{TRIGGER_LABEL[x]}</option>)}
-                  </NativeSelect>
-                </Field>
-                <Field label="Up to" id={`t-max-${i}`}>
-                  <Input id={`t-max-${i}`} type="number" min={1} max={10} value={r.max} onChange={(e) => setRule(i, { max: Number(e.target.value) || 1 })} />
-                </Field>
-                <Button variant="ghost" size="icon" aria-label="Remove effect" onClick={() => setBody({ ...body, sfx: body.sfx.filter((_, j) => j !== i) })}><Trash2 /></Button>
-                {r.at === "word" && (
-                  <Input className="col-span-4" placeholder="Words, comma separated: what, no way, bro" value={r.words.join(", ")}
-                    onChange={(e) => setRule(i, { words: e.target.value.split(",").map((w) => w.trim()).filter(Boolean) })} />
-                )}
-                {r.at === "punchline" && !data.punchlines && (
-                  <p className="col-span-4 text-xs text-destructive">Needs GEMINI_API_KEY for clipbot (docker compose up -d clipbot after setting it).</p>
-                )}
-              </div>
+              <RuleEditor key={i} index={i} rule={r} data={data} onChange={(patch) => setRule(i, patch)}
+                onRemove={() => setBody({ ...body, sfx: body.sfx.filter((_, j) => j !== i) })} />
             ))}
             <Button variant="outline" size="sm" disabled={!data.sounds.length}
-              onClick={() => setBody({ ...body, sfx: [...body.sfx, { sound: data.sounds[0], at: "punchline", words: [], volume: 1, max: 2 }] })}>
+              onClick={() => setBody({ ...body, sfx: [...body.sfx, {
+                sounds: [data.sounds[0]], at: "moment", kinds: ["punchline", "shock"], words: [], volume: 1, max: 2,
+              }] })}>
               <Plus /> Add a sound effect
             </Button>
             {!data.sounds.length && <p className="text-xs text-muted-foreground">Upload sounds below first.</p>}
-            <p className="text-xs text-muted-foreground">Effects keep 1.5 s apart. You can also place them by hand on a clip in Review.</p>
+            <p className="text-xs text-muted-foreground">
+              Add one rule per kind of moment, e.g. a vine boom on punchlines and a sad trombone on fails. A rule with
+              several sounds picks one each time. Effects keep 1.5 s apart; place them by hand on a clip in Review.
+            </p>
           </fieldset>
 
           <Field label="Credit line (added to every post's caption)" id="t-credit">
@@ -266,6 +262,77 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
         <Button onClick={() => save.mutate()} disabled={!body.name.trim() || save.isPending}>Save template</Button>
       </SheetFooter>
     </>
+  )
+}
+
+function RuleEditor({ index, rule, data, onChange, onRemove }: {
+  index: number; rule: SfxRule; data: TemplatesResponse; onChange: (patch: Partial<SfxRule>) => void; onRemove: () => void
+}) {
+  const id = `t-sfx-${index}`
+  const toggleKind = (kind: MomentKind) => {
+    const kinds = rule.kinds.includes(kind) ? rule.kinds.filter((k) => k !== kind) : [...rule.kinds, kind]
+    if (kinds.length) onChange({ kinds })
+  }
+  return (
+    <div className="space-y-3 rounded-md border border-border p-3">
+      <div className="grid grid-cols-[minmax(0,1.3fr)_4.5rem_minmax(0,1fr)_auto] items-end gap-2">
+        <Field label="When" id={`${id}-at`}>
+          <NativeSelect id={`${id}-at`} value={rule.at} onChange={(e) => onChange({ at: e.target.value as Trigger })}>
+            {data.triggers.map((x) => <option key={x} value={x}>{TRIGGER_LABEL[x]}</option>)}
+          </NativeSelect>
+        </Field>
+        <Field label="Up to" id={`${id}-max`}>
+          <Input id={`${id}-max`} type="number" min={1} max={10} value={rule.max} onChange={(e) => onChange({ max: Number(e.target.value) || 1 })} />
+        </Field>
+        <Field label={`Volume ${Math.round(rule.volume * 100)}%`} id={`${id}-vol`}>
+          <input id={`${id}-vol`} type="range" min={10} max={200} step={10} value={Math.round(rule.volume * 100)}
+            onChange={(e) => onChange({ volume: Number(e.target.value) / 100 })} className="h-9 w-full accent-primary" />
+        </Field>
+        <Button variant="ghost" size="icon" aria-label="Remove effect" onClick={onRemove}><Trash2 /></Button>
+      </div>
+
+      {rule.at === "moment" && (
+        <div className="space-y-1.5">
+          <span className="text-xs text-muted-foreground">Kinds of moment</span>
+          <div className="flex flex-wrap gap-1.5">
+            {(Object.keys(data.kinds) as MomentKind[]).map((kind) => (
+              <button key={kind} type="button" title={data.kinds[kind]} aria-pressed={rule.kinds.includes(kind)}
+                onClick={() => toggleKind(kind)}
+                className={cn("rounded-sm border px-2 py-1 text-xs transition-colors",
+                  rule.kinds.includes(kind) ? "border-primary bg-primary/15 text-primary" : "border-border text-muted-foreground hover:text-foreground")}>
+                {KIND_LABEL[kind]}
+              </button>
+            ))}
+          </div>
+          {!data.gemini && <p className="text-xs text-destructive">Needs GEMINI_API_KEY for clipbot (docker compose up -d clipbot after setting it).</p>}
+        </div>
+      )}
+      {rule.at === "word" && (
+        <Input placeholder="Words, comma separated: what, no way, bro" value={rule.words.join(", ")}
+          onChange={(e) => onChange({ words: e.target.value.split(",").map((w) => w.trim()).filter(Boolean) })} />
+      )}
+
+      <div className="space-y-1.5">
+        <span className="text-xs text-muted-foreground">{rule.sounds.length > 1 ? "Sounds (one picked each time)" : "Sound"}</span>
+        <div className="flex flex-wrap items-center gap-1.5">
+          {rule.sounds.map((name) => (
+            <span key={name} className={cn("inline-flex items-center gap-1 rounded-sm bg-accent px-2 py-1 text-xs",
+              !data.sounds.includes(name) && "text-destructive")}>
+              {name}{!data.sounds.includes(name) && " (missing)"}
+              {rule.sounds.length > 1 && (
+                <button type="button" aria-label={`Remove ${name}`} className="text-muted-foreground hover:text-foreground"
+                  onClick={() => onChange({ sounds: rule.sounds.filter((x) => x !== name) })}>×</button>
+              )}
+            </span>
+          ))}
+          <NativeSelect aria-label="Add a sound" className="h-7 w-auto text-xs" value=""
+            onChange={(e) => e.target.value && onChange({ sounds: [...rule.sounds, e.target.value] })}>
+            <option value="">+ sound</option>
+            {data.sounds.filter((x) => !rule.sounds.includes(x)).map((x) => <option key={x} value={x}>{x}</option>)}
+          </NativeSelect>
+        </div>
+      </div>
+    </div>
   )
 }
 

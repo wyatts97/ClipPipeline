@@ -7,3 +7,4 @@ roadmap.md
 clipbot/web/node_modules/
 clipbot/web/dist/
 dev/demo/.data/
+.claude/launch.json

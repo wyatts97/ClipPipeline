@@ -244,7 +244,9 @@ def templates_text(settings: Settings, store: Store) -> str:
         parts = [t["captions"]["font_name"] if t["captions"]["enabled"] else "no captions"]
         if t["music"]["sound"]:
             parts.append(f"music {t['music']['sound']}")
-        parts += [f"{r['sound']} on {r['at']}" for r in t["sfx"]]
+        for r in t["sfx"]:
+            where = "/".join(r["kinds"]) if r["at"] == "moment" else r["at"]
+            parts.append(f"{' or '.join(r['sounds'])} on {where}")
         missing = templates.missing_sounds(settings, t)
         mark = " (default)" if item["id"] == default else ""
         line = f"• {item['id']}{mark}: {', '.join(parts)}"
