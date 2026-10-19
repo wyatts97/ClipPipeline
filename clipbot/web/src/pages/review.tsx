@@ -1,19 +1,21 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
 
 import { ClipThumb } from "@/components/clip-thumb"
+import { NativeSelect } from "@/components/native-select"
 import { Status } from "@/components/status"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Tabs, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Textarea } from "@/components/ui/textarea"
-import { api, type Clip, type ClipStatus } from "@/lib/api"
+import { api, type Clip, type ClipStatus, type HandEffect } from "@/lib/api"
 import { ago, platformName, sourceLabel, tc } from "@/lib/format"
 import type { Platform } from "@/lib/api"
+import { SoundSelect } from "@/pages/templates"
 
 type Draft = Pick<Clip, "title" | "hook" | "description_tiktok" | "description_instagram">
 
@@ -35,7 +37,8 @@ export function ReviewPage() {
   const clips = useQuery({
     queryKey: ["clips", status],
     queryFn: () => api.clips(status),
-    refetchInterval: status === "pending" ? 10_000 : false,
+    refetchInterval: (q) => (q.state.data?.items.some((c) => c.render_state === "rendering") ? 2000
+      : status === "pending" ? 10_000 : false),
   })
   const items = useMemo(() => clips.data?.items ?? [], [clips.data])
   const [selectedId, setSelectedId] = useState<string | null>(null)
@@ -118,6 +121,7 @@ function isTyping(target: EventTarget | null) {
 
 function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => void; onPrev: () => void; isLast: boolean }) {
   const qc = useQueryClient()
+  const video = useRef<HTMLVideoElement>(null)
   const [draft, setDraft] = useState<Draft>(() => draftOf(clip))
   const dirty = JSON.stringify(draft) !== JSON.stringify(draftOf(clip))
   const pending = clip.status === "pending"
@@ -167,7 +171,7 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
   return (
     <>
       <div className="flex justify-center rounded-md bg-black/40 p-3">
-        <video key={clip.id} src={clip.video_url} controls autoPlay playsInline
+        <video ref={video} key={clip.video_url} src={clip.video_url} controls autoPlay playsInline
           className="aspect-[9/16] max-h-[calc(100vh-13rem)] w-auto max-w-full rounded-sm bg-black" />
       </div>
 
@@ -212,6 +216,8 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
           )}
         </div>
 
+        {clip.can_render && <Look key={`${clip.template}-${JSON.stringify(clip.sfx)}`} clip={clip} video={video} />}
+
         {pending && (
           <div className="space-y-2 border-t border-border pt-5">
             <div className="flex gap-2">
@@ -235,4 +241,83 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
 
 function Kbd({ children }: { children: React.ReactNode }) {
   return <kbd className="ml-1.5 rounded-sm border border-current/30 px-1 font-mono text-[10px] opacity-70">{children}</kbd>
+}
+
+/** Template and hand-placed sound effects for a clip that's waiting for review. */
+function Look({ clip, video }: { clip: Clip; video: React.RefObject<HTMLVideoElement | null> }) {
+  const qc = useQueryClient()
+  const templates = useQuery({ queryKey: ["templates"], queryFn: api.templates, staleTime: 30_000 })
+  const [template, setTemplate] = useState(clip.template ?? "")
+  const [effects, setEffects] = useState<HandEffect[]>(clip.sfx)
+  const [sound, setSound] = useState<string | null>(null)
+  const sounds = templates.data?.sounds ?? []
+  const pick = sound ?? sounds[0] ?? null
+  const rendering = clip.render_state === "rendering"
+  const changed = template !== (clip.template ?? "") || JSON.stringify(effects) !== JSON.stringify(clip.sfx)
+  const render = useMutation({
+    mutationFn: () => api.renderClip(clip.id, { template: template || undefined, sfx: effects }),
+    onSuccess: () => {
+      toast("Rendering…", { description: "The clip reloads when it's done." })
+      qc.invalidateQueries({ queryKey: ["clips"] })
+    },
+  })
+
+  return (
+    <div className="space-y-3 border-t border-border pt-5 text-sm">
+      <div className="flex items-baseline justify-between">
+        <h3 className="font-medium">Look</h3>
+        <Link to="/templates" className="text-xs text-muted-foreground hover:text-foreground">Edit templates</Link>
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="look-template" className="text-xs text-muted-foreground">Template</Label>
+        <NativeSelect id="look-template" value={template} onChange={(e) => setTemplate(e.target.value)} disabled={rendering}>
+          {(templates.data?.items ?? []).map((t) => (
+            <option key={t.id} value={t.id}>{t.name}{t.default ? " (default)" : ""}</option>
+          ))}
+        </NativeSelect>
+      </div>
+      <div className="space-y-1.5">
+        <span className="text-xs text-muted-foreground">Sound effects placed by hand</span>
+        {effects.length > 0 && (
+          <ul className="space-y-1">
+            {effects.map((e, i) => (
+              <li key={i} className="flex items-center gap-2">
+                <button className="timecode text-primary hover:underline"
+                  onClick={() => { if (video.current) video.current.currentTime = e.t }}>{tc(e.t)}</button>
+                <span className="flex-1 truncate">{e.sound}</span>
+                <button className="text-xs text-muted-foreground hover:text-destructive"
+                  onClick={() => setEffects(effects.filter((_, j) => j !== i))}>Remove</button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <div className="flex gap-2">
+          <SoundSelect sounds={sounds} value={pick} onChange={setSound} />
+          <Button variant="outline" size="sm" className="h-9 shrink-0" disabled={!pick || rendering}
+            onClick={() => {
+              const t = Math.round((video.current?.currentTime ?? 0) * 10) / 10
+              if (pick) setEffects([...effects, { sound: pick, t }].sort((a, b) => a.t - b.t))
+            }}>
+            Add at playhead
+          </Button>
+        </div>
+        {!sounds.length && (
+          <p className="text-xs text-muted-foreground">
+            Upload sounds on the <Link to="/templates" className="text-primary hover:underline">Templates</Link> page.
+          </p>
+        )}
+      </div>
+      {clip.render_error && !rendering && (
+        <p className={cn("text-xs", clip.render_state === "failed" ? "text-destructive" : "text-muted-foreground")}>{clip.render_error}</p>
+      )}
+      <Button className="w-full" variant={changed ? "default" : "outline"}
+        disabled={rendering || render.isPending || (!changed && clip.render_state !== "failed")}
+        onClick={() => render.mutate()}>
+        {rendering ? "Rendering…" : "Re-render with these"}
+      </Button>
+      {clip.word_count === 0 && (
+        <p className="text-xs text-muted-foreground">OpenShorts sent no words for this clip, so it can't get captions.</p>
+      )}
+    </div>
+  )
 }

@@ -6,9 +6,11 @@ Accepted forms (anything else gets the help text):
     /scan <url>                   find the best moments of a VOD
     /watch <channel>, /unwatch <channel>, /watching
     /cleanup                      offer to delete the files of finished jobs
+    /templates                    list the clip templates
     <url>                         clip the whole video
     <url> 1:02:00-1:12:30         clip only that part (also 62:00-72:30, 1h2m-1h12m)
     <url> clips=5                 how many clips to make (1-15)
+    <url> t=meme                  which template (captions, music, sound effects); /templates lists them
 """
 from __future__ import annotations
 
@@ -21,9 +23,11 @@ _TIME = r"(?:\d{1,2}:)?\d{1,2}:\d{2}|\d+h(?:\d{1,2}m)?(?:\d{1,2}s)?|\d+m(?:\d{1,
 RANGE_RE = re.compile(
     rf"(?<![\w:])({_TIME})\s*(?:-|–|—|to)\s*({_TIME})(?![\w:])", re.IGNORECASE)
 CLIPS_RE = re.compile(r"\b(?:clips?|n)\s*[=:]\s*(\d{1,2})\b", re.IGNORECASE)
+TEMPLATE_RE = re.compile(r"\b(?:t|template|style)\s*[=:]\s*([\w-]{1,40})", re.IGNORECASE)
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
 
-Kind = Literal["help", "status", "clip", "scan", "watch", "unwatch", "watching", "cleanup", "invalid"]
+Kind = Literal["help", "status", "clip", "scan", "watch", "unwatch", "watching", "cleanup", "templates",
+               "invalid"]
 
 
 @dataclass(frozen=True)
@@ -35,6 +39,7 @@ class Command:
     target_clips: Optional[int] = None
     error: Optional[str] = None
     arg: Optional[str] = None
+    template: Optional[str] = None
 
 
 def parse_timestamp(value: str) -> float:
@@ -81,6 +86,8 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
             return Command("watching")
         if command in ("/cleanup", "/storage"):
             return Command("cleanup")
+        if command == "/templates":
+            return Command("templates")
         if command in ("/watch", "/unwatch"):
             if not arg:
                 return Command("invalid", error=f"Usage: {command} https://twitch.tv/<channel> "
@@ -97,6 +104,12 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
         return Command("help")
     url = _clean_url(url_match.group(0))
     rest = (text[:url_match.start()] + " " + text[url_match.end():]).strip()
+
+    template = None
+    template_match = TEMPLATE_RE.search(rest)
+    if template_match:
+        template = template_match.group(1).lower()
+        rest = rest[:template_match.start()] + rest[template_match.end():]
 
     target = None
     clips_match = CLIPS_RE.search(rest)
@@ -124,4 +137,4 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
                            error=f"The range is {format_timestamp(length)} long; the limit is "
                                  f"{max_range_minutes} minutes (MAX_RANGE_MINUTES).")
 
-    return Command("clip", url=url, start=start, end=end, target_clips=target)
+    return Command("clip", url=url, start=start, end=end, target_clips=target, template=template)

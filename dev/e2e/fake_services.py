@@ -160,6 +160,10 @@ class OpenShorts(BaseHTTPRequestHandler):
             ]}})
         if self.path.startswith("/videos/fake-os-job/"):
             return self._send_bytes(SAMPLE)
+        if self.path.startswith("/api/clip/fake-os-job/") and self.path.endswith("/transcript"):
+            words = "no way he hit that chat".split()   # clipbot burns these as captions
+            return self._send({"captions": [{"text": w, "startMs": i * 400, "endMs": i * 400 + 350}
+                                            for i, w in enumerate(words)], "durationSec": 3, "language": "en"})
         return self._send({"detail": "not found"}, 404)
 
 

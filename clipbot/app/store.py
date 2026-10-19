@@ -126,10 +126,22 @@ CREATE TABLE IF NOT EXISTS posts (
     updated REAL NOT NULL
 );
 CREATE INDEX IF NOT EXISTS posts_clip ON posts(clip_id);
+CREATE TABLE IF NOT EXISTS templates (
+    id TEXT PRIMARY KEY,
+    data TEXT NOT NULL,
+    created REAL NOT NULL,
+    updated REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS app_settings (
+    key TEXT PRIMARY KEY,
+    value TEXT
+);
 """
 
 # Columns added after the first release; created on older databases at startup.
-MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"))
+MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"), ("jobs", "template", "TEXT"),
+              ("clips", "template", "TEXT"), ("clips", "sfx", "TEXT"), ("clips", "words", "TEXT"),
+              ("clips", "splits", "TEXT"), ("clips", "render_state", "TEXT"), ("clips", "render_error", "TEXT"))
 LOG_KEEP_DAYS = 14
 LOG_KEEP_ROWS = 20000
 
@@ -151,6 +163,7 @@ class Job:
     created: float
     updated: float
     retry_of: Optional[str] = None
+    template: Optional[str] = None     # template id picked for the job; None = the default
 
 
 @dataclass
@@ -166,6 +179,21 @@ class Clip:
     path: str
     preview_path: Optional[str]
     decided: Optional[float]
+    template: Optional[str] = None       # template the current render used
+    sfx: Optional[str] = None            # JSON [{sound, t, volume}]: effects placed by hand
+    words: Optional[str] = None          # JSON [{w, s, e}]: the clip's words, for captions
+    splits: Optional[str] = None         # JSON [[start, end]]: two-speaker stretches (captions on the seam)
+    render_state: Optional[str] = None   # rendering | failed | None
+    render_error: Optional[str] = None
+
+    def manual_sfx(self) -> list[dict[str, Any]]:
+        return json.loads(self.sfx) if self.sfx else []
+
+    def word_list(self) -> list[dict[str, Any]]:
+        return json.loads(self.words) if self.words else []
+
+    def split_list(self) -> list[tuple[float, float]]:
+        return [tuple(r) for r in json.loads(self.splits)] if self.splits else []
 
 
 @dataclass
@@ -267,16 +295,17 @@ class Store:
     # ---- jobs ------------------------------------------------------------
     def create_job(self, chat_id: int, source_url: str, range_start: Optional[float],
                    range_end: Optional[float], target_clips: int,
-                   retry_of: Optional[str] = None) -> Job:
+                   retry_of: Optional[str] = None, template: Optional[str] = None) -> Job:
         now = time.time()
         job = Job(new_id(), chat_id, source_url, range_start, range_end, target_clips,
-                  "queued", None, None, now, now, retry_of)
+                  "queued", None, None, now, now, retry_of, template)
         with self._lock:
             self._db.execute(
                 "INSERT INTO jobs (id, chat_id, source_url, range_start, range_end, target_clips, "
-                "status, openshorts_job, error, created, updated, retry_of) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status, openshorts_job, error, created, updated, retry_of, template) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.chat_id, job.source_url, job.range_start, job.range_end,
-                 job.target_clips, job.status, None, None, now, now, retry_of))
+                 job.target_clips, job.status, None, None, now, now, retry_of, template))
         return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -340,10 +369,18 @@ class Store:
                     preview_path, None)
         with self._lock:
             self._db.execute(
-                "INSERT INTO clips VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                "INSERT INTO clips (id, job_id, idx, title, hook, meta, duration, status, path, preview_path, "
+                "decided) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
                 (clip.id, job_id, idx, title, hook, json.dumps(meta), duration, "pending",
                  path, preview_path, None))
         return clip
+
+    def update_clip(self, clip_id: str, **fields: Any) -> None:
+        if "meta" in fields:
+            fields["meta"] = json.dumps(fields["meta"])
+        cols = ", ".join(f"{k}=?" for k in fields)
+        with self._lock:
+            self._db.execute(f"UPDATE clips SET {cols} WHERE id=?", (*fields.values(), clip_id))
 
     def get_clip(self, clip_id: str) -> Optional[Clip]:
         with self._lock:
@@ -453,6 +490,11 @@ class Store:
                                     (scan_id,)).fetchall()
         return [MomentRow(**dict(r)) for r in rows]
 
+    def moment_for_job(self, job_id: str) -> Optional[MomentRow]:
+        with self._lock:
+            row = self._db.execute("SELECT * FROM moments WHERE job_id=? LIMIT 1", (job_id,)).fetchone()
+        return MomentRow(**dict(row)) if row else None
+
     def claim_moment(self, moment_id: str, job_id: str) -> bool:
         """Attach a job to a moment unless one is already attached (double taps)."""
         with self._lock:
@@ -493,6 +535,50 @@ class Store:
         cols = ", ".join(f"{k}=?" for k in fields)
         with self._lock:
             self._db.execute(f"UPDATE watches SET {cols} WHERE id=?", (*fields.values(), watch_id))
+
+    # ---- templates and app settings -------------------------------------------
+    def seed_templates(self, built_in: dict[str, dict[str, Any]], default: str) -> None:
+        """First start only: the built-in templates and the default."""
+        with self._lock:
+            if self._db.execute("SELECT COUNT(*) FROM templates").fetchone()[0]:
+                return
+            now = time.time()
+            for tid, data in built_in.items():
+                self._db.execute("INSERT INTO templates VALUES (?,?,?,?)", (tid, json.dumps(data), now, now))
+            self._db.execute("INSERT OR REPLACE INTO app_settings VALUES ('default_template', ?)", (default,))
+
+    def list_templates(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM templates ORDER BY created, rowid").fetchall()
+        return [{"id": r["id"], "data": json.loads(r["data"]), "updated": r["updated"]} for r in rows]
+
+    def get_template(self, template_id: Optional[str]) -> Optional[dict[str, Any]]:
+        if not template_id:
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT data FROM templates WHERE id=?", (template_id,)).fetchone()
+        return json.loads(row["data"]) if row else None
+
+    def save_template(self, template_id: str, data: dict[str, Any]) -> None:
+        now = time.time()
+        with self._lock:
+            self._db.execute(
+                "INSERT INTO templates VALUES (?,?,?,?) ON CONFLICT(id) DO UPDATE SET data=excluded.data, "
+                "updated=excluded.updated", (template_id, json.dumps(data), now, now))
+
+    def delete_template(self, template_id: str) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM templates WHERE id=?", (template_id,))
+        return cur.rowcount == 1
+
+    def get_setting(self, key: str) -> Optional[str]:
+        with self._lock:
+            row = self._db.execute("SELECT value FROM app_settings WHERE key=?", (key,)).fetchone()
+        return row["value"] if row else None
+
+    def set_setting(self, key: str, value: Optional[str]) -> None:
+        with self._lock:
+            self._db.execute("INSERT OR REPLACE INTO app_settings VALUES (?, ?)", (key, value))
 
     # ---- publishing (Postiz) -----------------------------------------------
     def queue_publish(self, clip_id: str, chat_id: int, publish_at: Optional[float] = None,

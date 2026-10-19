@@ -12,13 +12,14 @@ import json
 import logging
 import shutil
 import time
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
 import httpx
 
-from . import media, storage
+from . import captions, fonts, media, render, storage, templates
 from .config import Settings
 from .diagnose import failure_hint, failure_reason, retry_delay
 from .openshorts import OpenShorts, OpenShortsError
@@ -36,8 +37,9 @@ def range_label(job: Job) -> str:
     return f"{format_timestamp(job.range_start)}–{format_timestamp(job.range_end)}"
 
 
-def clip_caption(job: Job, clip: Clip, total: int) -> str:
-    lines = [f"🎬 Clip {clip.idx + 1}/{total} · {format_timestamp(clip.duration or 0)}"]
+def clip_caption(job: Job, clip: Clip, total: int, template_name: Optional[str] = None) -> str:
+    lines = [f"🎬 Clip {clip.idx + 1}/{total} · {format_timestamp(clip.duration or 0)}"
+             + (f" · 🎨 {template_name}" if template_name else "")]
     if clip.title:
         lines.append(clip.title)
     if clip.hook:
@@ -48,6 +50,15 @@ def clip_caption(job: Job, clip: Clip, total: int) -> str:
     return caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…"
 
 
+@dataclass
+class Rendered:
+    template_id: str
+    template: dict[str, Any]
+    punchlines: Optional[list[float]] = None
+    notes: list[str] = field(default_factory=list)   # e.g. a sound that isn't in data/sounds
+    error: Optional[str] = None                      # the render failed; the clip has no template
+
+
 class Pipeline:
     def __init__(self, settings: Settings, store: Store, openshorts: OpenShorts,
                  notify_client: Optional[httpx.AsyncClient] = None):
@@ -56,6 +67,7 @@ class Pipeline:
         self.openshorts = openshorts
         self.notify_client = notify_client or httpx.AsyncClient(timeout=20)
         self.publisher = None   # set by main.create_app when publishing is configured
+        self.render_lock = asyncio.Lock()   # one template render at a time (CPU)
         self._wake = asyncio.Event()
         self._tasks: list[asyncio.Task] = []
 
@@ -97,9 +109,9 @@ class Pipeline:
             "clip_max_seconds": s.clip_max_seconds,
             "auto_hook": s.auto_hook,
             "layouts": [p.strip() for p in s.layouts.split(",") if p.strip()],
+            # clipbot burns the captions itself, in the clip's template (render_clip_files)
+            "captions": False,
         }
-        if not s.captions:
-            options["captions"] = False
         return options
 
     def ready_jobs(self) -> list[Job]:
@@ -197,36 +209,58 @@ class Pipeline:
         s = self.settings
         results = (doc.get("result") or {}).get("clips") or []
         pending, previews, thumbs = s.folder("pending"), s.folder("previews"), s.folder("thumbs")
+        clean = s.folder("clean")
         made: list[Clip] = []
+        names: dict[str, str] = {}
         problems: list[str] = []
         for idx, info in enumerate(results):
             video_url = info.get("video_url")
             if not video_url:
                 continue
+            source = clean / f"{job.id}_{idx}.mp4"       # as OpenShorts made it: no captions
             master = pending / f"{job.id}_{idx}.mp4"
             preview = previews / f"{job.id}_{idx}.mp4"
+            meta = {k: info.get(k) for k in (
+                "start", "end", "video_title_for_youtube_short", "video_description_for_tiktok",
+                "video_description_for_instagram", "viral_hook_text")}
             try:
                 local = s.openshorts_output_dir / job.openshorts_job / video_url.rsplit("/", 1)[-1]
                 if local.is_file():
-                    shutil.copyfile(local, master)
+                    shutil.copyfile(local, source)
                 else:
-                    await self.openshorts.download(video_url, master)
-                duration = await media.probe_duration(master)
+                    await self.openshorts.download(video_url, source)
+                duration = await media.probe_duration(source)
+                words, splits = await self.clip_text(job, idx, local)
+                done = await self.render_clip_files(job, source, master, words, splits, job.template,
+                                                    [], meta, duration)
                 await media.make_preview(master, preview, s.preview_max_mb, s.preview_height)
             except (media.MediaError, OpenShortsError, httpx.HTTPError, OSError) as e:
                 problems.append(f"clip {idx + 1}: {e}")
                 log.warning("job %s: clip %d unusable: %s", job.id, idx + 1, e, extra={"job_id": job.id})
+                source.unlink(missing_ok=True)
                 continue
             try:
                 await media.make_thumbnail(master, thumbs / f"{job.id}_{idx}.jpg")
             except media.MediaError as e:  # the dashboard falls back to the video itself
                 log.warning("job %s: no thumbnail for clip %d: %s", job.id, idx + 1, e, extra={"job_id": job.id})
-            meta = {k: info.get(k) for k in (
-                "start", "end", "video_title_for_youtube_short", "video_description_for_tiktok",
-                "video_description_for_instagram", "viral_hook_text")}
+            problems += [f"clip {idx + 1}: {note}" for note in done.notes]
+            if done.error:
+                problems.append(f"clip {idx + 1}: the {done.template['name']} template failed ({done.error[:200]}); "
+                                "it has no captions. Re-render it from the dashboard's Review page.")
+            if not words and s.captions and done.template["captions"]["enabled"]:
+                problems.append(f"clip {idx + 1}: no words from OpenShorts, so no captions")
+            if done.punchlines is not None:
+                meta["punchlines"] = done.punchlines
+            if done.template.get("credit"):
+                meta["credit"] = done.template["credit"]
             title = info.get("title") or info.get("video_title_for_youtube_short")
-            made.append(self.store.add_clip(job.id, idx, title, info.get("viral_hook_text"), meta,
-                                            duration, str(master), str(preview)))
+            clip = self.store.add_clip(job.id, idx, title, info.get("viral_hook_text"), meta,
+                                       duration, str(master), str(preview))
+            self.store.update_clip(clip.id, template=done.template_id, words=json.dumps(words) if words else None,
+                                   splits=json.dumps(splits) if splits else None,
+                                   render_error=done.error[:1000] if done.error else None)
+            made.append(self.store.get_clip(clip.id))
+            names[clip.id] = done.template["name"]
         self.store.update_job(job.id, status="done")
 
         summary = f"✅ Job {job.id} finished: {len(made)} clip(s) from {range_label(job)}."
@@ -242,12 +276,136 @@ class Pipeline:
                 "chat_id": job.chat_id,
                 "job_id": job.id,
                 "clip_id": clip.id,
-                "caption": clip_caption(job, clip, len(made)),
+                "caption": clip_caption(job, clip, len(made), names.get(clip.id)),
                 "preview_url": f"{s.self_url}/previews/{clip.id}",
                 "approve_data": f"ok:{clip.id}",
                 "skip_data": f"no:{clip.id}",
             })
         log.info("job %s: collected %d clip(s)", job.id, len(made), extra={"job_id": job.id})
+
+    # ---- templates -------------------------------------------------------------
+    async def clip_text(self, job: Job, idx: int, local: Path) -> tuple[list[dict[str, Any]], list[tuple[float, float]]]:
+        """The clip's words from OpenShorts, and where it stacked two speakers (layout sidecar)."""
+        words: list[dict[str, Any]] = []
+        try:
+            words = captions.words_from_openshorts(await self.openshorts.transcript(job.openshorts_job, idx))
+        except (OpenShortsError, httpx.HTTPError, ValueError) as e:
+            log.warning("job %s: no words for clip %d: %s", job.id, idx + 1, e, extra={"job_id": job.id})
+        splits: list[tuple[float, float]] = []
+        sidecar = Path(str(local) + ".layout.json")
+        if sidecar.is_file():
+            try:
+                splits = captions.split_ranges_from_layout(json.loads(sidecar.read_text(encoding="utf-8")))
+            except (OSError, ValueError):
+                pass
+        return words, splits
+
+    def resolve_template(self, template_id: Optional[str]) -> tuple[str, dict[str, Any]]:
+        """The template to use: the one asked for, else the default, else the built-in Standard."""
+        for tid in (template_id, self.store.get_setting("default_template"), templates.DEFAULT_TEMPLATE):
+            data = self.store.get_template(tid)
+            if data:
+                return tid, templates.normalize(data)
+        return templates.DEFAULT_TEMPLATE, templates.normalize(templates.BUILT_IN[templates.DEFAULT_TEMPLATE])
+
+    async def render_clip_files(self, job: Job, source: Path, dst: Path, words: list[dict[str, Any]],
+                                splits: list[tuple[float, float]], template_id: Optional[str],
+                                manual_sfx: list[dict[str, Any]], meta: dict[str, Any],
+                                duration: float) -> Rendered:
+        """Render source (no captions) into dst with a template. A failed render copies the source,
+        so the clip still exists; the error says why."""
+        s = self.settings
+        tid, template = self.resolve_template(template_id)
+        done = Rendered(tid, template, punchlines=meta.get("punchlines"))
+        work = s.folder("tmp") / f"render-{dst.stem}"
+        work.mkdir(parents=True, exist_ok=True)
+        plan = render.Plan(duration=duration, voice_volume=template["voice_volume"])
+        try:
+            style = template["captions"]
+            if s.captions and style["enabled"] and words:
+                ass = work / "captions.ass"
+                if captions.write_ass(ass, words, style, splits):
+                    plan.ass, plan.fonts_dir = ass, fonts.render_fonts_dir(s)
+            music = template["music"]
+            if music["sound"]:
+                path = templates.find_sound(s, music["sound"])
+                if path:
+                    plan.music = render.Music(path, music["volume"], music["duck"], music["start"])
+                else:
+                    done.notes.append(f"the {template['name']} template's music ({music['sound']}) isn't in "
+                                      "data/sounds; upload it on the dashboard's Templates page")
+            wants_punchlines = any(r["at"] == "punchline" for r in template["sfx"])
+            if wants_punchlines and done.punchlines is None and words:
+                done.punchlines = await templates.find_punchlines(
+                    s, words, max([r["max"] for r in template["sfx"] if r["at"] == "punchline"] or [2]))
+            moment = self.store.moment_for_job(job.id)
+            peak = templates.peak_in_clip(moment.peak if moment else None,
+                                          (job.range_start or 0.0) + float(meta.get("start") or 0.0)
+                                          if moment else None)
+            missing = set()
+            for event in templates.place_effects(template, words, duration, peak, done.punchlines, manual_sfx):
+                path = templates.find_sound(s, event["sound"])
+                if path:
+                    plan.effects.append(render.Effect(path, event["t"], event["volume"]))
+                else:
+                    missing.add(event["sound"])
+            if missing:
+                done.notes.append("sound effect(s) not in data/sounds: " + ", ".join(sorted(missing)))
+            plan.has_audio = await render.has_audio(source)
+            out = work / "out.mp4"
+            async with self.render_lock:
+                rendered = await render.render(source, out, plan)
+            if rendered:
+                shutil.move(str(out), dst)
+            else:
+                shutil.copyfile(source, dst)
+        except (media.MediaError, OSError) as e:
+            log.warning("job %s: %s template render failed: %s", job.id, template["name"], e,
+                        extra={"job_id": job.id})
+            done.error = str(e) or type(e).__name__
+            shutil.copyfile(source, dst)
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+        return done
+
+    def clean_source(self, clip: Clip) -> Path:
+        return self.settings.data_dir / "clean" / f"{clip.job_id}_{clip.idx}.mp4"
+
+    async def rerender(self, clip_id: str, template_id: Optional[str] = None,
+                       sfx: Optional[list[dict[str, Any]]] = None) -> None:
+        """Render a pending clip again, in another template and/or with effects placed by hand."""
+        clip = self.store.get_clip(clip_id)
+        job = self.store.get_job(clip.job_id) if clip else None
+        if not clip or not job:
+            return
+        source = self.clean_source(clip)
+        manual = clip.manual_sfx() if sfx is None else sfx
+        template_id = template_id or clip.template
+        tmp = Path(clip.path).with_name(f"{clip.job_id}_{clip.idx}.rendering.mp4")
+        try:
+            done = await self.render_clip_files(job, source, tmp, clip.word_list(), clip.split_list(), template_id,
+                                                manual, dict(clip.meta), clip.duration or await media.probe_duration(source))
+            tmp.replace(clip.path)
+            if clip.preview_path:
+                await media.make_preview(Path(clip.path), Path(clip.preview_path), self.settings.preview_max_mb,
+                                         self.settings.preview_height)
+            await media.make_thumbnail(Path(clip.path), self.settings.folder("thumbs") / f"{clip.job_id}_{clip.idx}.jpg")
+        except (media.MediaError, OSError) as e:
+            tmp.unlink(missing_ok=True)
+            self.store.update_clip(clip.id, render_state="failed", render_error=str(e)[:1000])
+            log.warning("clip %s: re-render failed: %s", clip.id, e, extra={"job_id": job.id})
+            return
+        meta = dict(clip.meta)
+        if done.punchlines is not None:
+            meta["punchlines"] = done.punchlines
+        meta.pop("credit", None)
+        if done.template.get("credit"):
+            meta["credit"] = done.template["credit"]
+        error = done.error or ("; ".join(done.notes) if done.notes else None)
+        self.store.update_clip(clip.id, template=done.template_id, sfx=json.dumps(manual) if manual else None,
+                               meta=meta, render_state="failed" if done.error else None,
+                               render_error=error[:1000] if error else None)
+        log.info("clip %s: rendered with the %s template", clip.id, done.template["name"], extra={"job_id": job.id})
 
     def auto_retry(self, job: Job, delay: Optional[int]) -> Optional[Job]:
         """Queue one delayed retry for a passing failure. A job that is itself a retry (automatic
@@ -297,6 +455,7 @@ class Pipeline:
             }, indent=2, ensure_ascii=False), encoding="utf-8")
         if clip.preview_path:
             Path(clip.preview_path).unlink(missing_ok=True)
+        self.clean_source(clip).unlink(missing_ok=True)      # no more re-renders after a decision
         self.store.decide_clip(clip.id, status, str(dest))
         reply = reply.format(name=dest.name, id=clip.id)
         if status == "approved" and self.publisher:

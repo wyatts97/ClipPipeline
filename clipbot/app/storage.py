@@ -124,7 +124,7 @@ def janitor_stuck(settings: Settings, now: Optional[float] = None) -> bool:
 def usage_report(settings: Settings, store: Store) -> dict[str, Any]:
     """Everything the dashboard's Storage page shows."""
     folders = {name: size_of(settings.data_dir / name)
-               for name in ("pending", "approved", "rejected", "previews", "thumbs", "tmp")}
+               for name in ("pending", "clean", "approved", "rejected", "previews", "thumbs", "tmp", "sounds")}
     jobs = []
     tracked: set[str] = set()
     for job in store.list_jobs(limit=2000):

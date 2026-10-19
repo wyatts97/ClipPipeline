@@ -147,7 +147,7 @@ function Disk({ report }: { report: StorageReport }) {
   const parts = [
     { label: "OpenShorts sources", value: report.openshorts.sources },
     { label: "OpenShorts work files", value: report.openshorts.work },
-    { label: "Waiting for review", value: report.folders.pending },
+    { label: "Waiting for review", value: report.folders.pending + report.folders.clean },
     { label: "Approved clips", value: report.folders.approved },
     { label: "Skipped clips", value: report.folders.rejected },
     { label: "Previews and thumbnails", value: report.folders.previews + report.folders.thumbs },

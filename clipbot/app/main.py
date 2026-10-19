@@ -22,7 +22,7 @@ from fastapi import Depends, FastAPI, Header, HTTPException
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
-from . import dashboard, logbook, storage
+from . import dashboard, logbook, storage, templates
 from .config import Settings
 from .openshorts import OpenShorts
 from .parsing import format_timestamp, parse_message
@@ -41,6 +41,7 @@ https://youtu.be/VIDEO_ID clips=5
 
 • A time range (h:mm:ss-h:mm:ss) processes only that part. Much faster on this server, so use it for long streams.
 • clips=N sets how many clips to make (1-15).
+• t=<template> picks the look: captions, music, sound effects (e.g. t=meme). /templates lists them.
 
 🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips) and sends each with a 🎬 button.
 👀 /watch <channel link> scans every new VOD when the stream ends. /watching lists them, /unwatch <channel> stops.
@@ -68,6 +69,8 @@ def create_app(settings: Optional[Settings] = None, openshorts: Optional[OpenSho
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         store = Store(settings.db_path)
+        store.seed_templates({tid: templates.normalize(data) for tid, data in templates.BUILT_IN.items()},
+                             templates.DEFAULT_TEMPLATE)
         log_handler = logbook.install(store)
         # yt-dlp and TwitchDownloaderCLI expect $HOME to exist; on a fresh ./data it doesn't.
         for folder in (os.environ.get("HOME"), os.environ.get("XDG_CACHE_HOME")):
@@ -203,15 +206,50 @@ async def handle_message(app: FastAPI, settings: Settings, chat_id: int, text: s
         return scout.list_watches(chat_id)
     if cmd.kind == "cleanup":
         return storage.offer_cleanup_all(settings, store, chat_id)
+    if cmd.kind == "templates":
+        return templates_text(settings, store)
+
+    template_id = None
+    if cmd.template:
+        template_id = find_template(store, cmd.template)
+        if not template_id:
+            return f"⚠️ There's no template called {cmd.template}. /templates lists them."
 
     job = store.create_job(chat_id, cmd.url, cmd.start, cmd.end,
-                           cmd.target_clips or settings.target_clips)
+                           cmd.target_clips or settings.target_clips, template=template_id)
     app.state.pipeline.wake()
     position = store.queue_position(job.id)
     part = (f"{format_timestamp(cmd.start)}–{format_timestamp(cmd.end)} "
             f"({format_timestamp(cmd.end - cmd.start)})" if cmd.start is not None else "the whole video")
     ahead = f" {position - 1} job(s) ahead of it." if position > 1 else ""
-    return (f"👍 Job {job.id} queued: {job.target_clips} clip(s) from {part}.{ahead}\n"
+    look = f" in the {store.get_template(template_id)['name']} template" if template_id else ""
+    return (f"👍 Job {job.id} queued: {job.target_clips} clip(s) from {part}{look}.{ahead}\n"
             "Clips arrive here when OpenShorts is done. On CPU that can take a while.")
 
 
+def find_template(store: Store, name: str) -> Optional[str]:
+    """A template id by id or by name, ignoring case."""
+    name = name.strip().lower()
+    for item in store.list_templates():
+        if name in (item["id"].lower(), str(item["data"].get("name", "")).lower()):
+            return item["id"]
+    return None
+
+
+def templates_text(settings: Settings, store: Store) -> str:
+    default = store.get_setting("default_template")
+    lines = ["🎨 Templates (add t=<name> after a link):"]
+    for item in store.list_templates():
+        t = templates.normalize(item["data"])
+        parts = [t["captions"]["font_name"] if t["captions"]["enabled"] else "no captions"]
+        if t["music"]["sound"]:
+            parts.append(f"music {t['music']['sound']}")
+        parts += [f"{r['sound']} on {r['at']}" for r in t["sfx"]]
+        missing = templates.missing_sounds(settings, t)
+        mark = " (default)" if item["id"] == default else ""
+        line = f"• {item['id']}{mark}: {', '.join(parts)}"
+        if missing:
+            line += f"\n  ⚠️ missing sound(s): {', '.join(missing)}"
+        lines.append(line)
+    lines.append("Edit them, upload sounds and fonts on the dashboard's Templates page.")
+    return "\n".join(lines)

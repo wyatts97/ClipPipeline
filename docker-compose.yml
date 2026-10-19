@@ -148,6 +148,9 @@ services:
       PUBLISH_TO: ${PUBLISH_TO:-youtube,tiktok,instagram}
       TIKTOK_POST_MODE: ${TIKTOK_POST_MODE:-UPLOAD}
       YOUTUBE_VISIBILITY: ${YOUTUBE_VISIBILITY:-public}
+      # templates: Gemini picks the punchlines for "on punchlines" sound effects
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      GEMINI_MODEL: ${GEMINI_MODEL:-}
     volumes:
       - ./data:/data                              # pending/ approved/ rejected/ live here
       - openshorts_output:/openshorts-output:ro   # read-only: sizes for the Storage page;

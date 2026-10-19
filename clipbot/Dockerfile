@@ -37,6 +37,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && pip install --no-cache-dir --upgrade "yt-dlp[default]"
 
 COPY app ./app
+# Caption fonts for templates (OFL / Apache 2.0, licenses in fonts/licenses). Yours go in data/fonts.
+COPY fonts ./fonts
 COPY --from=web /web/dist ./web
 
 ENV PYTHONUNBUFFERED=1 \

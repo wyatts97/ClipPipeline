@@ -6,6 +6,9 @@ buttons. Approved clips land in `data/approved/` with a `.json` file holding the
 descriptions. With [publishing](#publishing-postiz-posts-approved-clips) on, ✅ Post also schedules the
 clip on YouTube Shorts, TikTok and Instagram Reels through a self-hosted Postiz.
 
+[Templates](#templates-captions-music-and-sound-effects) set each clip's look: caption font and colors,
+background music, and sound effects like a vine boom on the punchline.
+
 You don't have to find the good parts yourself: `/scan <VOD>` reads the chat replay, loudness and
 viewer clips, and sends the stream's top moments with **🎬 Clip it** buttons. `/watch <channel>` does
 that automatically every time a stream ends.
@@ -187,7 +190,8 @@ From now on the bot ignores every other chat.
 | Page | For |
 |---|---|
 | **Overview** | Clips waiting for you, what OpenShorts is rendering right now (with its latest log line), problems with a one-click fix (retry a job, scan again, resend a Telegram message), the last 7 days and recent activity. The strip at the top is always visible: OpenShorts, queue, Telegram delivery, free disk. |
-| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. |
+| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**. |
+| **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
 | **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
@@ -204,11 +208,13 @@ in `ALLOWED_CHAT_IDS`). Signing in lasts 30 days; changing `DASHBOARD_PASSWORD` 
 | `<link>` | Clips the whole video |
 | `<link> 1:02:00-1:12:30` | Downloads and clips only that range (also `62:00-72:30`, `1h2m-1h12m`) |
 | `<link> clips=5` | Number of clips (1-15, default `TARGET_CLIPS`) |
+| `<link> t=meme` | Use that template instead of the default ([templates](#templates-captions-music-and-sound-effects)) |
 | `/scan <VOD link>` | Finds the stream's best moments and sends each with 🎬 buttons ([below](#finding-moments-scan-and-watch)) |
 | `/watch <channel link>` | Scans every new VOD of that channel when the stream ends |
 | `/watching`, `/unwatch <channel>` | List / stop watched channels |
 | `/status` | Your recent jobs and scans |
 | `/cleanup` | Offers to delete the sources and leftovers of finished jobs ([below](#freeing-disk-space)) |
+| `/templates` | Lists the templates, and any sounds they're missing |
 | `/help` | Usage |
 
 Links can be anything yt-dlp handles: YouTube, Twitch VODs, Kick VODs, and many more.
@@ -327,6 +333,50 @@ part again.
 The `janitor` container does the deleting: OpenShorts' files belong to its own user, so clipbot only
 hands it the job's id. If the dashboard says deletions are waiting, start it: `docker compose up -d janitor`.
 
+## Templates: captions, music and sound effects
+
+OpenShorts cuts and reframes the clip and burns in the hook line; clipbot then gives it the captions,
+music and sound effects of a **template**. It keeps a copy without captions plus the clip's words until
+you decide on it, so you can switch a clip to another template in Review and render it again.
+
+Five come built in (edit, copy or delete them on the **Templates** page):
+
+| Template | Captions | Audio |
+|---|---|---|
+| **Standard** (default) | Anton, yellow active word, pop: the look clips had before templates | none |
+| **Hormozi** | Montserrat ExtraBold, words appear as they're said | none |
+| **Meme** | Luckiest Guy, one big word at a time | `vine-boom` on up to 2 punchlines |
+| **Sneaky** | soft, sentence case | `sneaky-snitch` under the voice, quieter while someone talks; adds the credit line |
+| **Hype** | box behind the active word | `vine-boom` where chat exploded |
+
+Pick one per job with `t=<name>` in Telegram (`https://twitch.tv/videos/123 1:02:00-1:12:00 t=meme`) or in
+**New job**; jobs without one use the default.
+
+**Sounds** live in `data/sounds/`; upload them on the Templates page or copy them there. A template names
+a sound by its file name without the extension, so `vine-boom.mp3` is `vine-boom`. Nothing is bundled:
+- **Sneaky Snitch** is Kevin MacLeod's ([incompetech.com](https://incompetech.com)), free under
+  Creative Commons BY 4.0 as long as each post credits him. The Sneaky template adds that credit line to
+  every post's caption.
+- For a **vine boom** and other effects, use files you're allowed to use (royalty-free sound effect
+  libraries have them).
+- Skip copyrighted songs: YouTube and TikTok mute or claim them. Check each campaign's rules too; some
+  forbid added music or want their own sound added in the TikTok app.
+
+**Where effects land:**
+
+| Setting | Lands |
+|---|---|
+| at the start / at the end | first frame / last second |
+| where chat exploded | the `/scan` chat peak (clips made from a scan moment) |
+| on certain words | whenever one of your words is said, e.g. `what, no way` |
+| on punchlines | where Gemini thinks the joke lands (uses `GEMINI_API_KEY`, a few cents per thousand clips) |
+| by hand | Review → Look → **Add at playhead** |
+
+Effects stay at least 1.5 seconds apart. **Fonts:** Anton, Bangers, Bebas Neue, Luckiest Guy,
+Montserrat ExtraBold and Poppins ExtraBold are built in (open licenses, in `clipbot/fonts`); add your own
+`.ttf`/`.otf` on the Templates page. A template only with music or effects takes seconds to render;
+captions mean one more video encode, about as long as the clip on this CPU.
+
 ## CPU notes
 
 This box has no NVIDIA GPU, and OpenShorts only accelerates on CUDA/NVENC, so transcription and
@@ -347,6 +397,9 @@ scripts/fetch-openshorts.sh main && docker compose build openshorts && docker co
 
 The second line moves OpenShorts off the pinned commit. If clipbot can no longer talk to it,
 go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild.
+
+**From a version before templates:** clips now get their captions from clipbot (the Standard template
+looks like before). Rebuild clipbot: `docker compose build clipbot && docker compose up -d clipbot`.
 
 **From a version before publishing and cleanup:** `git pull`, then
 `docker compose build clipbot && docker compose up -d`. That restarts Postgres once (it allows more
@@ -378,6 +431,12 @@ it as described under Troubleshooting (this replaces any edits you made to the w
   accepted the events (clipbot keeps retrying while n8n is down or the workflow is unpublished).
 - **A scan says "chat unavailable (…)"**: the reason is in the brackets. For Twitch, try the chat tool
   by hand: `docker compose exec clipbot TwitchDownloaderCLI chatdownload --id <vod id> -o /tmp/c.json`.
+- **A clip has no captions:** the job's summary in Telegram says why. "No words from OpenShorts" means
+  its transcript was empty (music-only footage, or its files expired before the clip was collected).
+- **A template's music or effect is missing:** Telegram and the Review page name the sound; upload a file
+  with that name on the Templates page and re-render the clip.
+- **Punchline effects never land:** clipbot needs `GEMINI_API_KEY` (the same key as OpenShorts), then
+  `docker compose up -d clipbot`.
 - **Postiz doesn't come up:** `docker compose logs postiz-db temporal postiz`. `postiz-db` stops with a
   message when `POSTIZ_HOSTNAME` or `POSTIZ_JWT_SECRET` is missing (`bash setup.sh --publish` sets
   both). Temporal takes about a minute on its first start, Postiz a few minutes.

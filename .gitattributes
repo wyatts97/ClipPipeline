@@ -1,3 +1,7 @@
 # Shell scripts and configs run on Linux: keep LF even if edited on Windows.
 * text=auto eol=lf
 *.mp4 binary
+*.ttf binary
+*.otf binary
+*.mp3 binary
+*.wav binary

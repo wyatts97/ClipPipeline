@@ -69,6 +69,10 @@ class Settings:
     tiktok_post_mode: str = "UPLOAD"      # UPLOAD = your TikTok inbox, DIRECT_POST = publish
     youtube_visibility: str = "public"
     timezone: str = "UTC"
+    # templates: Gemini picks punchlines for "punchline" sound effects (optional)
+    gemini_api_key: str = ""
+    gemini_model: str = "gemini-3.1-flash-lite"
+    gemini_api_url: str = "https://generativelanguage.googleapis.com"
     # web dashboard
     dashboard_password: str = ""
     n8n_url: str = "http://n8n:5678"
@@ -131,6 +135,8 @@ class Settings:
             tiktok_post_mode=os.environ.get("TIKTOK_POST_MODE", "UPLOAD").strip().upper(),
             youtube_visibility=os.environ.get("YOUTUBE_VISIBILITY", "public").strip().lower(),
             timezone=os.environ.get("TZ", "UTC").strip() or "UTC",
+            gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
+            gemini_model=os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite",
             dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
             n8n_url=os.environ.get("N8N_URL", "http://n8n:5678").rstrip("/"),
             n8n_api_key=os.environ.get("N8N_API_KEY", "").strip(),

@@ -79,13 +79,17 @@ def youtube_title(clip: Clip) -> str:
 
 
 def caption_for(platform: str, clip: Clip) -> str:
+    """The post text. A template's credit line (e.g. for CC-BY music) always goes at the end."""
     meta = clip.meta or {}
     title = clean_caption(clip.title or meta.get("video_title_for_youtube_short") or "")
     if platform == "youtube":
-        return "\n".join(x for x in (clean_caption(clip.hook), "#shorts") if x)
-    if platform == "tiktok":
-        return clean_caption(meta.get("video_description_for_tiktok")) or title
-    return clean_caption(meta.get("video_description_for_instagram")) or title
+        text = "\n".join(x for x in (clean_caption(clip.hook), "#shorts") if x)
+    elif platform == "tiktok":
+        text = clean_caption(meta.get("video_description_for_tiktok")) or title
+    else:
+        text = clean_caption(meta.get("video_description_for_instagram")) or title
+    credit = str(meta.get("credit") or "").strip()
+    return f"{text}\n\n{credit}".strip() if credit else text
 
 
 def channel_settings(settings: Settings, channel: dict[str, Any], clip: Clip) -> dict[str, Any]:

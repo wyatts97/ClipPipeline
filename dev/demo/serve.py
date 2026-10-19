@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import dataclasses
+import json
 import random
 import shutil
 import subprocess
@@ -104,10 +105,21 @@ async def seed(settings: Settings) -> None:
         master = pending / f"{done.id}_{i}.mp4"
         make_video(master, SOURCES[i % len(SOURCES)], 5 + i)
         await media.make_thumbnail(master, thumbs / f"{done.id}_{i}.jpg")
-        store.add_clip(done.id, i, title, hook, {
+        clip = store.add_clip(done.id, i, title, hook, {
             "video_title_for_youtube_short": title, "viral_hook_text": hook,
             "video_description_for_tiktok": f"{title} #twitch #streamer #clips",
             "video_description_for_instagram": f"{title}. Follow for daily clips."}, float(5 + i), str(master), None)
+        # Re-renderable in Review: a copy without captions, and the words to caption it with.
+        shutil.copyfile(master, settings.folder("clean") / master.name)
+        words = [{"w": w, "s": round(k * 0.45, 2), "e": round(k * 0.45 + 0.4, 2)}
+                 for k, w in enumerate(f"{hook} {title}".split())]
+        store.update_clip(clip.id, template="standard", words=json.dumps(words))
+    # Placeholder sounds (sine tones) so the Templates page and Review have something to pick.
+    sounds = settings.folder("sounds")
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=70:duration=0.7",
+                    str(sounds / "demo-boom.wav")], check=True)
+    subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=520:duration=12",
+                    "-ac", "2", str(sounds / "demo-music.mp3")], check=True)
     old = job("https://youtu.be/zn1dXa6W7t4", 600, 735, 2, "done", 86400 * 2,
               os_job="5a1c0d4e-0000-4000-8000-0000000001d0")
     for i, decision in enumerate(("ok", "no")):

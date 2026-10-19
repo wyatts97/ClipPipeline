@@ -11,6 +11,7 @@ import { PublishingPage } from "@/pages/publishing"
 import { ReviewPage } from "@/pages/review"
 import { ScansPage } from "@/pages/scans"
 import { StoragePage } from "@/pages/storage"
+import { TemplatesPage } from "@/pages/templates"
 
 export function App() {
   const session = useQuery({ queryKey: ["session"], queryFn: api.session, staleTime: 60_000 })
@@ -33,6 +34,7 @@ export function App() {
         <Route index element={<OverviewPage />} />
         <Route path="review" element={<ReviewPage />} />
         <Route path="publishing" element={<PublishingPage />} />
+        <Route path="templates" element={<TemplatesPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="jobs/:jobId" element={<JobsPage />} />
         <Route path="scans" element={<ScansPage />} />

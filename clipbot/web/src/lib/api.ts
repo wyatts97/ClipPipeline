@@ -22,6 +22,7 @@ export interface Job {
   retried_by: string | null
   openshorts_job: string | null
   clip_count: number
+  template: string | null
   last_log?: string | null
 }
 
@@ -69,6 +70,72 @@ export interface Clip {
   file: string
   video_url: string
   thumb_url: string | null
+  template: string | null
+  template_name: string | null
+  sfx: HandEffect[]
+  render_state: "rendering" | "failed" | null
+  render_error: string | null
+  can_render: boolean
+  credit: string | null
+  word_count: number
+}
+
+export interface HandEffect { sound: string; t: number; volume?: number }
+
+export type Trigger = "start" | "end" | "peak" | "word" | "punchline"
+export type CaptionEffect = "none" | "pop" | "glow" | "box" | "highlight"
+export type CaptionPosition = "bottom" | "middle" | "top"
+
+export interface CaptionStyle {
+  enabled: boolean
+  font_name: string
+  font_size: number
+  font_color: string
+  highlight_color: string
+  border_color: string
+  border_width: number
+  effect: CaptionEffect
+  uppercase: boolean
+  reveal: boolean
+  max_chars: number
+  max_duration: number
+  position: CaptionPosition
+  base_opacity: number
+  shadow: number
+  bg_opacity: number
+  bg_color: string
+}
+
+export interface SfxRule { sound: string; at: Trigger; words: string[]; volume: number; max: number }
+
+export interface TemplateBody {
+  name: string
+  captions: CaptionStyle
+  music: { sound: string | null; volume: number; duck: boolean; start: number }
+  voice_volume: number
+  sfx: SfxRule[]
+  credit: string
+}
+
+export interface Template extends TemplateBody {
+  id: string
+  default: boolean
+  missing_sounds: string[]
+}
+
+export interface FontItem { family: string; file: string; bundled: boolean }
+export interface SoundItem { name: string; file: string; size: number; duration: number | null }
+
+export interface TemplatesResponse {
+  items: Template[]
+  default: string | null
+  presets: Record<string, CaptionStyle>
+  effects: CaptionEffect[]
+  positions: CaptionPosition[]
+  triggers: Trigger[]
+  fonts: FontItem[]
+  sounds: string[]
+  punchlines: boolean
 }
 
 export interface Scan {
@@ -162,7 +229,7 @@ export interface Overview {
 
 export interface StorageReport {
   disk: { total: number; free: number }
-  folders: Record<"pending" | "approved" | "rejected" | "previews" | "thumbs" | "tmp", number>
+  folders: Record<"pending" | "clean" | "approved" | "rejected" | "previews" | "thumbs" | "tmp" | "sounds", number>
   openshorts: { work: number; sources: number }
   jobs: (Job & { files: JobFiles })[]
   janitor_stuck: boolean
@@ -271,6 +338,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>
 }
 
+/** PUT a file as the raw request body (sounds, fonts). */
+async function upload<T>(path: string, file: File): Promise<T> {
+  return request<T>(path, { method: "PUT", body: file, headers: { "Content-Type": file.type || "application/octet-stream" } })
+}
+
 const post = <T>(path: string, body?: unknown) =>
   request<T>(path, { method: "POST", body: body === undefined ? undefined : JSON.stringify(body) })
 
@@ -298,13 +370,26 @@ export const api = {
 
   jobs: (status?: string) => request<{ items: Job[] }>(`/api/jobs${query({ status, limit: 200 })}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
-  createJob: (body: { url: string; start?: string; end?: string; clips?: number }) => post<Job>("/api/jobs", body),
+  createJob: (body: { url: string; start?: string; end?: string; clips?: number; template?: string }) => post<Job>("/api/jobs", body),
   retryJob: (id: string) => post<Job>(`/api/jobs/${id}/retry`),
   cancelJob: (id: string) => post<Job>(`/api/jobs/${id}/cancel`),
   deleteJobFiles: (id: string) => post<{ freed: number }>(`/api/jobs/${id}/delete-files`),
 
   storage: () => request<StorageReport>("/api/storage"),
   cleanup: () => post<{ jobs: number; freed: number }>("/api/storage/cleanup"),
+
+  templates: () => request<TemplatesResponse>("/api/templates"),
+  createTemplate: (body: TemplateBody) => post<Template>("/api/templates", body),
+  updateTemplate: (id: string, body: TemplateBody) =>
+    request<Template>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
+  deleteTemplate: (id: string) => request<{ ok: boolean }>(`/api/templates/${id}`, { method: "DELETE" }),
+  defaultTemplate: (id: string) => post<{ default: string }>(`/api/templates/${id}/default`),
+  sounds: () => request<{ items: SoundItem[] }>("/api/sounds"),
+  uploadSound: (file: File) => upload<SoundItem>(`/api/sounds/${encodeURIComponent(file.name)}`, file),
+  deleteSound: (name: string) => request<{ ok: boolean }>(`/api/sounds/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  uploadFont: (file: File) => upload<FontItem>(`/api/fonts/${encodeURIComponent(file.name)}`, file),
+  deleteFont: (file: string) => request<{ ok: boolean }>(`/api/fonts/${encodeURIComponent(file)}`, { method: "DELETE" }),
+  renderClip: (id: string, body: { template?: string; sfx?: HandEffect[] }) => post<Clip>(`/api/clips/${id}/render`, body),
 
   publishing: () => request<Publishing>("/api/publishing"),
   publish: (clipId: string, body: { at?: number | null; now?: boolean }) =>

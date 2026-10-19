@@ -18,7 +18,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
-from . import storage
+from . import captions, fonts, media, storage, templates
 from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
 from .platforms import detect_vod, timestamp_link
@@ -130,6 +130,7 @@ def job_out(store: Store, job: Job) -> dict[str, Any]:
         "created": job.created, "updated": job.updated, "retry_of": job.retry_of,
         "retried_by": retry.id if retry else None, "openshorts_job": job.openshorts_job,
         "clip_count": len(store.clips_for_job(job.id)) if job.status == "done" else 0,
+        "template": job.template,
     }
 
 
@@ -137,16 +138,24 @@ def thumb_path(settings: Settings, clip: Clip) -> Path:
     return settings.data_dir / "thumbs" / f"{clip.job_id}_{clip.idx}.jpg"
 
 
-def clip_out(settings: Settings, clip: Clip, job: Optional[Job]) -> dict[str, Any]:
+def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional[Store] = None) -> dict[str, Any]:
     meta = clip.meta or {}
+    video = Path(clip.path)
+    version = int(video.stat().st_mtime) if video.is_file() else 0
+    clean = settings.data_dir / "clean" / f"{clip.job_id}_{clip.idx}.mp4"
+    template = store.get_template(clip.template) if store and clip.template else None
     return {
+        "template": clip.template, "template_name": (template or {}).get("name"),
+        "sfx": clip.manual_sfx(), "render_state": clip.render_state, "render_error": clip.render_error,
+        "can_render": clip.status == "pending" and clean.is_file(), "credit": meta.get("credit"),
+        "word_count": len(clip.word_list()),
         "id": clip.id, "job_id": clip.job_id, "index": clip.idx, "status": clip.status,
         "title": clip.title, "hook": clip.hook, "duration": clip.duration, "decided": clip.decided,
         "description_tiktok": meta.get("video_description_for_tiktok"),
         "description_instagram": meta.get("video_description_for_instagram"),
         "source_url": job.source_url if job else None, "range": _range(job) if job else None,
         "created": job.updated if job else None, "file": Path(clip.path).name,
-        "video_url": f"/api/clips/{clip.id}/video",
+        "video_url": f"/api/clips/{clip.id}/video?v={version}",
         "thumb_url": f"/api/clips/{clip.id}/thumb" if thumb_path(settings, clip).is_file() else None,
     }
 
@@ -269,7 +278,7 @@ async def overview(request: Request):
         "queued_jobs": len(store.jobs_with_status("queued")),
         "scans": [scan_out(store, s) for s in store.scans_with_status("running", "queued")],
         "pending_clips": len(pending),
-        "pending_preview": [clip_out(settings, c, store.get_job(c.job_id)) for c in pending[:8]],
+        "pending_preview": [clip_out(settings, c, store.get_job(c.job_id), store) for c in pending[:8]],
         "problems": problems[:20],
         "errors_24h": len(store.query_logs(levels=LEVELS["error"], since=now - 86400, limit=1000)),
         "activity": activity[:30],
@@ -311,7 +320,7 @@ def _clip_or_404(store: Store, clip_id: str) -> Clip:
 @router.get("/clips", dependencies=authed)
 async def list_clips(request: Request, status: str = "pending", limit: int = 200):
     settings, store = settings_of(request), store_of(request)
-    return {"items": [clip_out(settings, c, store.get_job(c.job_id))
+    return {"items": [clip_out(settings, c, store.get_job(c.job_id), store)
                       for c in store.list_clips(status, limit=min(limit, 500))]}
 
 
@@ -334,7 +343,7 @@ async def edit_clip(clip_id: str, body: ClipEdit, request: Request):
         data.update({"title": title, "hook": hook, **{k: v for k, v in meta.items() if k.startswith("video_")}})
         sidecar.write_text(json.dumps(data, indent=2, ensure_ascii=False), encoding="utf-8")
     clip = store.get_clip(clip.id)
-    return clip_out(settings, clip, store.get_job(clip.job_id))
+    return clip_out(settings, clip, store.get_job(clip.job_id), store)
 
 
 def _decide(request: Request, clip_id: str, decision: str) -> dict[str, Any]:
@@ -345,7 +354,7 @@ def _decide(request: Request, clip_id: str, decision: str) -> dict[str, Any]:
     job = store.get_job(clip.job_id)
     toast, reply = request.app.state.pipeline.decide(job.chat_id, f"{'ok' if decision == 'approve' else 'no'}:{clip.id}")
     clip = store.get_clip(clip.id)
-    return {"result": toast, "message": reply, "clip": clip_out(settings, clip, job)}
+    return {"result": toast, "message": reply, "clip": clip_out(settings, clip, job, store)}
 
 
 @router.post("/clips/{clip_id}/decision", dependencies=authed)
@@ -381,6 +390,7 @@ class JobIn(BaseModel):
     start: Union[str, float, None] = None
     end: Union[str, float, None] = None
     clips: Optional[int] = None
+    template: Optional[str] = None
 
 
 def _job_or_404(store: Store, job_id: str) -> Job:
@@ -410,7 +420,7 @@ async def get_job(job_id: str, request: Request):
             openshorts = {"status": "unreachable", "logs": [str(e) or type(e).__name__]}
     usage = storage.job_usage(settings, store, job)
     return {**job_out(store, job),
-            "clips": [clip_out(settings, c, job) for c in store.clips_for_job(job.id)],
+            "clips": [clip_out(settings, c, job, store) for c in store.clips_for_job(job.id)],
             "logs": store.query_logs(job_id=job.id, limit=200), "openshorts": openshorts,
             "files": {**usage, "freeable": storage.freeable(usage),
                       "deleting": storage.purge_requested(settings, job.openshorts_job)}}
@@ -427,7 +437,9 @@ async def create_job(body: JobIn, request: Request):
     clips = body.clips or settings.target_clips
     if not 1 <= clips <= 15:
         raise HTTPException(422, "Clips must be between 1 and 15.")
-    job = store.create_job(default_chat(settings), url, start, end, clips)
+    if body.template and store.get_template(body.template) is None:
+        raise HTTPException(422, "No such template.")
+    job = store.create_job(default_chat(settings), url, start, end, clips, template=body.template or None)
     request.app.state.pipeline.wake()
     return job_out(store, job)
 
@@ -439,7 +451,7 @@ async def retry_job(job_id: str, request: Request):
     if job.status not in ("failed", "cancelled"):
         raise HTTPException(409, "Only failed or cancelled jobs can be retried.")
     new = store.create_job(job.chat_id, job.source_url, job.range_start, job.range_end, job.target_clips,
-                           retry_of=job.id)
+                           retry_of=job.id, template=job.template)
     request.app.state.pipeline.wake()
     return job_out(store, new)
 
@@ -527,7 +539,7 @@ async def publishing(request: Request):
         if not clip:
             continue
         live = [p for p in posts if p.status != "cancelled"] or posts
-        groups.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id)),
+        groups.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id), store),
                        "status": _group_status(live), "publish_at": min(p.publish_at for p in live),
                        "posts": [post_out(p) for p in sorted(live, key=lambda p: p.platform)]})
     upcoming = sorted((g for g in groups if g["status"] == "scheduled"), key=lambda g: g["publish_at"])
@@ -536,11 +548,11 @@ async def publishing(request: Request):
     for req in store.publish_requests("waiting", "failed"):
         clip = store.get_clip(req.clip_id)
         if clip:
-            queue.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id)), "status": req.status,
+            queue.append({"clip": clip_out(settings, clip, store.get_job(clip.job_id), store), "status": req.status,
                           "error": req.error, "attempts": req.attempts, "next_try": req.next_try})
     busy = {q["clip"]["id"] for q in queue} | {
         clip_id for clip_id, posts in by_clip.items() if any(p.status in ("scheduled", "published") for p in posts)}
-    unscheduled = [clip_out(settings, c, store.get_job(c.job_id))
+    unscheduled = [clip_out(settings, c, store.get_job(c.job_id), store)
                    for c in store.list_clips("approved", limit=100) if c.id not in busy]
     taken = {int(p.publish_at // 60) for p in store.list_posts("scheduled", since=now)}
     return {**base, "channels": channels, "error": error,
@@ -584,6 +596,216 @@ async def unschedule_clip(clip_id: str, request: Request):
         raise HTTPException(502, str(e))
 
 
+# ---- templates, sounds and fonts --------------------------------------------------------
+MAX_SOUND_BYTES = 30 * 1024 * 1024
+MAX_FONT_BYTES = 10 * 1024 * 1024
+AUDIO_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", ".m4a": "audio/mp4",
+               ".aac": "audio/aac", ".flac": "audio/flac", ".opus": "audio/ogg"}
+
+
+class TemplateIn(BaseModel):
+    name: str
+    captions: dict[str, Any] = {}
+    music: dict[str, Any] = {}
+    voice_volume: float = 1.0
+    sfx: list[dict[str, Any]] = []
+    credit: str = ""
+
+
+class RenderIn(BaseModel):
+    template: Optional[str] = None
+    sfx: Optional[list[dict[str, Any]]] = None    # effects placed by hand: [{sound, t, volume}]
+
+
+def template_out(settings: Settings, store: Store, item: dict[str, Any]) -> dict[str, Any]:
+    t = templates.normalize(item["data"])
+    return {"id": item["id"], **t, "default": item["id"] == store.get_setting("default_template"),
+            "missing_sounds": templates.missing_sounds(settings, t)}
+
+
+def _template_or_404(store: Store, template_id: str) -> dict[str, Any]:
+    data = store.get_template(template_id)
+    if data is None:
+        raise HTTPException(404, "No such template.")
+    return {"id": template_id, "data": data}
+
+
+async def _sound_items(settings: Settings) -> list[dict[str, Any]]:
+    folder = settings.data_dir / "sounds"
+    paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in templates.SOUND_EXTS) if folder.is_dir() else []
+
+    async def item(path: Path) -> dict[str, Any]:
+        try:
+            duration = await media.probe_duration(path)
+        except media.MediaError:
+            duration = None
+        return {"name": path.stem, "file": path.name, "size": path.stat().st_size, "duration": duration}
+
+    return list(await asyncio.gather(*(item(p) for p in paths)))
+
+
+@router.get("/templates", dependencies=authed)
+async def list_templates(request: Request):
+    settings, store = settings_of(request), store_of(request)
+    return {"items": [template_out(settings, store, item) for item in store.list_templates()],
+            "default": store.get_setting("default_template"),
+            "presets": captions.PRESETS, "effects": list(captions.EFFECTS), "positions": list(captions.POSITIONS),
+            "triggers": list(templates.TRIGGERS), "fonts": fonts.list_fonts(settings),
+            "sounds": [s["name"] for s in await _sound_items(settings)],
+            "punchlines": bool(settings.gemini_api_key)}
+
+
+@router.post("/templates", dependencies=authed, status_code=201)
+async def create_template(body: TemplateIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    data = templates.normalize(body.model_dump())
+    base = templates.slug(data["name"])
+    tid, n = base, 2
+    while store.get_template(tid) is not None:
+        tid, n = f"{base}-{n}", n + 1
+    store.save_template(tid, data)
+    return template_out(settings, store, {"id": tid, "data": data})
+
+
+@router.put("/templates/{template_id}", dependencies=authed)
+async def update_template(template_id: str, body: TemplateIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    _template_or_404(store, template_id)
+    data = templates.normalize(body.model_dump())
+    store.save_template(template_id, data)
+    return template_out(settings, store, {"id": template_id, "data": data})
+
+
+@router.delete("/templates/{template_id}", dependencies=authed)
+async def delete_template(template_id: str, request: Request):
+    store = store_of(request)
+    _template_or_404(store, template_id)
+    if store.get_setting("default_template") == template_id:
+        raise HTTPException(409, "This is the default template. Make another one the default first.")
+    store.delete_template(template_id)
+    return {"ok": True}
+
+
+@router.post("/templates/{template_id}/default", dependencies=authed)
+async def make_default_template(template_id: str, request: Request):
+    store = store_of(request)
+    _template_or_404(store, template_id)
+    store.set_setting("default_template", template_id)
+    return {"default": template_id}
+
+
+@router.get("/sounds", dependencies=authed)
+async def list_sounds(request: Request):
+    return {"items": await _sound_items(settings_of(request))}
+
+
+@router.put("/sounds/{filename}", dependencies=authed, status_code=201)
+async def upload_sound(filename: str, request: Request):
+    settings = settings_of(request)
+    suffix = Path(filename).suffix.lower()
+    name = templates.sound_name(filename)
+    if suffix not in templates.SOUND_EXTS or not name:
+        raise HTTPException(422, "Upload an audio file: " + ", ".join(templates.SOUND_EXTS))
+    body = await request.body()
+    if not body or len(body) > MAX_SOUND_BYTES:
+        raise HTTPException(413, f"Sounds can be up to {MAX_SOUND_BYTES // 1024 // 1024} MB.")
+    for old in (settings.data_dir / "sounds").glob("*"):
+        if old.stem.lower() == name.lower():
+            old.unlink()                   # replacing a sound of the same name, maybe another format
+    path = templates.sounds_dir(settings) / f"{name}{suffix}"
+    path.write_bytes(body)
+    try:
+        duration = await media.probe_duration(path)
+    except media.MediaError:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "That file isn't audio ffmpeg can read.")
+    return {"name": name, "file": path.name, "size": len(body), "duration": duration}
+
+
+@router.delete("/sounds/{name}", dependencies=authed)
+async def delete_sound(name: str, request: Request):
+    path = templates.find_sound(settings_of(request), templates.sound_name(name))
+    if not path:
+        raise HTTPException(404, "No such sound.")
+    path.unlink()
+    return {"ok": True}
+
+
+@router.get("/sounds/{name}/file", dependencies=authed)
+async def sound_file(name: str, request: Request):
+    path = templates.find_sound(settings_of(request), templates.sound_name(name))
+    if not path:
+        raise HTTPException(404, "No such sound.")
+    return FileResponse(path, media_type=AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+
+
+@router.get("/fonts", dependencies=authed)
+async def list_font_files(request: Request):
+    return {"items": fonts.list_fonts(settings_of(request))}
+
+
+@router.put("/fonts/{filename}", dependencies=authed, status_code=201)
+async def upload_font(filename: str, request: Request):
+    settings = settings_of(request)
+    safe = Path(filename).name
+    if Path(safe).suffix.lower() not in fonts.FONT_EXTS:
+        raise HTTPException(422, "Upload a .ttf or .otf font.")
+    body = await request.body()
+    if not body or len(body) > MAX_FONT_BYTES:
+        raise HTTPException(413, f"Fonts can be up to {MAX_FONT_BYTES // 1024 // 1024} MB.")
+    path = settings.folder("fonts") / safe
+    path.write_bytes(body)
+    family = fonts.family_name(path)
+    if not family:
+        path.unlink(missing_ok=True)
+        raise HTTPException(422, "That file isn't a font clipbot can read.")
+    return {"family": family, "file": safe, "bundled": False}
+
+
+@router.delete("/fonts/{filename}", dependencies=authed)
+async def delete_font(filename: str, request: Request):
+    path = settings_of(request).data_dir / "fonts" / Path(filename).name
+    if not path.is_file():
+        raise HTTPException(404, "Only fonts you uploaded can be deleted.")
+    path.unlink()
+    return {"ok": True}
+
+
+@router.get("/fonts/{filename}/file", dependencies=authed)
+async def font_data(filename: str, request: Request):
+    path = fonts.font_file(settings_of(request), filename)
+    if not path:
+        raise HTTPException(404, "No such font.")
+    return FileResponse(path, media_type="font/otf" if path.suffix.lower() == ".otf" else "font/ttf",
+                        headers={"Cache-Control": "max-age=86400"})
+
+
+@router.post("/clips/{clip_id}/render", dependencies=authed, status_code=202)
+async def render_clip(clip_id: str, body: RenderIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    clip = _clip_or_404(store, clip_id)
+    pipeline = request.app.state.pipeline
+    if clip.status != "pending":
+        raise HTTPException(409, "Only clips waiting for review can be re-rendered.")
+    if clip.render_state == "rendering":
+        raise HTTPException(409, "This clip is rendering already.")
+    if not pipeline.clean_source(clip).is_file():
+        raise HTTPException(409, "The copy without captions is gone, so this clip can't be re-rendered.")
+    if body.template and store.get_template(body.template) is None:
+        raise HTTPException(422, "No such template.")
+    sfx = None
+    if body.sfx is not None:
+        sfx = [{"sound": templates.sound_name(e.get("sound")), "t": float(e.get("t") or 0),
+                "volume": float(e.get("volume") or 1.0)} for e in body.sfx if templates.sound_name(e.get("sound"))]
+    store.update_clip(clip.id, render_state="rendering", render_error=None)
+    task = asyncio.create_task(pipeline.rerender(clip.id, body.template, sfx))
+    request.app.state.render_tasks = getattr(request.app.state, "render_tasks", set())
+    request.app.state.render_tasks.add(task)
+    task.add_done_callback(request.app.state.render_tasks.discard)
+    clip = store.get_clip(clip.id)
+    return clip_out(settings, clip, store.get_job(clip.job_id), store)
+
+
 # ---- scans ----------------------------------------------------------------------
 class ScanIn(BaseModel):
     url: str
@@ -594,6 +816,7 @@ class ScanClipIn(BaseModel):
     end: Union[str, float]
     clips: int = 1
     moment_id: Optional[str] = None
+    template: Optional[str] = None
 
 
 def _scan_or_404(store: Store, scan_id: str) -> Scan:
@@ -647,7 +870,10 @@ async def clip_from_scan(scan_id: str, body: ScanClipIn, request: Request):
     moment = store.get_moment(body.moment_id) if body.moment_id else None
     if moment and moment.job_id:
         raise HTTPException(409, "That moment already has a job.")
-    job = store.create_job(scan.chat_id or default_chat(settings), scan.source_url, start, end, body.clips)
+    if body.template and store.get_template(body.template) is None:
+        raise HTTPException(422, "No such template.")
+    job = store.create_job(scan.chat_id or default_chat(settings), scan.source_url, start, end, body.clips,
+                           template=body.template or None)
     if moment and moment.scan_id == scan.id:
         store.claim_moment(moment.id, job.id)
     request.app.state.pipeline.wake()

@@ -89,6 +89,13 @@ class OpenShorts:
             raise OpenShortsError(f"Status check failed ({resp.status_code}): {_detail(resp)}")
         return resp.json()
 
+    async def transcript(self, job_id: str, clip_index: int) -> list[dict[str, Any]]:
+        """The clip's words with clip-relative times: [{text, startMs, endMs}]."""
+        resp = await self._client.get(f"{self.base_url}/api/clip/{job_id}/{clip_index}/transcript")
+        if resp.status_code >= 400:
+            raise OpenShortsError(f"No transcript for clip {clip_index + 1} ({resp.status_code}): {_detail(resp)}")
+        return (resp.json() or {}).get("captions") or []
+
     async def download(self, video_url: str, dst: Path) -> None:
         url = video_url if video_url.startswith("http") else f"{self.base_url}{video_url}"
         async with self._client.stream("GET", url) as resp:

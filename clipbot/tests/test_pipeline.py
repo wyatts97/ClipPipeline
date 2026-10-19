@@ -4,6 +4,7 @@ import dataclasses
 import json
 import shutil
 import time
+from pathlib import Path
 
 import httpx
 import pytest
@@ -23,6 +24,8 @@ class FakeOpenShorts:
         self.status_value = "completed"
         self.logs = ["step one", "boom"]
         self.refuse = None
+        self.words = [{"text": w, "startMs": i * 400, "endMs": i * 400 + 350}
+                      for i, w in enumerate("he did what no way".split())]
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         path, method = request.url.path, request.method
@@ -50,6 +53,8 @@ class FakeOpenShorts:
                      "viral_hook_text": "He did WHAT 😳", "start": 12.0, "end": 40.0},
                     {"video_url": f"/videos/{OS_JOB}/clip_1.mp4", "title": "Second one"},
                 ]} if self.status_value == "completed" else None})
+        if method == "GET" and path.startswith(f"/api/clip/{OS_JOB}/") and path.endswith("/transcript"):
+            return httpx.Response(200, json={"captions": self.words, "durationSec": 3.0, "language": "en"})
         if method == "GET" and path.startswith(f"/videos/{OS_JOB}/"):
             return httpx.Response(200, content=self.sample.read_bytes())
         return httpx.Response(404, json={"detail": "not found"})
@@ -95,7 +100,7 @@ def test_url_job_end_to_end(env, settings):
     body = fake_os.process_bodies[0]
     assert body["acknowledged"] is True and body["url"] == "https://youtu.be/abc"
     assert body["layouts"] == ["auto"] and body["target_clips"] == 3 and body["auto_hook"] is True
-    assert "captions" not in body  # OpenShorts burns captions unless told captions=false
+    assert body["captions"] is False   # clipbot burns them, in the job's template
 
     run(pipeline.poll_job(job))
     assert store.get_job(job.id).status == "done"
@@ -106,6 +111,9 @@ def test_url_job_end_to_end(env, settings):
         preview = settings.data_dir / "previews" / f"{job.id}_{clip.idx}.mp4"
         assert preview.is_file() and preview.stat().st_size < settings.preview_max_mb * 1024 * 1024
         assert 2.5 < clip.duration < 3.5
+        assert clip.template == "standard" and clip.word_list()[2] == {"w": "what", "s": 0.8, "e": 1.15}
+        clean = settings.data_dir / "clean" / f"{job.id}_{clip.idx}.mp4"
+        assert clean.is_file() and clean.read_bytes() != Path(clip.path).read_bytes()   # captions burned in
 
     run(pipeline.flush_outbox())
     kinds = [e["event"] for e in fake_n8n.events]
@@ -115,6 +123,7 @@ def test_url_job_end_to_end(env, settings):
     assert first["chat_id"] == 111 and first["approve_data"] == f"ok:{clips[0].id}"
     assert first["preview_url"] == f"http://clipbot:8080/previews/{clips[0].id}"
     assert "Funny moment" in first["caption"] and "🪝 He did WHAT" in first["caption"]
+    assert "🎨 Standard" in first["caption"]
     assert set(fake_n8n.tokens) == {"test-token"}
     assert store.due_events() == []
 
@@ -133,6 +142,7 @@ def test_decisions_move_files(env, settings):
     sidecar = json.loads(approved[0].with_suffix(".json").read_text(encoding="utf-8"))
     assert sidecar["viral_hook_text"] == "He did WHAT 😳" and sidecar["source_url"] == "https://youtu.be/abc"
     assert not (settings.data_dir / "previews" / f"{job.id}_0.mp4").exists()
+    assert not (settings.data_dir / "clean" / f"{job.id}_0.mp4").exists()   # no re-renders after a decision
 
     assert pipeline.decide(111, f"ok:{first.id}") == ("Already approved", None)
     assert pipeline.decide(222, f"no:{second.id}") == ("Unknown clip", None)

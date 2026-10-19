@@ -142,6 +142,8 @@ def main() -> None:
         assert any("finished: 2 clip(s)" in t for t in texts), texts
         first = videos[0]["body"]
         assert first["video"]["bytes"] > 1000 and "Big play" in first["caption"], first
+        assert "🎨 Standard" in first["caption"], first["caption"]           # captions rendered by clipbot
+        assert not any("no words" in t or "template failed" in t for t in texts), texts
         keyboard = json.loads(first["reply_markup"])["inline_keyboard"][0]
         assert [b["text"] for b in keyboard] == ["✅ Post", "❌ Skip"], keyboard
         ok_data, skip_data = keyboard[0]["callback_data"], json.loads(

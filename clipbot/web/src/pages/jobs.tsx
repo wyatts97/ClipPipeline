@@ -5,6 +5,7 @@ import { Link, useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
 
 import { ClipThumb } from "@/components/clip-thumb"
+import { NativeSelect } from "@/components/native-select"
 import { LogLines } from "@/components/log-lines"
 import { isActive, Status } from "@/components/status"
 import { Button } from "@/components/ui/button"
@@ -144,6 +145,8 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
               <dd>{d.target_clips}</dd>
               <dt className="text-muted-foreground">Started</dt>
               <dd>{clock(d.created)}{isActive(d.status) && <span className="ml-2 text-muted-foreground timecode">running {elapsed(d.created)}</span>}</dd>
+              <dt className="text-muted-foreground">Template</dt>
+              <dd>{d.template ?? "default"}</dd>
               {d.openshorts_job && (<><dt className="text-muted-foreground">OpenShorts job</dt><dd className="font-mono text-xs">{d.openshorts_job}</dd></>)}
               {d.retry_of && (<><dt className="text-muted-foreground">Retry of</dt><dd><Link to={`/jobs/${d.retry_of}`} className="hover:underline">job {d.retry_of}</Link></dd></>)}
               {d.retried_by && (<><dt className="text-muted-foreground">Retried as</dt><dd><Link to={`/jobs/${d.retried_by}`} className="hover:underline">job {d.retried_by}</Link></dd></>)}
@@ -237,12 +240,16 @@ export function NewJobDialog({ open, onOpenChange, initial }: {
   const [start, setStart] = useState(initial?.start ?? "")
   const [end, setEnd] = useState(initial?.end ?? "")
   const [clips, setClips] = useState("3")
+  const [template, setTemplate] = useState("")
+  const templates = useQuery({ queryKey: ["templates"], queryFn: api.templates, enabled: open })
   const s = parseTc(start)
   const e = parseTc(end)
   const length = s !== null && e !== null && e > s ? e - s : null
 
   const create = useMutation({
-    mutationFn: () => api.createJob({ url, start: start || undefined, end: end || undefined, clips: Number(clips) || undefined }),
+    mutationFn: () => api.createJob({
+      url, start: start || undefined, end: end || undefined, clips: Number(clips) || undefined, template: template || undefined,
+    }),
     onSuccess: (job: Job) => {
       toast.success(`Job ${job.id} queued`)
       qc.invalidateQueries({ queryKey: ["jobs"] })
@@ -284,6 +291,13 @@ export function NewJobDialog({ open, onOpenChange, initial }: {
           <p className="text-sm text-muted-foreground">
             {length !== null ? <>Clips <span className="timecode">{tc(length)}</span> of the video.</> : "Leave start and end empty to use the whole video."}
           </p>
+          <div className="space-y-1.5">
+            <Label htmlFor="job-template">Template</Label>
+            <NativeSelect id="job-template" value={template} onChange={(ev) => setTemplate(ev.target.value)}>
+              <option value="">Default{templates.data ? ` (${templates.data.items.find((t) => t.default)?.name ?? "Standard"})` : ""}</option>
+              {(templates.data?.items ?? []).filter((t) => !t.default).map((t) => <option key={t.id} value={t.id}>{t.name}</option>)}
+            </NativeSelect>
+          </div>
         </form>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>
