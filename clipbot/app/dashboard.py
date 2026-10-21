@@ -20,13 +20,14 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import captions, fonts, media, storage, templates
+from . import captions, editing, fonts, media, render, storage, templates
 from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
-from .platforms import detect_vod, timestamp_link
+from .platforms import Channel, channel_url, detect_channel, detect_vod, timestamp_link
+from .openshorts import OpenShortsError
 from .postiz import PostizError
 from .publisher import caption_for, next_free_slot, youtube_title
-from .store import Clip, Job, MomentRow, Post, Scan, Store
+from .store import Clip, Job, MomentRow, Post, Scan, Store, Watch
 
 COOKIE = "cp_session"
 SESSION_DAYS = 30
@@ -140,6 +141,13 @@ def thumb_path(settings: Settings, clip: Clip) -> Path:
     return settings.data_dir / "thumbs" / f"{clip.job_id}_{clip.idx}.jpg"
 
 
+def edited(clip: Clip) -> bool:
+    """Cut or zoomed in the editor."""
+    edit = json.loads(clip.edit) if clip.edit else {}
+    segments = edit.get("segments") or []
+    return bool(edit.get("zooms")) or len(segments) > 1 or bool(segments and segments[0][0] > 0.05)
+
+
 def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional[Store] = None) -> dict[str, Any]:
     meta = clip.meta or {}
     video = Path(clip.path)
@@ -150,6 +158,7 @@ def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional
         "template": clip.template, "template_name": (template or {}).get("name"),
         "sfx": clip.manual_sfx(), "render_state": clip.render_state, "render_error": clip.render_error,
         "can_render": clip.status == "pending" and clean.is_file(), "credit": meta.get("credit"),
+        "edited": edited(clip),
         "word_count": len(clip.word_list()),
         "download_url": f"/api/clips/{clip.id}/download",
         "post_text": {"youtube_title": youtube_title(clip), "youtube": caption_for("youtube", clip),
@@ -874,12 +883,286 @@ async def render_clip(clip_id: str, body: RenderIn, request: Request):
         sfx = [{"sound": templates.sound_name(e.get("sound")), "t": float(e.get("t") or 0),
                 "volume": float(e.get("volume") or 1.0)} for e in body.sfx if templates.sound_name(e.get("sound"))]
     store.update_clip(clip.id, render_state="rendering", render_error=None)
-    task = asyncio.create_task(pipeline.rerender(clip.id, body.template, sfx))
+    _background(request, pipeline.rerender(clip.id, body.template, sfx))
+    clip = store.get_clip(clip.id)
+    return clip_out(settings, clip, store.get_job(clip.job_id), store)
+
+
+def _background(request: Request, coro) -> None:
+    """Run a render after answering; keep a reference so the task isn't garbage-collected."""
+    task = asyncio.create_task(coro)
     request.app.state.render_tasks = getattr(request.app.state, "render_tasks", set())
     request.app.state.render_tasks.add(task)
     task.add_done_callback(request.app.state.render_tasks.discard)
+
+
+def _editable(request: Request, clip_id: str) -> Clip:
+    store = store_of(request)
+    clip = _clip_or_404(store, clip_id)
+    if clip.status != "pending":
+        raise HTTPException(409, "Only clips waiting for review can be edited.")
+    if clip.render_state == "rendering":
+        raise HTTPException(409, "This clip is rendering already.")
+    if not request.app.state.pipeline.clean_source(clip).is_file():
+        raise HTTPException(409, "The copy without captions is gone, so this clip can't be edited.")
+    return clip
+
+
+# ---- the clip editor ------------------------------------------------------------------
+class WordIn(BaseModel):
+    w: str
+    s: float
+    e: float
+
+
+class EditIn(BaseModel):
+    template: Optional[str] = None
+    sfx: Optional[list[dict[str, Any]]] = None
+    edit: Optional[dict[str, Any]] = None
+    words: Optional[list[WordIn]] = None
+
+
+class RecutIn(BaseModel):
+    extend_start: float = 0
+    extend_end: float = 0
+    framing: Optional[str] = None      # auto | full | track; None keeps the clip's
+
+
+@router.get("/clips/{clip_id}/editor", dependencies=authed)
+async def clip_editor(clip_id: str, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    clip = _clip_or_404(store, clip_id)
+    pipeline = request.app.state.pipeline
+    source = pipeline.clean_source(clip)
+    if clip.status != "pending" or not source.is_file():
+        raise HTTPException(409, "Only clips waiting for review can be edited (their copy without captions "
+                                 "is deleted once you decide).")
+    duration = await media.probe_duration(source)
+    job = store.get_job(clip.job_id)
+    openshorts: dict[str, Any] = {"available": False, "source_kept": False, "framing": None, "reason": None}
+    if job and job.openshorts_job:
+        try:
+            edl = await asyncio.wait_for(pipeline.openshorts.edl(job.openshorts_job, clip.idx), 5)
+            openshorts.update(available=True, source_kept=bool((edl.get("source") or {}).get("available")),
+                              framing=edl.get("framing") or "auto")
+            if not openshorts["source_kept"]:
+                openshorts["reason"] = ("OpenShorts deleted this clip's source, so it can only be cut shorter, "
+                                        "not extended or reframed.")
+        except (OpenShortsError, httpx.HTTPError, asyncio.TimeoutError) as e:
+            openshorts["reason"] = ("OpenShorts no longer has this clip (it keeps job files about a day)."
+                                    if isinstance(e, OpenShortsError) and e.status == 404
+                                    else f"OpenShorts didn't answer: {str(e)[:200] or type(e).__name__}")
+    version = int(source.stat().st_mtime)
+    return {"clip": clip_out(settings, clip, job, store), "source_url": f"/api/clips/{clip.id}/source?v={version}",
+            "peaks_url": f"/api/clips/{clip.id}/peaks?v={version}", "source_duration": duration,
+            "words": clip.word_list(), "words_original": clip.meta.get("words_original"),
+            "edit": editing.normalize(json.loads(clip.edit) if clip.edit else None, duration),
+            "sfx": clip.manual_sfx(), "template": clip.template, "openshorts": openshorts}
+
+
+@router.get("/clips/{clip_id}/source", dependencies=authed)
+async def clip_source(clip_id: str, request: Request):
+    clip = _clip_or_404(store_of(request), clip_id)
+    source = request.app.state.pipeline.clean_source(clip)
+    if not source.is_file():
+        raise HTTPException(404, "The copy without captions is gone.")
+    return FileResponse(source, media_type="video/mp4")
+
+
+@router.get("/clips/{clip_id}/peaks", dependencies=authed)
+async def clip_peaks(clip_id: str, request: Request):
+    settings = settings_of(request)
+    clip = _clip_or_404(store_of(request), clip_id)
+    source = request.app.state.pipeline.clean_source(clip)
+    if not source.is_file():
+        raise HTTPException(404, "The copy without captions is gone.")
+    cache = settings.folder("tmp") / "peaks" / f"{clip.id}-{int(source.stat().st_mtime)}.json"
+    if cache.is_file():
+        return json.loads(cache.read_text(encoding="utf-8"))
+    try:
+        data = {"per_second": 50, "peaks": await render.peaks(source, 50)}
+    except media.MediaError:
+        data = {"per_second": 50, "peaks": []}
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    for old in cache.parent.glob(f"{clip.id}-*.json"):
+        old.unlink(missing_ok=True)
+    cache.write_text(json.dumps(data), encoding="utf-8")
+    return data
+
+
+@router.post("/clips/{clip_id}/edit", dependencies=authed, status_code=202)
+async def edit_clip_render(clip_id: str, body: EditIn, request: Request):
+    """Save the editor's work (any of: template, hand-placed effects, cuts and zooms, caption words)
+    and render the clip again."""
+    settings, store = settings_of(request), store_of(request)
+    clip = _editable(request, clip_id)
+    if body.template and store.get_template(body.template) is None:
+        raise HTTPException(422, "No such template.")
+    sfx = None
+    if body.sfx is not None:
+        sfx = [{"sound": templates.sound_name(e.get("sound")), "t": round(float(e.get("t") or 0), 3),
+                "volume": float(e.get("volume") or 1.0)} for e in body.sfx if templates.sound_name(e.get("sound"))]
+    words = None
+    if body.words is not None:
+        words = [{"w": w.w.strip(), "s": round(w.s, 3), "e": round(max(w.e, w.s + 0.05), 3)}
+                 for w in body.words if w.w.strip()]
+    store.update_clip(clip.id, render_state="rendering", render_error=None)
+    _background(request, request.app.state.pipeline.rerender(clip.id, body.template, sfx, body.edit, words))
     clip = store.get_clip(clip.id)
     return clip_out(settings, clip, store.get_job(clip.job_id), store)
+
+
+@router.post("/clips/{clip_id}/recut", dependencies=authed, status_code=202)
+async def recut_clip(clip_id: str, body: RecutIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    clip = _editable(request, clip_id)
+    job = store.get_job(clip.job_id)
+    if not job or not job.openshorts_job:
+        raise HTTPException(409, "This clip didn't come from an OpenShorts job.")
+    if body.framing not in (None, "auto", "full", "track"):
+        raise HTTPException(422, "framing must be auto, full or track.")
+    extend_start, extend_end = max(0.0, min(60.0, body.extend_start)), max(0.0, min(60.0, body.extend_end))
+    if not extend_start and not extend_end and body.framing is None:
+        raise HTTPException(422, "Nothing to change: extend the clip or pick a framing.")
+    store.update_clip(clip.id, render_state="rendering", render_error=None)
+    _background(request, request.app.state.pipeline.recut(clip.id, extend_start, extend_end, body.framing))
+    clip = store.get_clip(clip.id)
+    return clip_out(settings, clip, job, store)
+
+
+# ---- streamers (watched channels) -------------------------------------------------------
+class StreamerIn(BaseModel):
+    url: str
+    auto_scan: bool = True
+    auto_clip: int = 0
+    template: Optional[str] = None
+    backfill: int = 0             # also scan this many of the latest VODs now
+
+
+class StreamerEdit(BaseModel):
+    auto_scan: Optional[bool] = None
+    auto_clip: Optional[int] = None
+    template: Optional[str] = None    # "" = the default template
+
+
+class BackfillIn(BaseModel):
+    count: int = 3
+
+
+class VodScanIn(BaseModel):
+    vod_id: str
+
+
+def streamer_out(store: Store, watch: Watch) -> dict[str, Any]:
+    vods = []
+    for vod in store.vods_for_watch(watch.id):
+        scans = store.scans_for_url(vod.url)
+        scan = scans[0] if scans else None
+        vods.append({"vod_id": vod.vod_id, "url": vod.url, "title": vod.title, "duration": vod.duration,
+                     "published": vod.published, "seen": vod.seen, "live": bool(vod.live),
+                     "scan": {"id": scan.id, "status": scan.status, "moment_count": len(store.moments_for_scan(scan.id)),
+                              "error": scan.error} if scan else None})
+    template = store.get_template(watch.template) if watch.template else None
+    return {"id": watch.id, "platform": watch.platform, "channel": watch.channel,
+            "label": f"{watch.platform}/{watch.channel}", "url": channel_url(Channel(watch.platform, watch.channel)),
+            "auto_scan": bool(watch.auto_scan), "auto_clip": watch.auto_clip, "template": watch.template,
+            "template_name": (template or {}).get("name"), "checked": watch.checked,
+            "check_error": watch.check_error, "created": watch.created, "vods": vods}
+
+
+def _watch_or_404(store: Store, watch_id: str) -> Watch:
+    watch = store.get_watch(watch_id)
+    if not watch:
+        raise HTTPException(404, "No such streamer.")
+    return watch
+
+
+def _check_template(store: Store, template: Optional[str]) -> Optional[str]:
+    if template and store.get_template(template) is None:
+        raise HTTPException(422, "No such template.")
+    return template or None
+
+
+@router.get("/streamers", dependencies=authed)
+async def list_streamers(request: Request):
+    store = store_of(request)
+    return {"items": [streamer_out(store, w) for w in store.watches()],
+            "interval_minutes": settings_of(request).watch_interval_minutes}
+
+
+@router.post("/streamers", dependencies=authed, status_code=201)
+async def add_streamer(body: StreamerIn, request: Request):
+    settings, store = settings_of(request), store_of(request)
+    channel = detect_channel(body.url)
+    if not channel:
+        raise HTTPException(422, "Paste a channel link: twitch.tv/<name>, kick.com/<name> or youtube.com/@<handle>.")
+    template = _check_template(store, body.template)
+    scout = request.app.state.scout
+    try:
+        watch, _ = await scout.add_streamer(default_chat(settings), channel, body.auto_scan, body.auto_clip, template)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    except (media.MediaError, httpx.HTTPError) as e:
+        raise HTTPException(502, f"Couldn't read {channel.label}'s videos: {str(e)[:300]}")
+    if body.backfill > 0:
+        scout.backfill(watch, min(10, body.backfill))
+    return streamer_out(store, store.get_watch(watch.id))
+
+
+@router.patch("/streamers/{watch_id}", dependencies=authed)
+async def edit_streamer(watch_id: str, body: StreamerEdit, request: Request):
+    store = store_of(request)
+    _watch_or_404(store, watch_id)
+    fields: dict[str, Any] = {}
+    if body.auto_scan is not None:
+        fields["auto_scan"] = int(body.auto_scan)
+    if body.auto_clip is not None:
+        fields["auto_clip"] = max(0, min(10, body.auto_clip))
+    if body.template is not None:
+        fields["template"] = _check_template(store, body.template)
+    if fields:
+        store.update_watch(watch_id, **fields)
+    return streamer_out(store, store.get_watch(watch_id))
+
+
+@router.delete("/streamers/{watch_id}", dependencies=authed)
+async def remove_streamer(watch_id: str, request: Request):
+    store = store_of(request)
+    _watch_or_404(store, watch_id)
+    store.delete_watch(watch_id)
+    return {"ok": True}
+
+
+@router.post("/streamers/{watch_id}/refresh", dependencies=authed)
+async def refresh_streamer(watch_id: str, request: Request):
+    store = store_of(request)
+    watch = _watch_or_404(store, watch_id)
+    try:
+        await request.app.state.scout.refresh(watch)
+    except (media.MediaError, httpx.HTTPError, ValueError) as e:
+        raise HTTPException(502, f"Couldn't read the channel's videos: {str(e)[:300]}")
+    return streamer_out(store, store.get_watch(watch_id))
+
+
+@router.post("/streamers/{watch_id}/backfill", dependencies=authed)
+async def backfill_streamer(watch_id: str, body: BackfillIn, request: Request):
+    store = store_of(request)
+    watch = _watch_or_404(store, watch_id)
+    scans = request.app.state.scout.backfill(watch, max(1, min(10, body.count)))
+    return {"queued": [s.id for s in scans], "streamer": streamer_out(store, store.get_watch(watch_id))}
+
+
+@router.post("/streamers/{watch_id}/scan", dependencies=authed, status_code=201)
+async def scan_streamer_vod(watch_id: str, body: VodScanIn, request: Request):
+    store = store_of(request)
+    watch = _watch_or_404(store, watch_id)
+    vod = next((v for v in store.vods_for_watch(watch.id, limit=200) if v.vod_id == body.vod_id), None)
+    if not vod:
+        raise HTTPException(404, "That VOD isn't in this streamer's list. Refresh it first.")
+    if vod.live:
+        raise HTTPException(409, "That stream is still live. It gets scanned when it ends.")
+    scan = request.app.state.scout.queue_scan(watch.chat_id, vod.url, watch.id)
+    return scan_out(store, scan)
 
 
 # ---- scans ----------------------------------------------------------------------

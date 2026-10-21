@@ -12,7 +12,9 @@ import httpx
 
 
 class OpenShortsError(RuntimeError):
-    pass
+    def __init__(self, message: str, status: Optional[int] = None):
+        super().__init__(message)
+        self.status = status
 
 
 def _detail(resp: httpx.Response) -> str:
@@ -95,6 +97,27 @@ class OpenShorts:
         if resp.status_code >= 400:
             raise OpenShortsError(f"No transcript for clip {clip_index + 1} ({resp.status_code}): {_detail(resp)}")
         return (resp.json() or {}).get("captions") or []
+
+    async def edl(self, job_id: str, clip_index: int) -> dict[str, Any]:
+        """The clip's recipe: source segments, canonical range, framing, whether the source is kept."""
+        resp = await self._client.get(f"{self.base_url}/api/clip/{job_id}/{clip_index}/edl")
+        if resp.status_code >= 400:
+            raise OpenShortsError(f"OpenShorts can't edit this clip any more ({resp.status_code}): {_detail(resp)}",
+                                  resp.status_code)
+        return resp.json()
+
+    async def recut(self, job_id: str, clip_index: int, segments: list[dict[str, float]],
+                    framing: Optional[str] = None) -> dict[str, Any]:
+        """Re-render the clip from these source segments (and framing), without captions."""
+        body: dict[str, Any] = {"job_id": job_id, "clip_index": clip_index, "segments": segments,
+                                "reapply_captions": False}
+        if framing:
+            body["framing"] = framing
+        resp = await self._client.post(f"{self.base_url}/api/clip/rerender", json=body)
+        if resp.status_code >= 400:
+            raise OpenShortsError(f"OpenShorts couldn't re-cut the clip ({resp.status_code}): {_detail(resp)}",
+                                  resp.status_code)
+        return resp.json()
 
     async def download(self, video_url: str, dst: Path) -> None:
         url = video_url if video_url.startswith("http") else f"{self.base_url}{video_url}"

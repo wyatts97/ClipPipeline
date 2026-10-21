@@ -1,14 +1,18 @@
-"""Turning a clip without captions into the finished clip: captions, music and sound effects in
-one ffmpeg run. Without captions the video stream is copied, so audio-only templates take seconds."""
+"""Turning a clip without captions into the finished clip: cuts, zoom punch-ins, captions, music and
+sound effects in one ffmpeg run. Without cuts, zooms or captions the video stream is copied, so
+audio-only templates take seconds."""
 from __future__ import annotations
 
+import array
+import asyncio
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
-from .media import run
+from .media import MediaError, run
 
 VIDEO_ARGS = ["-c:v", "libx264", "-preset", "veryfast", "-crf", "20", "-pix_fmt", "yuv420p"]
+ZOOM_EASE = 0.12   # seconds to punch in
 
 
 @dataclass
@@ -22,23 +26,31 @@ class Music:
 @dataclass
 class Effect:
     path: Path
-    t: float                # clip seconds
+    t: float                # seconds on the finished clip
     volume: float = 1.0
 
 
 @dataclass
 class Plan:
-    duration: float
+    duration: float                                   # of the finished clip
     ass: Optional[Path] = None
     fonts_dir: Optional[Path] = None
     music: Optional[Music] = None
     effects: list[Effect] = field(default_factory=list)
     voice_volume: float = 1.0
     has_audio: bool = True
+    segments: Optional[list[list[float]]] = None      # kept stretches of the source (None = all of it)
+    zooms: list[tuple[float, float, float]] = field(default_factory=list)   # (start, end, scale), finished-clip time
+    size: Optional[tuple[int, int]] = None            # source width/height, needed for zooms
 
     @property
     def touches_audio(self) -> bool:
-        return bool(self.music or self.effects or abs(self.voice_volume - 1.0) > 1e-3 or not self.has_audio)
+        return bool(self.music or self.effects or abs(self.voice_volume - 1.0) > 1e-3 or not self.has_audio
+                    or self.segments)
+
+    @property
+    def touches_video(self) -> bool:
+        return bool(self.ass or self.segments or (self.zooms and self.size))
 
 
 def filter_path(path: Path) -> str:
@@ -46,26 +58,54 @@ def filter_path(path: Path) -> str:
     return str(path).replace("\\", "/").replace(":", "\\:").replace("'", "")
 
 
+def zoom_filter(zooms: list[tuple[float, float, float]], size: tuple[int, int]) -> str:
+    """Scale up during each zoom (quick ease in), cropped back to the frame from the centre."""
+    w, h = size
+    terms = "+".join(f"if(between(t,{s:.3f},{e:.3f}),{z - 1:.3f}*min(1,(t-{s:.3f})/{ZOOM_EASE}),0)"
+                     for s, e, z in zooms)
+    factor = f"(1+{terms})"
+    return (f"scale=w='2*trunc(iw*{factor}/2)':h='2*trunc(ih*{factor}/2)':eval=frame,"
+            f"crop={w}:{h},setsar=1")
+
+
 def command(src: Path, dst: Path, plan: Plan) -> Optional[list[str]]:
     """The ffmpeg command for this plan, or None when there is nothing to change."""
-    if not plan.ass and not plan.touches_audio:
+    if not plan.touches_video and not plan.touches_audio:
         return None
     inputs = ["-i", str(src)]
     graph: list[str] = []
-    vmap = "0:v"
+    vin, ain = "[0:v]", "[0:a]" if plan.has_audio else None
+    if plan.segments:
+        parts = []
+        for i, (s, e) in enumerate(plan.segments):
+            graph.append(f"[0:v]trim=start={s:.3f}:end={e:.3f},setpts=PTS-STARTPTS[v{i}]")
+            if plan.has_audio:
+                graph.append(f"[0:a]atrim=start={s:.3f}:end={e:.3f},asetpts=PTS-STARTPTS[a{i}]")
+                parts.append(f"[v{i}][a{i}]")
+            else:
+                parts.append(f"[v{i}]")
+        audio_out = "[acut]" if plan.has_audio else ""
+        graph.append(f"{''.join(parts)}concat=n={len(plan.segments)}:v=1:a={int(plan.has_audio)}[vcut]{audio_out}")
+        vin, ain = "[vcut]", ("[acut]" if plan.has_audio else None)
+
+    chain = []
+    if plan.zooms and plan.size:
+        chain.append(zoom_filter(plan.zooms, plan.size))
     if plan.ass:
         fonts = f":fontsdir='{filter_path(plan.fonts_dir)}'" if plan.fonts_dir else ""
-        graph.append(f"[0:v]ass=filename='{filter_path(plan.ass)}'{fonts}[v]")
+        chain.append(f"ass=filename='{filter_path(plan.ass)}'{fonts}")
+    if chain:
+        graph.append(f"{vin}{','.join(chain)}[v]")
         vmap = "[v]"
+    else:
+        vmap = vin if plan.segments else "0:v"
 
     amap = "0:a?"
     if plan.touches_audio:
         dur = f"{plan.duration:.3f}"
-        if plan.has_audio:
-            voice = f"[0:a]volume={plan.voice_volume:.3f}"
-        else:
-            voice = f"anullsrc=r=48000:cl=stereo,atrim=0:{dur}"
-        duck = bool(plan.music and plan.music.duck and plan.has_audio)
+        voice = (f"{ain}volume={plan.voice_volume:.3f}" if ain
+                 else f"anullsrc=r=48000:cl=stereo,atrim=0:{dur}")
+        duck = bool(plan.music and plan.music.duck and ain)
         graph.append(f"{voice},asplit=2[voice][side]" if duck else f"{voice}[voice]")
         mix = ["[voice]"]
         index = 1
@@ -97,7 +137,7 @@ def command(src: Path, dst: Path, plan: Plan) -> Optional[list[str]]:
     if graph:
         cmd += ["-filter_complex", ";".join(graph)]
     cmd += ["-map", vmap, "-map", amap]
-    cmd += VIDEO_ARGS if plan.ass else ["-c:v", "copy"]
+    cmd += VIDEO_ARGS if plan.touches_video else ["-c:v", "copy"]
     cmd += ["-c:a", "aac", "-b:a", "160k"] if plan.touches_audio else ["-c:a", "copy"]
     cmd += ["-t", f"{plan.duration:.3f}", "-movflags", "+faststart", str(dst)]
     return cmd
@@ -107,6 +147,42 @@ async def has_audio(path: Path) -> bool:
     out = await run(["ffprobe", "-v", "error", "-select_streams", "a", "-show_entries", "stream=index",
                      "-of", "csv=p=0", str(path)], timeout=60)
     return bool(out.strip())
+
+
+async def video_size(path: Path) -> Optional[tuple[int, int]]:
+    out = await run(["ffprobe", "-v", "error", "-select_streams", "v:0", "-show_entries", "stream=width,height",
+                     "-of", "csv=p=0:s=x", str(path)], timeout=60)
+    try:
+        w, h = out.strip().split("x")[:2]
+        return int(w), int(h)
+    except ValueError:
+        return None
+
+
+async def peaks(path: Path, per_second: int = 50) -> list[float]:
+    """Loudness peaks (0-1) for the editor's waveform, per_second values per second of audio."""
+    rate = per_second * 80
+    proc = await run_bytes(["ffmpeg", "-v", "error", "-i", str(path), "-ac", "1", "-ar", str(rate),
+                            "-f", "s16le", "-"], timeout=300)
+    samples = array.array("h")
+    samples.frombytes(proc[: len(proc) - len(proc) % 2])
+    step = 80
+    return [round(max((abs(x) for x in samples[i:i + step]), default=0) / 32768, 3)
+            for i in range(0, len(samples), step)]
+
+
+async def run_bytes(cmd: list[str], timeout: float) -> bytes:
+    proc = await asyncio.create_subprocess_exec(*cmd, stdout=asyncio.subprocess.PIPE,
+                                                stderr=asyncio.subprocess.PIPE)
+    try:
+        out, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        await proc.wait()
+        raise MediaError(f"{cmd[0]} timed out after {int(timeout)}s")
+    if proc.returncode != 0:
+        raise MediaError(f"{cmd[0]} failed: " + " | ".join(err.decode(errors="replace").strip().splitlines()[-4:]))
+    return out
 
 
 async def render(src: Path, dst: Path, plan: Plan, timeout: float = 1800) -> bool:

@@ -191,8 +191,10 @@ From now on the bot ignores every other chat.
 |---|---|
 | **Overview** | Clips waiting for you, what OpenShorts is rendering right now (with its latest log line), problems with a one-click fix (retry a job, scan again, resend a Telegram message), the last 7 days and recent activity. The strip at the top is always visible: OpenShorts, queue, Telegram delivery, free disk. |
 | **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**: the new version is sent to Telegram again with fresh ✅/❌ buttons. **Post it yourself** downloads the clip and copies its TikTok, Instagram and YouTube text (what publishing would post, credit line included). The **Approved** tab downloads all approved clips as one zip, with their `.json` files. |
+| **Editor** | Review → **Open the editor**: a timeline with the waveform, cuts, captions, sound effects and zooms over a live preview ([below](#clip-editor)). |
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
+| **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, template. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
 | **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
 | **Storage** | Free disk, what takes the space, and every job with files left: **Delete files** per job or **Clean up finished jobs**. |
@@ -268,10 +270,44 @@ OpenShorts job.
 **`/watch https://twitch.tv/<name>`** (or `kick.com/<name>`, `youtube.com/@handle`) checks the channel
 every `WATCH_INTERVAL_MINUTES`. When the newest VOD stops growing between two checks, the stream is
 over, and you get "📺 … finished a 4:12:00 stream. Scanning it…" followed by the moments. A stream
-that is live when you send `/watch` is scanned when it ends; older VODs are not (scan those by hand).
+that is live when you send `/watch` is scanned when it ends.
+
+The dashboard's **Streamers** page does the same with more control. Add a channel there (or with
+`/watch`), then per streamer:
+- **Scan right away / Scan the latest N:** scans older VODs from its list (finished ones that
+  weren't scanned yet).
+- **Auto-clip the top N moments:** when a scan of that streamer finishes, its best N moments become
+  jobs by themselves, in the template you pick. The clips arrive in Telegram and Review like any
+  other, so the whole stream → clips step needs no taps.
+- **Scan new streams:** switch it off to only list the VODs and scan by hand.
+
+The VOD list refreshes every check (or **Check now**); each VOD shows whether it's live, scanned
+(click through to its moments) or not.
 
 Limits: sub-only Twitch VODs have no public chat (the scan says "chat unavailable" and uses the rest).
 Kick's `?t=` links may open at the start of the VOD.
+
+## Clip editor
+
+Review → **Open the editor** (any clip still waiting for review). The preview plays the clip without
+captions and draws the template's captions, your cuts and zooms on top as you go, so changes show
+right away; **Render** makes the real file and sends it to Telegram again.
+
+| Track | You can |
+|---|---|
+| Clip | Split at the playhead (**S**), select a part and **Delete** it, drag a part's edges to trim it. The waveform shows where the talking is. |
+| Captions | The **Captions** tab lists every line: fix a misheard word or empty a line to drop it. Timing stays. **Reset** brings the transcript back. |
+| Effects | **Effect here** (**E**) or the **Effects** tab: sound, volume, preview; drag the diamonds to move them. They come on top of the template's own effects. |
+| Zooms | **Zoom here** (**Z**): a quick punch-in on the picture (captions stay put); drag to move or resize, set how far it zooms. |
+
+The **Length** tab has OpenShorts cut the clip again from the stream: start up to 15 s earlier, end
+later, or change the framing (follow the speaker, or the whole frame with blurred bars). Your cuts,
+zooms and effects move along with the new start. This needs OpenShorts' copy of the source, which it
+keeps for a day (`OPENSHORTS_RETENTION_SECONDS` in `.env` to keep it longer); after that a clip can
+still be cut shorter, just not longer.
+
+Space plays, ←/→ step a frame (Shift: a second), Ctrl+Z / Ctrl+Shift+Z undo and redo, **Timeline
+zoom** stretches the timeline for fine trims.
 
 ## Publishing: Postiz posts approved clips
 

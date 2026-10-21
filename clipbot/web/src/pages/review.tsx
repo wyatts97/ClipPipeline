@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { Copy, Download } from "lucide-react"
+import { Copy, Download, Scissors } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
@@ -276,6 +276,9 @@ function Look({ clip, video }: { clip: Clip; video: React.RefObject<HTMLVideoEle
         <h3 className="font-medium">Look</h3>
         <Link to="/templates" className="text-xs text-muted-foreground hover:text-foreground">Edit templates</Link>
       </div>
+      <Button asChild variant="secondary" className="w-full">
+        <Link to={`/review/${clip.id}/edit`}><Scissors /> Open the editor</Link>
+      </Button>
       <div className="space-y-1.5">
         <Label htmlFor="look-template" className="text-xs text-muted-foreground">Template</Label>
         <NativeSelect id="look-template" value={template} onChange={(e) => setTemplate(e.target.value)} disabled={rendering}>

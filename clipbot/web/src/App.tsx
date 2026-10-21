@@ -3,6 +3,7 @@ import { Navigate, Route, Routes } from "react-router"
 
 import { Shell } from "@/components/shell"
 import { api } from "@/lib/api"
+import { EditorPage } from "@/pages/editor"
 import { JobsPage } from "@/pages/jobs"
 import { LoginPage } from "@/pages/login"
 import { LogsPage } from "@/pages/logs"
@@ -11,6 +12,7 @@ import { PublishingPage } from "@/pages/publishing"
 import { ReviewPage } from "@/pages/review"
 import { ScansPage } from "@/pages/scans"
 import { StoragePage } from "@/pages/storage"
+import { StreamersPage } from "@/pages/streamers"
 import { TemplatesPage } from "@/pages/templates"
 
 export function App() {
@@ -33,12 +35,14 @@ export function App() {
       <Route element={<Shell />}>
         <Route index element={<OverviewPage />} />
         <Route path="review" element={<ReviewPage />} />
+        <Route path="review/:clipId/edit" element={<EditorPage />} />
         <Route path="publishing" element={<PublishingPage />} />
         <Route path="templates" element={<TemplatesPage />} />
         <Route path="jobs" element={<JobsPage />} />
         <Route path="jobs/:jobId" element={<JobsPage />} />
         <Route path="scans" element={<ScansPage />} />
         <Route path="scans/:scanId" element={<ScansPage />} />
+        <Route path="streamers" element={<StreamersPage />} />
         <Route path="storage" element={<StoragePage />} />
         <Route path="logs" element={<LogsPage />} />
         <Route path="*" element={<Navigate to="/" replace />} />

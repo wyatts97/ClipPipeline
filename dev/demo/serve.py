@@ -31,6 +31,7 @@ from app.clips_api import ClipMarker  # noqa: E402
 from app.config import Settings  # noqa: E402
 from app.main import create_app  # noqa: E402
 from app.openshorts import OpenShorts  # noqa: E402
+from app.platforms import LatestVod  # noqa: E402
 from app.postiz import Postiz  # noqa: E402
 from app.publisher import Publisher  # noqa: E402
 from app.scoring import StreamSignals, find_moments, score, timeline  # noqa: E402
@@ -207,6 +208,17 @@ async def seed(settings: Settings) -> None:
            ("INFO", "scout", f"scan {scan.id}: 5 moment(s) from chat 9,812 msgs, audio, 4 viewer clips", None, scan.id, None)]
     for i, (level, source, message, job_id, scan_id, detail) in enumerate(log):
         store.add_log(now - 3000 + i * 400, level, source, message, job_id, scan_id, detail)
+
+    # Streamers: one with auto-clip and a VOD list (one live, one scanned, one not), one failing.
+    lirik = store.add_watch(CHAT, "twitch", "lirik", None)
+    store.update_watch(lirik.id, auto_clip=2, template="meme", checked=now - 420)
+    store.save_vods(lirik.id, [
+        LatestVod("2905550001", "https://www.twitch.tv/videos/2905550001", None, True, "LIVE: late night chaos"),
+        LatestVod("2901337436", vod, 3 * 3600.0, False, "VALOR MORTIS! Enshrouded starts SOON", now - 86400),
+        LatestVod("2899000000", "https://www.twitch.tv/videos/2899000000", 14000.0, False, "Elden Ring blind run", now - 3 * 86400),
+        LatestVod("2897000000", "https://www.twitch.tv/videos/2897000000", 9800.0, False, "Viewer games", now - 5 * 86400)])
+    kick = store.add_watch(CHAT, "kick", "xqc", None)
+    store.update_watch(kick.id, checked=now - 900, check_error="HTTP Error 403: Forbidden")
 
     store.enqueue_event({"event": "message", "chat_id": CHAT, "text": f"✅ Job {done.id} finished: 5 clip(s)."})
     store.enqueue_event({"event": "clip_ready", "chat_id": CHAT, "caption": "🎬 Clip 2/5 · 0:06\nChat lost it after this play"})

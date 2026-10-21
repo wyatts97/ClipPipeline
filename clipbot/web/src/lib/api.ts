@@ -80,6 +80,51 @@ export interface Clip {
   word_count: number
   download_url: string
   post_text: { youtube_title: string; youtube: string; tiktok: string; instagram: string }
+  edited: boolean
+}
+
+export interface Word { w: string; s: number; e: number }
+export interface Zoom { s: number; e: number; scale: number }
+export interface ClipEdit { segments: [number, number][]; zooms: Zoom[] }
+
+export interface EditorData {
+  clip: Clip
+  source_url: string
+  peaks_url: string
+  source_duration: number
+  words: Word[]
+  words_original: Word[] | null
+  edit: ClipEdit
+  sfx: HandEffect[]
+  template: string | null
+  openshorts: { available: boolean; source_kept: boolean; framing: string | null; reason: string | null }
+}
+
+export interface StreamerVod {
+  vod_id: string
+  url: string
+  title: string | null
+  duration: number | null
+  published: number | null
+  seen: number
+  live: boolean
+  scan: { id: string; status: ScanStatus; moment_count: number; error: string | null } | null
+}
+
+export interface Streamer {
+  id: string
+  platform: "twitch" | "youtube" | "kick"
+  channel: string
+  label: string
+  url: string
+  auto_scan: boolean
+  auto_clip: number
+  template: string | null
+  template_name: string | null
+  checked: number | null
+  check_error: string | null
+  created: number
+  vods: StreamerVod[]
 }
 
 export interface HandEffect { sound: string; t: number; volume?: number }
@@ -405,6 +450,24 @@ export const api = {
   uploadFont: (file: File) => upload<FontItem>(`/api/fonts/${encodeURIComponent(file.name)}`, file),
   deleteFont: (file: string) => request<{ ok: boolean }>(`/api/fonts/${encodeURIComponent(file)}`, { method: "DELETE" }),
   renderClip: (id: string, body: { template?: string; sfx?: HandEffect[] }) => post<Clip>(`/api/clips/${id}/render`, body),
+
+  streamers: () => request<{ items: Streamer[]; interval_minutes: number }>("/api/streamers"),
+  addStreamer: (body: { url: string; auto_scan: boolean; auto_clip: number; template?: string | null; backfill: number }) =>
+    post<Streamer>("/api/streamers", body),
+  editStreamer: (id: string, body: { auto_scan?: boolean; auto_clip?: number; template?: string }) =>
+    request<Streamer>(`/api/streamers/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
+  removeStreamer: (id: string) => request<{ ok: boolean }>(`/api/streamers/${id}`, { method: "DELETE" }),
+  refreshStreamer: (id: string) => post<Streamer>(`/api/streamers/${id}/refresh`),
+  backfillStreamer: (id: string, count: number) =>
+    post<{ queued: string[]; streamer: Streamer }>(`/api/streamers/${id}/backfill`, { count }),
+  scanStreamerVod: (id: string, vodId: string) => post<Scan>(`/api/streamers/${id}/scan`, { vod_id: vodId }),
+
+  editor: (clipId: string) => request<EditorData>(`/api/clips/${clipId}/editor`),
+  peaks: (url: string) => request<{ per_second: number; peaks: number[] }>(url),
+  saveEdit: (clipId: string, body: { template?: string; sfx?: HandEffect[]; edit?: ClipEdit; words?: Word[] }) =>
+    post<Clip>(`/api/clips/${clipId}/edit`, body),
+  recut: (clipId: string, body: { extend_start: number; extend_end: number; framing?: string | null }) =>
+    post<Clip>(`/api/clips/${clipId}/recut`, body),
 
   publishing: () => request<Publishing>("/api/publishing"),
   publish: (clipId: string, body: { at?: number | null; now?: boolean }) =>

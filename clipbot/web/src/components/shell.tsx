@@ -1,6 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { Activity, AlertTriangle, CalendarClock, Clapperboard, Film, HardDrive, LogOut, Palette, ScanSearch } from "lucide-react"
+import { Activity, AlertTriangle, CalendarClock, Clapperboard, Film, HardDrive, LogOut, Palette, Radio, ScanSearch } from "lucide-react"
 import type { ReactNode } from "react"
 import { NavLink, Outlet } from "react-router"
 
@@ -20,6 +20,7 @@ const NAV = [
   { to: "/templates", label: "Templates", icon: Palette },
   { to: "/jobs", label: "Jobs", icon: Clapperboard },
   { to: "/scans", label: "Scans", icon: ScanSearch },
+  { to: "/streamers", label: "Streamers", icon: Radio },
   { to: "/storage", label: "Storage", icon: HardDrive },
   { to: "/logs", label: "Logs & errors", icon: AlertTriangle, count: "errors" as const },
 ]

@@ -198,10 +198,10 @@ def test_new_vod_waits_until_it_stops_growing(env):
 def test_add_watch_replies(env, monkeypatch):
     scout, store, _ = env
 
-    async def latest(channel, client=None):
-        return LatestVod("100", "https://www.twitch.tv/videos/100", 3600, False)
+    async def vods(channel, client=None, limit=8):
+        return [LatestVod("100", "https://www.twitch.tv/videos/100", 3600, False, "Big stream")]
 
-    monkeypatch.setattr(scout_mod, "latest_vod", latest)
+    monkeypatch.setattr(scout_mod, "list_vods", vods)
     reply = asyncio.run(scout.add_watch(111, "https://twitch.tv/lirik"))
     assert reply.startswith("👀 Watching twitch/lirik") and "videos/100" in reply
     assert asyncio.run(scout.add_watch(111, "twitch.tv/lirik")) == "Already watching twitch/lirik."

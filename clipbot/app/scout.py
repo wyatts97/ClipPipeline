@@ -13,6 +13,7 @@ import asyncio
 import json
 import logging
 import shutil
+import time
 from typing import Optional
 
 import httpx
@@ -21,7 +22,8 @@ from . import chat, clips_api, signals
 from .config import Settings
 from .media import MediaError
 from .parsing import format_timestamp as ts
-from .platforms import Channel, LatestVod, Vod, detect_channel, detect_vod, latest_vod, timestamp_link
+from .platforms import (Channel, LatestVod, Vod, detect_channel, detect_vod, list_vods,
+                        timestamp_link)
 from .scoring import Moment, StreamSignals, find_moments, score, timeline
 from .store import Scan, Store, Watch
 
@@ -94,8 +96,8 @@ class Scout:
         self.store.enqueue_event({"event": "message", "chat_id": chat_id, "text": text})
 
     # ---- scanning ------------------------------------------------------------
-    def queue_scan(self, chat_id: int, url: str) -> Scan:
-        scan = self.store.create_scan(chat_id, url)
+    def queue_scan(self, chat_id: int, url: str, watch_id: Optional[str] = None) -> Scan:
+        scan = self.store.create_scan(chat_id, url, watch_id)
         self.wake()
         return scan
 
@@ -149,10 +151,12 @@ class Scout:
             return
         self._event(scan.chat_id, head + f"\nTop {len(moments)} moment(s) below. 🎬 clips one; "
                                          "▶️ opens the VOD there so you can check first.")
+        rows = []
         for rank, m in enumerate(moments, 1):
             row = self.store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info={
                 "chat_ratio": m.chat_ratio, "loud": m.loud, "clips": m.clips,
                 "clip_views": m.clip_views, "replayed": m.replayed, "top_tokens": m.top_tokens})
+            rows.append(row)
             self.store.enqueue_event({
                 "event": "choice", "chat_id": scan.chat_id, "text": moment_text(rank, vod, m),
                 "buttons": [{"text": "🎬 Clip it", "data": f"sc:{row.id}:1"},
@@ -160,6 +164,26 @@ class Scout:
             })
         log.info("scan %s: %d moment(s) from %s", scan.id, len(moments), ", ".join(notes),
                  extra={"scan_id": scan.id})
+        self.auto_clip(scan, rows)
+
+    def auto_clip(self, scan: Scan, rows: list) -> list:
+        """A streamer set to auto-clip gets jobs for its scan's top moments right away."""
+        watch = self.store.get_watch(scan.watch_id)
+        if not watch or watch.auto_clip <= 0 or not rows:
+            return []
+        jobs = []
+        for row in rows[:watch.auto_clip]:
+            job = self.store.create_job(scan.chat_id, scan.source_url, row.start, row.end,
+                                        self.settings.scan_clips_per_moment, template=watch.template)
+            self.store.claim_moment(row.id, job.id)
+            jobs.append((row.rank, job))
+        self.pipeline.wake()
+        self._event(scan.chat_id, f"🤖 Auto-clipping the top {len(jobs)} moment(s) for "
+                                  f"{watch.platform}/{watch.channel}: "
+                                  + ", ".join(f"#{rank} → job {job.id}" for rank, job in jobs)
+                                  + ". The clips arrive here when they're done.")
+        log.info("scan %s: auto-clipping %d moment(s)", scan.id, len(jobs), extra={"scan_id": scan.id})
+        return [job for _, job in jobs]
 
     async def gather(self, vod: Vod, info: dict, duration: float, work,
                      scan_id: Optional[str] = None) -> tuple[StreamSignals, list[str]]:
@@ -239,28 +263,64 @@ class Scout:
                           f"({ts(end - start)}) of moment #{moment.rank}.")
 
     # ---- watching -------------------------------------------------------------
+    async def add_streamer(self, chat_id: int, channel: Channel, auto_scan: bool = True, auto_clip: int = 0,
+                           template: Optional[str] = None) -> tuple[Watch, Optional[LatestVod]]:
+        """Watch a channel. Raises ValueError when it's watched already, and the listing errors."""
+        vods = await list_vods(channel, self.http)
+        latest = vods[0] if vods else None
+        # A stream that's live right now counts as new: it gets scanned once it ends.
+        seen = latest.vod_id if latest and not latest.live else None
+        watch = self.store.add_watch(chat_id, channel.platform, channel.name, seen)
+        if not watch:
+            raise ValueError(f"Already watching {channel.label}.")
+        self.store.update_watch(watch.id, auto_scan=int(auto_scan), auto_clip=max(0, min(10, auto_clip)),
+                                template=template, checked=time.time(), check_error=None)
+        self.store.save_vods(watch.id, vods)
+        if latest:
+            # Remember its length: if it grows by the next check, it was live and gets scanned too.
+            self.store.update_watch(watch.id, pending_vod_id=latest.vod_id, pending_duration=latest.duration)
+        return self.store.get_watch(watch.id), latest
+
+    async def refresh(self, watch: Watch) -> list[LatestVod]:
+        """Read the channel's VOD list now. Raises on a listing error (also kept on the watch)."""
+        try:
+            vods = await list_vods(Channel(watch.platform, watch.channel), self.http)
+        except (MediaError, httpx.HTTPError, ValueError) as e:
+            self.store.update_watch(watch.id, checked=time.time(), check_error=str(e)[:500])
+            raise
+        self.store.save_vods(watch.id, vods)
+        self.store.update_watch(watch.id, checked=time.time(), check_error=None)
+        return vods
+
+    def backfill(self, watch: Watch, count: int) -> list[Scan]:
+        """Scan the newest `count` finished VODs that haven't been scanned yet."""
+        scans = []
+        for vod in self.store.vods_for_watch(watch.id):
+            if len(scans) >= count:
+                break
+            if vod.live or any(s.status != "failed" for s in self.store.scans_for_url(vod.url)):
+                continue
+            scans.append(self.queue_scan(watch.chat_id, vod.url, watch.id))
+        return scans
+
     async def add_watch(self, chat_id: int, text: str) -> str:
         channel = detect_channel(text)
         if not channel:
             return ("⚠️ I need a channel link: https://twitch.tv/<name>, https://kick.com/<name> "
                     "or https://youtube.com/@<handle>")
         try:
-            latest = await latest_vod(channel, self.http)
-        except (MediaError, httpx.HTTPError, ValueError) as e:
+            watch, latest = await self.add_streamer(chat_id, channel)
+        except ValueError as e:
+            return str(e)
+        except (MediaError, httpx.HTTPError) as e:
             return f"⚠️ Couldn't read {channel.label}'s videos: {str(e)[:300]}"
-        watch = self.store.add_watch(chat_id, channel.platform, channel.name,
-                                     latest.vod_id if latest else None)
-        if not watch:
-            return f"Already watching {channel.label}."
-        if latest:
-            # Remember its length: if it grows by the next check, it was live and gets scanned too.
-            self.store.update_watch(watch.id, pending_vod_id=latest.vod_id, pending_duration=latest.duration)
         msg = (f"👀 Watching {channel.label}. When a stream ends I'll scan the VOD and send you its top "
                f"moments (checked every {self.settings.watch_interval_minutes} min).")
         if latest and latest.live:
             msg += "\nIt's live right now; that stream gets scanned when it ends."
         elif latest:
             msg += f"\nLatest VOD: {latest.url}\nSend /scan with it to scan that one now."
+        msg += "\nThe dashboard's Streamers page can scan older VODs and clip top moments by itself."
         return msg
 
     def remove_watch(self, chat_id: int, text: str) -> str:
@@ -281,11 +341,11 @@ class Scout:
         for watch in self.store.watches():
             channel = Channel(watch.platform, watch.channel)
             try:
-                latest = await latest_vod(channel, self.http)
+                vods = await self.refresh(watch)
             except (MediaError, httpx.HTTPError, ValueError) as e:
                 log.warning("watch %s: listing failed: %s", channel.label, e)
                 continue
-            self.step_watch(watch, channel, latest)
+            self.step_watch(self.store.get_watch(watch.id), channel, vods[0] if vods else None)
         await asyncio.sleep(self.settings.watch_interval_minutes * 60)
 
     def step_watch(self, w: Watch, channel: Channel, latest: Optional[LatestVod]) -> Optional[Scan]:
@@ -307,7 +367,10 @@ class Scout:
             return None
         # Same VOD, same length as last check: the stream is over.
         self.store.update_watch(w.id, last_vod_id=latest.vod_id, pending_vod_id=None, pending_duration=None)
-        scan = self.queue_scan(w.chat_id, latest.url)
+        if not w.auto_scan:
+            log.info("watch %s: new VOD %s (auto-scan is off)", channel.label, latest.url)
+            return None
+        scan = self.queue_scan(w.chat_id, latest.url, w.id)
         self._event(w.chat_id, f"📺 {channel.label} finished a {ts(latest.duration or 0)} stream. "
                                f"Scanning it (scan {scan.id})…\n{latest.url}")
         return scan

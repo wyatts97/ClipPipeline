@@ -101,7 +101,9 @@ services:
       QUALITY_GATE_MIN_HEIGHT: "0"
       RATE_LIMIT_ENABLED: "0"
       YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}
-      JOB_RETENTION_SECONDS: "86400"
+      # How long OpenShorts keeps a job's source and work files. The clip editor can extend or
+      # reframe a clip only while they're kept.
+      JOB_RETENTION_SECONDS: ${OPENSHORTS_RETENTION_SECONDS:-86400}
     volumes:
       - openshorts_output:/app/output
       - openshorts_uploads:/app/uploads

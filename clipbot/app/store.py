@@ -132,6 +132,17 @@ CREATE TABLE IF NOT EXISTS templates (
     created REAL NOT NULL,
     updated REAL NOT NULL
 );
+CREATE TABLE IF NOT EXISTS vods (
+    watch_id TEXT NOT NULL,
+    vod_id TEXT NOT NULL,
+    url TEXT NOT NULL,
+    title TEXT,
+    duration REAL,
+    published REAL,
+    live INTEGER NOT NULL DEFAULT 0,
+    seen REAL NOT NULL,
+    PRIMARY KEY (watch_id, vod_id)
+);
 CREATE TABLE IF NOT EXISTS app_settings (
     key TEXT PRIMARY KEY,
     value TEXT
@@ -141,7 +152,11 @@ CREATE TABLE IF NOT EXISTS app_settings (
 # Columns added after the first release; created on older databases at startup.
 MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"), ("jobs", "template", "TEXT"),
               ("clips", "template", "TEXT"), ("clips", "sfx", "TEXT"), ("clips", "words", "TEXT"),
-              ("clips", "splits", "TEXT"), ("clips", "render_state", "TEXT"), ("clips", "render_error", "TEXT"))
+              ("clips", "splits", "TEXT"), ("clips", "render_state", "TEXT"), ("clips", "render_error", "TEXT"),
+              ("clips", "edit", "TEXT"), ("scans", "watch_id", "TEXT"),
+              ("watches", "auto_scan", "INTEGER NOT NULL DEFAULT 1"),
+              ("watches", "auto_clip", "INTEGER NOT NULL DEFAULT 0"),
+              ("watches", "template", "TEXT"), ("watches", "checked", "REAL"), ("watches", "check_error", "TEXT"))
 LOG_KEEP_DAYS = 14
 LOG_KEEP_ROWS = 20000
 
@@ -185,6 +200,7 @@ class Clip:
     splits: Optional[str] = None         # JSON [[start, end]]: two-speaker stretches (captions on the seam)
     render_state: Optional[str] = None   # rendering | failed | None
     render_error: Optional[str] = None
+    edit: Optional[str] = None           # JSON: the editor's cuts and zooms (see editing.py)
 
     def manual_sfx(self) -> list[dict[str, Any]]:
         return json.loads(self.sfx) if self.sfx else []
@@ -208,6 +224,7 @@ class Scan:
     error: Optional[str]
     created: float
     updated: float
+    watch_id: Optional[str] = None   # the streamer whose VOD this is (auto-clip settings)
 
 
 @dataclass
@@ -267,6 +284,23 @@ class Watch:
     pending_vod_id: Optional[str]
     pending_duration: Optional[float]
     created: float
+    auto_scan: int = 1                 # scan each new VOD when the stream ends
+    auto_clip: int = 0                 # then clip the top N moments by itself (0 = just send them)
+    template: Optional[str] = None     # template for those clips (None = the default)
+    checked: Optional[float] = None    # last time its VOD list was read
+    check_error: Optional[str] = None
+
+
+@dataclass
+class VodRow:
+    watch_id: str
+    vod_id: str
+    url: str
+    title: Optional[str]
+    duration: Optional[float]
+    published: Optional[float]
+    live: int
+    seen: float
 
 
 def new_id() -> str:
@@ -420,13 +454,22 @@ class Store:
                 (status, path, time.time(), clip_id))
 
     # ---- scans and their moments ----------------------------------------
-    def create_scan(self, chat_id: int, source_url: str) -> Scan:
+    def create_scan(self, chat_id: int, source_url: str, watch_id: Optional[str] = None) -> Scan:
         now = time.time()
-        scan = Scan(new_id(), chat_id, source_url, "queued", None, None, None, None, now, now)
+        scan = Scan(new_id(), chat_id, source_url, "queued", None, None, None, None, now, now, watch_id)
         with self._lock:
-            self._db.execute("INSERT INTO scans VALUES (?,?,?,?,?,?,?,?,?,?)",
-                             (scan.id, chat_id, source_url, "queued", None, None, None, None, now, now))
+            self._db.execute(
+                "INSERT INTO scans (id, chat_id, source_url, status, title, duration, signals, error, created, "
+                "updated, watch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (scan.id, chat_id, source_url, "queued", None, None, None, None, now, now, watch_id))
         return scan
+
+    def scans_for_url(self, source_url: str) -> list[Scan]:
+        """Scans of this VOD, newest first."""
+        with self._lock:
+            rows = self._db.execute("SELECT * FROM scans WHERE source_url=? ORDER BY created DESC",
+                                    (source_url,)).fetchall()
+        return [Scan(**dict(r)) for r in rows]
 
     def get_scan(self, scan_id: str) -> Optional[Scan]:
         with self._lock:
@@ -509,12 +552,45 @@ class Store:
         watch = Watch(new_id(), chat_id, platform, channel, last_vod_id, None, None, time.time())
         with self._lock:
             try:
-                self._db.execute("INSERT INTO watches VALUES (?,?,?,?,?,?,?,?)",
-                                 (watch.id, chat_id, platform, channel, last_vod_id, None, None,
-                                  watch.created))
+                self._db.execute(
+                    "INSERT INTO watches (id, chat_id, platform, channel, last_vod_id, pending_vod_id, "
+                    "pending_duration, created) VALUES (?,?,?,?,?,?,?,?)",
+                    (watch.id, chat_id, platform, channel, last_vod_id, None, None, watch.created))
             except sqlite3.IntegrityError:
                 return None
         return watch
+
+    def get_watch(self, watch_id: Optional[str]) -> Optional[Watch]:
+        if not watch_id:
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM watches WHERE id=?", (watch_id,)).fetchone()
+        return Watch(**dict(row)) if row else None
+
+    def delete_watch(self, watch_id: str) -> bool:
+        with self._lock:
+            cur = self._db.execute("DELETE FROM watches WHERE id=?", (watch_id,))
+            self._db.execute("DELETE FROM vods WHERE watch_id=?", (watch_id,))
+        return cur.rowcount > 0
+
+    def save_vods(self, watch_id: str, vods: list[Any]) -> None:
+        """Remember a channel's VOD list (LatestVod items); keeps when each was first seen."""
+        now = time.time()
+        with self._lock:
+            for i, v in enumerate(vods):   # newest first: keep that order among same-batch rows
+                self._db.execute(
+                    "INSERT INTO vods (watch_id, vod_id, url, title, duration, published, live, seen) "
+                    "VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(watch_id, vod_id) DO UPDATE SET url=excluded.url, "
+                    "title=COALESCE(excluded.title, title), duration=excluded.duration, "
+                    "published=COALESCE(excluded.published, published), live=excluded.live",
+                    (watch_id, v.vod_id, v.url, v.title, v.duration, v.published, int(v.live), now - i * 0.001))
+
+    def vods_for_watch(self, watch_id: str, limit: int = 20) -> list[VodRow]:
+        with self._lock:
+            rows = self._db.execute(
+                "SELECT * FROM vods WHERE watch_id=? ORDER BY COALESCE(published, seen) DESC, seen DESC LIMIT ?",
+                (watch_id, limit)).fetchall()
+        return [VodRow(**dict(r)) for r in rows]
 
     def remove_watch(self, chat_id: int, platform: str, channel: str) -> bool:
         with self._lock:

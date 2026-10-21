@@ -19,7 +19,7 @@ from typing import Any, Optional
 
 import httpx
 
-from . import captions, fonts, media, render, storage, templates
+from . import captions, editing, fonts, media, render, storage, templates
 from .config import Settings
 from .diagnose import failure_hint, failure_reason, retry_delay
 from .openshorts import OpenShorts, OpenShortsError
@@ -57,6 +57,7 @@ class Rendered:
     moments: Optional[list[dict[str, Any]]] = None   # Gemini's moments, cached on the clip
     notes: list[str] = field(default_factory=list)   # e.g. a sound that isn't in data/sounds
     error: Optional[str] = None                      # the render failed; the clip has no template
+    duration: Optional[float] = None                 # of the finished clip (after the editor's cuts)
 
 
 class Pipeline:
@@ -311,20 +312,32 @@ class Pipeline:
     async def render_clip_files(self, job: Job, source: Path, dst: Path, words: list[dict[str, Any]],
                                 splits: list[tuple[float, float]], template_id: Optional[str],
                                 manual_sfx: list[dict[str, Any]], meta: dict[str, Any],
-                                duration: float, seed: str = "") -> Rendered:
-        """Render source (no captions) into dst with a template. A failed render copies the source,
-        so the clip still exists; the error says why."""
+                                duration: float, seed: str = "",
+                                edit: Optional[dict[str, Any]] = None) -> Rendered:
+        """Render source (no captions) into dst with a template and the editor's edit. A failed
+        render copies the source, so the clip still exists; the error says why. Words, effects and
+        zooms come in on the source's timeline and are moved onto the edited one here."""
         s = self.settings
         tid, template = self.resolve_template(template_id)
         done = Rendered(tid, template, moments=templates.cached_moments(meta))
         work = s.folder("tmp") / f"render-{dst.stem}"
         work.mkdir(parents=True, exist_ok=True)
-        plan = render.Plan(duration=duration, voice_volume=template["voice_volume"])
+        edit = editing.normalize(edit, duration)
+        segments = edit["segments"]
+        cut = editing.is_cut(edit, duration)
+        out_duration = editing.output_duration(edit) if cut else duration
+        done.duration = out_duration
+        plan = render.Plan(duration=out_duration, voice_volume=template["voice_volume"],
+                           segments=segments if cut else None, zooms=editing.zoom_ranges(edit))
         try:
+            if plan.zooms:
+                plan.size = await render.video_size(source)
+            shown = editing.map_words(words, segments) if cut else words
+            shown_splits = [r for a, b in splits for r in editing.map_range(a, b, segments)] if cut else splits
             style = template["captions"]
-            if s.captions and style["enabled"] and words:
+            if s.captions and style["enabled"] and shown:
                 ass = work / "captions.ass"
-                if captions.write_ass(ass, words, style, splits):
+                if captions.write_ass(ass, shown, style, shown_splits):
                     plan.ass, plan.fonts_dir = ass, fonts.render_fonts_dir(s)
             music = template["music"]
             if music["sound"]:
@@ -343,8 +356,13 @@ class Pipeline:
             peak = templates.peak_in_clip(moment.peak if moment else None,
                                           (job.range_start or 0.0) + float(meta.get("start") or 0.0)
                                           if moment else None)
+            moments, manual = done.moments, manual_sfx
+            if cut:
+                peak = editing.map_time(peak, segments) if peak is not None else None
+                moments = editing.map_points(moments or [], segments) if moments is not None else None
+                manual = editing.map_points(manual_sfx, segments)
             missing = set()
-            for event in templates.place_effects(template, words, duration, peak, done.moments, manual_sfx, seed):
+            for event in templates.place_effects(template, shown, out_duration, peak, moments, manual, seed):
                 path = templates.find_sound(s, event["sound"])
                 if path:
                     plan.effects.append(render.Effect(path, event["t"], event["volume"]))
@@ -373,8 +391,10 @@ class Pipeline:
         return self.settings.data_dir / "clean" / f"{clip.job_id}_{clip.idx}.mp4"
 
     async def rerender(self, clip_id: str, template_id: Optional[str] = None,
-                       sfx: Optional[list[dict[str, Any]]] = None) -> None:
-        """Render a pending clip again, in another template and/or with effects placed by hand."""
+                       sfx: Optional[list[dict[str, Any]]] = None, edit: Optional[dict[str, Any]] = None,
+                       words: Optional[list[dict[str, Any]]] = None) -> None:
+        """Render a pending clip again: another template, effects placed by hand, and/or the editor's
+        cuts, zooms and caption text. Whatever isn't given stays as it was."""
         clip = self.store.get_clip(clip_id)
         job = self.store.get_job(clip.job_id) if clip else None
         if not clip or not job:
@@ -382,11 +402,20 @@ class Pipeline:
         source = self.clean_source(clip)
         manual = clip.manual_sfx() if sfx is None else sfx
         template_id = template_id or clip.template
+        meta = dict(clip.meta)
+        if words is not None:
+            meta.setdefault("words_original", clip.word_list())      # for "reset captions"
+            self.store.update_clip(clip.id, words=json.dumps(words), meta=meta)
         tmp = Path(clip.path).with_name(f"{clip.job_id}_{clip.idx}.rendering.mp4")
         try:
+            source_duration = await media.probe_duration(source)
+            edit = editing.normalize(edit if edit is not None else (json.loads(clip.edit) if clip.edit else None),
+                                     source_duration)
+            self.store.update_clip(clip.id, edit=json.dumps(edit))
+            clip = self.store.get_clip(clip.id)
             done = await self.render_clip_files(job, source, tmp, clip.word_list(), clip.split_list(), template_id,
-                                                manual, dict(clip.meta), clip.duration or await media.probe_duration(source),
-                                                seed=f"{clip.job_id}_{clip.idx}")
+                                                manual, dict(clip.meta), source_duration,
+                                                seed=f"{clip.job_id}_{clip.idx}", edit=edit)
             tmp.replace(clip.path)
             preview = Path(clip.preview_path or self.settings.folder("previews") / f"{clip.job_id}_{clip.idx}.mp4")
             await media.make_preview(Path(clip.path), preview, self.settings.preview_max_mb,
@@ -409,9 +438,60 @@ class Pipeline:
         error = done.error or ("; ".join(done.notes) if done.notes else None)
         self.store.update_clip(clip.id, template=done.template_id, sfx=json.dumps(manual) if manual else None,
                                meta=meta, render_state="failed" if done.error else None,
-                               render_error=error[:1000] if error else None)
+                               render_error=error[:1000] if error else None, duration=done.duration)
         log.info("clip %s: rendered with the %s template", clip.id, done.template["name"], extra={"job_id": job.id})
         self.resend_clip(job, self.store.get_clip(clip.id), done)
+
+    async def recut(self, clip_id: str, extend_start: float = 0.0, extend_end: float = 0.0,
+                    framing: Optional[str] = None) -> None:
+        """Have OpenShorts cut the clip again from its source: longer at either end, and/or framed
+        differently. Then the caption-free copy, words and layout are replaced, the editor's edit and
+        hand-placed effects move along with the new start, and the clip renders again."""
+        clip = self.store.get_clip(clip_id)
+        job = self.store.get_job(clip.job_id) if clip else None
+        if not clip or not job or not job.openshorts_job:
+            return
+        source = self.clean_source(clip)
+        try:
+            edl = await self.openshorts.edl(job.openshorts_job, clip.idx)
+            segments = [{"start": float(x["start"]), "end": float(x["end"])} for x in edl.get("segments") or []]
+            if not segments:
+                raise OpenShortsError("OpenShorts has no recipe for this clip.")
+            limit = (edl.get("source") or {}).get("duration") or float("inf")
+            new_start = max(0.0, segments[0]["start"] - max(0.0, extend_start))
+            moved_by = segments[0]["start"] - new_start
+            segments[0]["start"] = round(new_start, 3)
+            segments[-1]["end"] = round(min(limit, segments[-1]["end"] + max(0.0, extend_end)), 3)
+            result = await self.openshorts.recut(job.openshorts_job, clip.idx, segments,
+                                                 framing if framing in ("auto", "full", "track") else None)
+            old_duration = await media.probe_duration(source)
+            fresh = source.with_name(source.stem + ".recut.mp4")
+            await self.openshorts.download(result["new_video_url"], fresh)
+            new_duration = await media.probe_duration(fresh)
+            fresh.replace(source)
+            words = captions.words_from_openshorts(await self.openshorts.transcript(job.openshorts_job, clip.idx))
+            splits: list[tuple[float, float]] = []
+            doc = await self.openshorts.status(job.openshorts_job)
+            clips = ((doc or {}).get("result") or {}).get("clips") or []
+            if clip.idx < len(clips):
+                splits = captions.split_ranges_from_layout({"ranges": clips[clip.idx].get("layout_ranges") or []})
+        except (OpenShortsError, httpx.HTTPError, media.MediaError, OSError, KeyError, ValueError) as e:
+            message = str(e) or type(e).__name__
+            if isinstance(e, OpenShortsError) and e.status == 404:
+                message = "OpenShorts no longer has this clip's files (it keeps them about a day)."
+            self.store.update_clip(clip.id, render_state="failed", render_error=message[:1000])
+            log.warning("clip %s: re-cut failed: %s", clip.id, message, extra={"job_id": job.id})
+            return
+        edit, sfx = editing.shift(json.loads(clip.edit) if clip.edit else None, clip.manual_sfx(), moved_by,
+                                  old_duration, new_duration)
+        meta = {k: v for k, v in clip.meta.items() if k not in ("moments", "punchlines", "words_original")}
+        meta.update(start=result.get("start", meta.get("start")), end=result.get("end", meta.get("end")))
+        self.store.update_clip(clip.id, words=json.dumps(words) if words else None,
+                               splits=json.dumps(splits) if splits else None, meta=meta,
+                               edit=json.dumps(edit), sfx=json.dumps(sfx) if sfx else None)
+        log.info("clip %s: re-cut by OpenShorts (%s path), %.1f s longer at the start", clip.id,
+                 result.get("render_path"), moved_by, extra={"job_id": job.id})
+        await self.rerender(clip.id)
 
     def resend_clip(self, job: Job, clip: Clip, done: Rendered) -> None:
         """Send a re-rendered clip to Telegram again, with fresh ✅/❌ buttons. The earlier message's
