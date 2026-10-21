@@ -8,6 +8,7 @@ word timings, so a template can restyle it any time.
 """
 from __future__ import annotations
 
+import math
 import re
 from pathlib import Path
 from typing import Any, Optional
@@ -48,8 +49,12 @@ DEFAULT_HOOK: dict[str, Any] = {
     "enabled": True, "style": "box", "font_name": "Montserrat ExtraBold", "font_size": 30,
     "text_color": "#000000", "box_color": "#FFFFFF", "outline_color": "#000000", "position": "top",
     "duration": 5.0, "uppercase": False,
+    "box_radius": 0,      # rounded box corners: 0 (square) to 100 (round ends, like a pill)
 }
 HOOK_MARGIN = {"top": 38, "middle": 0, "bottom": 88}     # bottom sits above the captions
+PLAY_RES_Y = 288
+PLAY_RES_X = 384          # what libass assumes without a PlayResX: PlayResY * 4/3
+_CURVE = 0.5523           # Bezier control distance for a quarter circle
 # Emoji: the burned line has no emoji font, so they're left out of it (the saved text keeps them).
 _EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE00-\uFE0F\u200D\u20E3]")
 
@@ -109,6 +114,7 @@ def normalize_hook(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
         "position": raw.get("position") if raw.get("position") in POSITIONS else d["position"],
         "duration": round(_clamp(raw.get("duration"), 0, 60, d["duration"]), 2),   # 0 = the whole clip
         "uppercase": bool(raw.get("uppercase", d["uppercase"])),
+        "box_radius": int(_clamp(raw.get("box_radius"), 0, 100, d["box_radius"])),
     }
 
 
@@ -116,14 +122,31 @@ def strip_emoji(text: str) -> str:
     return re.sub(r"[ \t]{2,}", " ", _EMOJI.sub("", text or "")).strip()
 
 
-def _hook_style_line(h: dict[str, Any], position: str) -> str:
+def _hook_size(h: dict[str, Any]) -> tuple[int, int]:
+    """The hook's ASS font size and its box's padding."""
     size = max(10, int(h["font_size"] * 0.85))
+    return size, max(3, round(size * 0.28))
+
+
+def hook_radius(h: dict[str, Any], frame_height: int) -> float:
+    """The box's corner radius in pixels: box_radius percent of half a line's box."""
+    size, pad = _hook_size(h)
+    return h["box_radius"] / 100 * (size + 2 * pad) / 2 * frame_height / PLAY_RES_Y
+
+
+def _hook_style_line(h: dict[str, Any], position: str, mode: str = "") -> str:
+    """mode "text": a box hook's text alone (a rounded box is drawn under it); "mask": its box alone,
+    white, to see where libass puts it."""
+    size, pad = _hook_size(h)
     align = {"top": 8, "middle": 5, "bottom": 2}[position]
     margin = HOOK_MARGIN[position]
     text = _ass_color(h["text_color"])
+    if h["style"] == "box" and mode == "text":
+        return (f"Style: Hook,{h['font_name']},{size},{text},{text},&H00000000,&H00000000,1,0,0,0,100,100,0,0,1,0,0,"
+                f"{align},28,28,{margin},1\n")
     if h["style"] == "box":
-        box = _ass_color(h["box_color"])
-        pad = max(3, round(size * 0.28))
+        box = "&H00FFFFFF" if mode == "mask" else _ass_color(h["box_color"])
+        text = "&HFF000000" if mode == "mask" else text
         return (f"Style: Hook,{h['font_name']},{size},{text},{text},{box},{box},1,0,0,0,100,100,0,0,3,{pad},0,"
                 f"{align},28,28,{margin},1\n")
     if h["style"] == "outline":
@@ -263,10 +286,16 @@ def build_ass(words: list[dict[str, Any]], style: dict[str, Any],
     if hook_text and hook["end"] > hook["start"]:
         h = normalize_hook(hook.get("style"))
         position = hook.get("position") if hook.get("position") in POSITIONS else h["position"]
-        styles += _hook_style_line(h, position)
+        mask = bool(hook.get("mask"))
+        shape = hook.get("shape") if h["style"] == "box" and not mask else None
+        styles += _hook_style_line(h, position, "mask" if mask else "text" if shape else "")
         text = _escape(hook_text.upper() if h["uppercase"] else hook_text).replace("\n", "\\N")
-        events.append(f"Dialogue: 1,{_ass_time(hook['start'])},{_ass_time(hook['end'])},Hook,,0,0,0,,"
-                      f"{{\\fad(120,150)}}{text}")
+        span = "0:00:00.00,0:00:10.00" if mask else f"{_ass_time(hook['start'])},{_ass_time(hook['end'])}"
+        if shape:      # the rounded box, drawn at frame coordinates under the text
+            events.append(f"Dialogue: 1,{span},Hook,,0,0,0,,{{\\an7\\pos(0,0)\\bord0\\shad0"
+                          f"\\1c{_inline_color(h['box_color'])}\\fad(120,150)\\p4}}{shape}{{\\p0}}")
+        fade = "" if mask else "{\\fad(120,150)}"
+        events.append(f"Dialogue: 2,{span},Hook,,0,0,0,,{fade}{text}")
     if not events:
         return None
     return ("[Script Info]\nScriptType: v4.00+\nPlayResY: 288\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
@@ -275,6 +304,98 @@ def build_ass(words: list[dict[str, Any]], style: dict[str, Any],
             "Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n" + styles +
             "\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
             + "\n".join(events) + "\n")
+
+
+def hook_mask_ass(hook: dict[str, Any]) -> Optional[str]:
+    """A box hook's square box alone, white and steady from 0 to 10 s: rendered once, it shows where
+    libass puts the box (its line breaks and widths) for hook_box_shape to round."""
+    return build_ass([], {**DEFAULT_STYLE, "enabled": False}, None, {**hook, "mask": True, "shape": None})
+
+
+_ON = bytes(0 if i < 128 else 1 for i in range(256))
+
+
+def hook_box_shape(gray: bytes, width: int, height: int, radius: float) -> Optional[str]:
+    """The hook's box as an ASS drawing (\\p4 at \\an7\\pos(0,0)) with round corners, from a frame of
+    hook_mask_ass (gray, one byte a pixel): the outline of libass' per-line boxes, every corner
+    rounded by radius pixels, also where lines of different widths meet. None when there's no box."""
+    shapes: list[list[list[int]]] = []
+    bands: list[list[int]] = []                 # [top, bottom, left, right] in pixels
+    for y in range(height):
+        row = gray[y * width:(y + 1) * width].translate(_ON)
+        left = row.find(1)
+        if left < 0:
+            if bands:
+                shapes.append(bands)
+                bands = []
+            continue
+        right = row.rfind(1) + 1
+        last = bands[-1] if bands else None
+        if last and abs(last[2] - left) <= 2 and abs(last[3] - right) <= 2:
+            last[1], last[2], last[3] = y + 1, min(last[2], left), max(last[3], right)
+        else:
+            bands.append([y, y + 1, left, right])
+    if bands:
+        shapes.append(bands)
+    sx, sy = PLAY_RES_X / width * 8, PLAY_RES_Y / height * 8      # pixels -> \\p4 units (1/8)
+    path = []
+    for shape in shapes:
+        # Half-covered edge rows sit at the threshold and light up at random: drop slivers, close gaps.
+        shape = [b for b in shape if b[1] - b[0] >= 3]
+        for upper, lower in zip(shape, shape[1:]):
+            upper[1] = lower[0]
+        if not shape:
+            continue
+        for cmd, *points in rounded_outline(shape, radius):
+            path.append(cmd + " " + " ".join(f"{round(x * sx)} {round(y * sy)}" for x, y in points))
+    return " ".join(path) or None
+
+
+def rounded_outline(bands: list[list[int]], radius: float) -> list[tuple]:
+    """Stacked boxes ([top, bottom, left, right], top to bottom, touching) as one outline with round
+    corners: [("m", a), ("b", c1, c2, b), ("l", a), ...] in pixels. dashboard's lib/box-shape.ts
+    draws the preview the same way."""
+    corners: list[tuple[float, float]] = []
+    for top, bottom, left, right in bands:              # down the right side...
+        corners += [(right, top), (right, bottom)]
+    for top, bottom, left, right in reversed(bands):    # ...and up the left
+        corners += [(left, bottom), (left, top)]
+    points: list[tuple[float, float]] = []
+    for p in corners:
+        if not points or points[-1] != p:
+            points.append(p)
+    if len(points) > 1 and points[0] == points[-1]:
+        points.pop()
+    changed = True
+    while changed and len(points) > 3:                  # drop points in the middle of a straight edge
+        changed = False
+        for i in range(len(points)):
+            a, b, c = points[i - 1], points[i], points[(i + 1) % len(points)]
+            if (a[0] == b[0] == c[0]) or (a[1] == b[1] == c[1]):
+                points.pop(i)
+                changed = True
+                break
+    n = len(points)
+    # Corners share edges: each first gets half of both its edges, then may grow into what its
+    # neighbour leaves over (a big corner next to a short step between lines stays round), and an
+    # edge still claimed twice shrinks both its corners alike.
+    edges = [math.dist(points[i], points[(i + 1) % n]) for i in range(n)]     # edge i: corner i to i+1
+    half = [min(radius, edges[i - 1] / 2, edges[i] / 2) for i in range(n)]
+    grown = [min(radius, edges[i - 1] - half[i - 1], edges[i] - half[(i + 1) % n]) for i in range(n)]
+    fit = [min(1.0, edges[i] / (grown[i] + grown[(i + 1) % n] or 1)) for i in range(n)]
+    radii = [grown[i] * min(fit[i - 1], fit[i]) for i in range(n)]
+    out: list[tuple] = []
+    for i in range(n):
+        p, v, q = points[i - 1], points[i], points[(i + 1) % n]
+        d1 = math.dist(v, p)
+        d2 = math.dist(v, q)
+        r = radii[i]
+        a = (v[0] + (p[0] - v[0]) * r / d1, v[1] + (p[1] - v[1]) * r / d1)
+        b = (v[0] + (q[0] - v[0]) * r / d2, v[1] + (q[1] - v[1]) * r / d2)
+        out.append(("l" if out else "m", a))
+        out.append(("b", (a[0] + (v[0] - a[0]) * _CURVE, a[1] + (v[1] - a[1]) * _CURVE),
+                    (b[0] + (v[0] - b[0]) * _CURVE, b[1] + (v[1] - b[1]) * _CURVE), b))
+    return out
 
 
 def write_ass(path: Path, words: list[dict[str, Any]], style: dict[str, Any],

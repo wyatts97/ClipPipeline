@@ -10,10 +10,10 @@ import httpx
 import pytest
 from fastapi.testclient import TestClient
 
-from app import captions, editing, templates
+from app import captions, editing, media, render, templates
 from app.main import create_app
 from app.openshorts import OpenShorts
-from app.pipeline import Pipeline
+from app.pipeline import Pipeline, Rendered
 from app.store import Store
 
 WORDS = [{"w": w, "s": i * 0.4, "e": i * 0.4 + 0.35} for i, w in enumerate("he really did that no way".split())]
@@ -33,7 +33,7 @@ def test_hook_styles_and_positions():
     hook = {"text": "POV: he didn't see it coming 😳", "style": {}, "start": 0, "end": 5}
     style_line, event = hook_lines(captions.build_ass(WORDS, captions.DEFAULT_STYLE, hook=hook))
     assert style_line.startswith("Style: Hook,Montserrat ExtraBold,25,&H00000000") and ",0,0,3,7,0,8,28,28,38,1" in style_line
-    assert event.startswith("Dialogue: 1,0:00:00.00,0:00:05.00,Hook") and event.endswith("POV: he didn't see it coming")
+    assert event.startswith("Dialogue: 2,0:00:00.00,0:00:05.00,Hook") and event.endswith("POV: he didn't see it coming")
     outline = captions.build_ass([], {**captions.DEFAULT_STYLE, "enabled": False}, hook={
         **hook, "text": "two\nlines", "position": "bottom",
         "style": {"style": "outline", "text_color": "#FFFFFF", "uppercase": True}})
@@ -45,6 +45,78 @@ def test_hook_styles_and_positions():
     assert captions.build_ass([], captions.DEFAULT_STYLE, hook={**hook, "text": "😳🔥"}) is None   # only emoji
     assert captions.normalize_hook({"style": "neon", "font_size": 500, "duration": -3, "position": "left"}) == {
         **captions.DEFAULT_HOOK, "font_size": 90, "duration": 0.0}
+
+
+def frame(width, height, boxes):
+    """A gray mask with white boxes (top, bottom, left, right), like hook_mask_ass renders."""
+    data = bytearray(width * height)
+    for top, bottom, left, right in boxes:
+        for y in range(top, bottom):
+            data[y * width + left:y * width + right] = b"\xff" * (right - left)
+    return bytes(data)
+
+
+def drawing_points(path):
+    nums = [int(n) for n in path.replace("m", " ").replace("l", " ").replace("b", " ").split()]
+    return list(zip(nums[::2], nums[1::2]))
+
+
+def test_rounded_box_shape():
+    w, h = 384, 288                                     # 1 px = 1 ASS unit, \p4 = 8 per px
+    pill = captions.hook_box_shape(frame(w, h, [(20, 60, 100, 300)]), w, h, radius=1000)
+    assert pill.startswith("m ") and pill.count(" b ") == 4
+    xs, ys = zip(*drawing_points(pill))
+    assert (min(xs), max(xs), min(ys), max(ys)) == (800, 2400, 160, 480)
+    assert {(960, 160), (2240, 160), (960, 480), (2240, 480)} <= set(drawing_points(pill))   # ends: h/2 round
+    square = captions.hook_box_shape(frame(w, h, [(20, 60, 100, 300)]), w, h, radius=0)
+    assert (800, 160) in drawing_points(square)
+    # A narrow line over a wide one, with a half-covered sliver row on top: one outline, 8 corners.
+    lines = frame(w, h, [(19, 20, 180, 200), (20, 60, 140, 260), (52, 100, 100, 300)])
+    stepped = captions.hook_box_shape(lines, w, h, radius=12)
+    assert stepped.count("m ") == 1 and stepped.count(" b ") == 8
+    xs, ys = zip(*drawing_points(stepped))
+    assert (min(xs), max(xs), min(ys), max(ys)) == (800, 2400, 160, 800)
+    assert captions.hook_box_shape(frame(w, h, []), w, h, 10) is None
+    two = captions.hook_box_shape(frame(w, h, [(20, 60, 100, 300), (150, 190, 100, 300)]), w, h, 5)
+    assert two.count("m ") == 2                          # a blank line between: two boxes
+
+
+def test_rounded_box_in_the_ass():
+    look = captions.normalize_hook({"box_radius": 60, "box_color": "#FFE500"})
+    assert look["box_radius"] == 60 and captions.normalize_hook({"box_radius": 400})["box_radius"] == 100
+    assert captions.hook_radius(look, 1920) == pytest.approx(0.6 * (25 + 2 * 7) / 2 * 1920 / 288)
+    hook = {"text": "Wait for it", "style": look, "start": 1, "end": 4, "position": "top"}
+    mask = hook_lines(captions.hook_mask_ass(hook))
+    assert ",&HFF000000,&HFF000000,&H00FFFFFF,&H00FFFFFF," in mask[0] and ",3,7,0,8," in mask[0]   # box alone
+    assert mask[1].startswith("Dialogue: 2,0:00:00.00,0:00:10.00,Hook") and "fad" not in mask[1]
+    doc = captions.build_ass([], captions.DEFAULT_STYLE, hook={**hook, "shape": "m 0 0 l 8 0 8 8"})
+    style_line, box, text = hook_lines(doc)
+    assert ",0,0,1,0,0,8,28,28,38,1" in style_line                       # text alone, no square box
+    assert box.startswith("Dialogue: 1,0:00:01.00,0:00:04.00,Hook") and box.endswith(
+        "{\\an7\\pos(0,0)\\bord0\\shad0\\1c&H00E5FF&\\fad(120,150)\\p4}m 0 0 l 8 0 8 8{\\p0}")
+    assert text.startswith("Dialogue: 2,0:00:01.00,0:00:04.00,Hook") and text.endswith("{\\fad(120,150)}Wait for it")
+
+
+def test_rounded_box_render(settings, sample_video, monkeypatch, tmp_path):
+    store = Store(settings.db_path)
+    try:
+        pipeline = Pipeline(settings, store, openshorts=None)
+        look = captions.normalize_hook({"box_radius": 100})
+        hook = {"text": "Wait for the ending", "style": look, "start": 0, "end": 3, "position": "top"}
+        done = Rendered("standard", {})
+        plan = render.Plan(duration=3.0)
+        shape = run(pipeline.rounded_hook_box(hook, sample_video, tmp_path, plan, done))   # real libass
+        assert shape.startswith("m ") and " b " in shape and not done.notes
+
+        async def broken(*args):
+            raise media.MediaError("ffmpeg failed: no")
+
+        monkeypatch.setattr(render, "ass_mask", broken)
+        assert run(pipeline.rounded_hook_box(hook, sample_video, tmp_path, plan, done)) is None
+        assert done.notes == ["the hook's box has square corners this time (ffmpeg failed: no)"]
+        run(pipeline.notify_client.aclose())
+    finally:
+        store.close()
 
 
 def test_hook_window():

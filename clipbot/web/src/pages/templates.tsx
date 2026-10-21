@@ -240,6 +240,12 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
               </Field>
               <ColorField label="Hook text" value={h.text_color} onChange={(v) => setH({ text_color: v })} />
               {h.style === "box" && <ColorField label="Box" value={h.box_color} onChange={(v) => setH({ box_color: v })} />}
+              {h.style === "box" && (
+                <Field label={`Rounded corners ${h.box_radius}%`} id="t-hradius">
+                  <input id="t-hradius" type="range" min={0} max={100} step={5} value={h.box_radius} disabled={!h.enabled}
+                    onChange={(e) => setH({ box_radius: Number(e.target.value) })} className="w-full accent-primary" />
+                </Field>
+              )}
               {h.style === "outline" && <ColorField label="Hook outline" value={h.outline_color} onChange={(v) => setH({ outline_color: v })} />}
               <Field label="Position" id="t-hpos">
                 <NativeSelect id="t-hpos" value={h.position} disabled={!h.enabled} onChange={(e) => setH({ position: e.target.value as HookStyle["position"] })}>

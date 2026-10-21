@@ -159,6 +159,14 @@ async def video_size(path: Path) -> Optional[tuple[int, int]]:
         return None
 
 
+async def ass_mask(ass: Path, fonts_dir: Optional[Path], size: tuple[int, int]) -> bytes:
+    """The first frame of an ASS file drawn on black, gray, one byte a pixel: where libass puts things."""
+    fonts = f":fontsdir='{filter_path(fonts_dir)}'" if fonts_dir else ""
+    return await run_bytes(["ffmpeg", "-v", "error", "-f", "lavfi", "-i", f"color=c=black:s={size[0]}x{size[1]}:d=1",
+                            "-vf", f"ass=filename='{filter_path(ass)}'{fonts}", "-frames:v", "1",
+                            "-f", "rawvideo", "-pix_fmt", "gray", "-"], timeout=120)
+
+
 async def peaks(path: Path, per_second: int = 50) -> list[float]:
     """Loudness peaks (0-1) for the editor's waveform, per_second values per second of audio."""
     rate = per_second * 80

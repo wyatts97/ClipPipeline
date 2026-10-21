@@ -173,6 +173,7 @@ export interface HookStyle {
   position: CaptionPosition
   duration: number      // seconds from the start; 0 = the whole clip
   uppercase: boolean
+  box_radius: number    // rounded box corners: 0 (square) to 100 (round ends)
 }
 
 export interface SfxRule {

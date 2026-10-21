@@ -1,7 +1,8 @@
 import { cn } from "cn"
-import { useEffect, useState } from "react"
+import { useEffect, useLayoutEffect, useRef, useState } from "react"
 
 import type { CaptionPosition, CaptionStyle, FontItem, HookStyle } from "@/lib/api"
+import { roundedBoxPath } from "@/lib/box-shape"
 
 const SAMPLE = ["NO", "WAY", "HE", "ACTUALLY", "DID", "THAT"]
 const SAMPLE_HOOK = "Wait for the ending"
@@ -78,41 +79,77 @@ export function CaptionLayer({ style, line, active, em = 0.7 }: { style: Caption
   )
 }
 
-/** The hook line in a hook style, placed and sized like the burned one. */
+/** The hook line in a hook style, placed and sized like the burned one. A rounded box is drawn
+ * behind it the way clipbot burns it: the outline of the line boxes, every corner rounded. */
 export function HookLayer({ hook, text, position, em = 0.7 }: {
   hook: HookStyle; text: string; position?: CaptionPosition; em?: number
 }) {
   const shown = stripEmoji(text)
-  if (!shown) return null
   const where = position ?? hook.position
   const size = Math.max(10, Math.floor(hook.font_size * 0.85))
   const pad = Math.max(3, Math.round(size * 0.28))
   const outline = Math.max(2, Math.round(size * 0.1))
+  const rounded = hook.style === "box" && hook.box_radius > 0
+  const radius = (hook.box_radius / 100) * ((size + 2 * pad) / 2)     // in units of the burn
+  const root = useRef<HTMLDivElement>(null)
+  const line = useRef<HTMLSpanElement>(null)
+  const [path, setPath] = useState<string | null>(null)
+
+  useLayoutEffect(() => {
+    const frame = root.current?.parentElement
+    const el = line.current
+    if (!rounded || !frame || !el) { setPath(null); return }
+    const measure = () => {
+      const f = frame.getBoundingClientRect()
+      if (!f.height) return
+      const boxes = [...el.getClientRects()].map((r) => ({
+        top: r.top - f.top, bottom: r.bottom - f.top, left: r.left - f.left, right: r.right - f.left,
+      }))
+      setPath(roundedBoxPath(boxes, radius * (f.height / 288)))
+    }
+    measure()
+    const ro = new ResizeObserver(measure)
+    ro.observe(frame)
+    document.fonts.addEventListener("loadingdone", measure)
+    return () => { ro.disconnect(); document.fonts.removeEventListener("loadingdone", measure) }
+  }, [rounded, radius, shown, where, hook, em])
+
+  if (!shown) return null
+  const drawn = rounded && path !== null
   return (
-    // A block (not flex), so the text stays inline and the box hugs each line like libass draws it;
-    // balanced lines like libass' WrapStyle 0.
-    <div className={cn("pointer-events-none absolute inset-x-[7%] whitespace-pre-line text-balance text-center",
-      where === "middle" && "top-1/2 -translate-y-1/2")}
-      style={{
-        // An ASS font size is the font's whole line height (ascent + descent), so lines are 1/em apart.
-        fontFamily: `"${hook.font_name}", Montserrat, sans-serif`, fontSize: `${size * em * UNIT}cqh`, fontWeight: 700, lineHeight: 1 / em,
-        ...(where === "top" ? { top: `${HOOK_MARGIN.top * UNIT}cqh` } : where === "bottom" ? { bottom: `${HOOK_MARGIN.bottom * UNIT}cqh` } : {}),
-      }}>
-      <span style={{
-        color: hook.text_color,
-        background: hook.style === "box" ? hook.box_color : undefined,
-        // libass pads the box all round, scaling borders per axis: by PlayResY (288) up and down, by
-        // the implied PlayResX (384) to the sides.
-        padding: hook.style === "box" ? `${pad * UNIT}cqh ${pad * UNIT_X}cqw` : undefined,
-        boxDecorationBreak: "clone", WebkitBoxDecorationBreak: "clone",
-        // Twice the width (the fill covers the inner half), averaged over both axes.
-        WebkitTextStroke: hook.style === "outline" ? `calc(${outline * UNIT}cqh + ${outline * UNIT_X}cqw) ${hook.outline_color}` : undefined,
-        paintOrder: "stroke fill",
-        textShadow: hook.style === "plain" ? `0 ${2 * UNIT}cqh 0 rgba(0,0,0,.55)` : undefined,
-      }}>
-        {hook.uppercase ? shown.toUpperCase() : shown}
-      </span>
-    </div>
+    <>
+      {drawn && (
+        <svg aria-hidden className="pointer-events-none absolute inset-0 size-full overflow-visible">
+          <path d={path ?? undefined} fill={hook.box_color} />
+        </svg>
+      )}
+      {/* A block (not flex), so the text stays inline and the box hugs each line like libass draws it;
+          balanced lines like libass' WrapStyle 0. */}
+      <div ref={root} className={cn("pointer-events-none absolute inset-x-[7%] whitespace-pre-line text-balance text-center",
+        where === "middle" && "top-1/2 -translate-y-1/2")}
+        style={{
+          // An ASS font size is the font's whole line height (ascent + descent), so lines are 1/em apart.
+          fontFamily: `"${hook.font_name}", Montserrat, sans-serif`, fontSize: `${size * em * UNIT}cqh`, fontWeight: 700, lineHeight: 1 / em,
+          ...(where === "top" ? { top: `${HOOK_MARGIN.top * UNIT}cqh` } : where === "bottom" ? { bottom: `${HOOK_MARGIN.bottom * UNIT}cqh` } : {}),
+        }}>
+        <span ref={line} style={{
+          color: hook.text_color,
+          // Until the rounded outline is measured, a plain rounded background stands in.
+          background: hook.style === "box" && !drawn ? hook.box_color : undefined,
+          borderRadius: rounded && !drawn ? `${radius * UNIT}cqh` : undefined,
+          // libass pads the box all round, scaling borders per axis: by PlayResY (288) up and down, by
+          // the implied PlayResX (384) to the sides.
+          padding: hook.style === "box" ? `${pad * UNIT}cqh ${pad * UNIT_X}cqw` : undefined,
+          boxDecorationBreak: "clone", WebkitBoxDecorationBreak: "clone",
+          // Twice the width (the fill covers the inner half), averaged over both axes.
+          WebkitTextStroke: hook.style === "outline" ? `calc(${outline * UNIT}cqh + ${outline * UNIT_X}cqw) ${hook.outline_color}` : undefined,
+          paintOrder: "stroke fill",
+          textShadow: hook.style === "plain" ? `0 ${2 * UNIT}cqh 0 rgba(0,0,0,.55)` : undefined,
+        }}>
+          {hook.uppercase ? shown.toUpperCase() : shown}
+        </span>
+      </div>
+    </>
   )
 }
 

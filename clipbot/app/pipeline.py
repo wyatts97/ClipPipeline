@@ -342,6 +342,8 @@ class Pipeline:
             captions_on = bool(s.captions and style["enabled"] and shown)
             hook = self.hook_plan(template, edit, hook_text, out_duration)
             done.hook_text = captions.strip_emoji(hook["text"]) if hook else ""
+            if hook and hook["style"]["style"] == "box" and hook["style"]["box_radius"]:
+                hook["shape"] = await self.rounded_hook_box(hook, source, work, plan, done)
             if captions_on or hook:
                 ass = work / "captions.ass"
                 if captions.write_ass(ass, shown if captions_on else [], {**style, "enabled": captions_on},
@@ -394,6 +396,22 @@ class Pipeline:
         finally:
             shutil.rmtree(work, ignore_errors=True)
         return done
+
+    async def rounded_hook_box(self, hook: dict[str, Any], source: Path, work: Path, plan: render.Plan,
+                               done: Rendered) -> Optional[str]:
+        """The hook's box with round corners, as an ASS drawing: libass draws the square box once, on
+        its own, and its outline is traced and rounded. None (a square box) if that fails."""
+        try:
+            size = plan.size or await render.video_size(source)
+            if not size:
+                raise media.MediaError("couldn't read the video's size")
+            mask = work / "hook-mask.ass"
+            mask.write_text(captions.hook_mask_ass(hook) or "", encoding="utf-8")
+            gray = await render.ass_mask(mask, fonts.render_fonts_dir(self.settings), size)
+            return captions.hook_box_shape(gray, size[0], size[1], captions.hook_radius(hook["style"], size[1]))
+        except media.MediaError as e:
+            done.notes.append(f"the hook's box has square corners this time ({e})")
+            return None
 
     def hook_plan(self, template: dict[str, Any], edit: dict[str, Any], text: Optional[str],
                   out_duration: float) -> Optional[dict[str, Any]]:

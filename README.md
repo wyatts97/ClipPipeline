@@ -392,7 +392,8 @@ Pick one per job with `t=<name>` in Telegram (`https://twitch.tv/videos/123 1:02
 **The hook line** is the text over the first seconds that makes people stop scrolling. OpenShorts' AI
 writes one per clip; clipbot draws it in the template's hook look: a box behind the text, an outline,
 or a plain shadow, in any font and color, at the top, middle or bottom, for the first few seconds (or
-the whole clip). Emoji are left off the video, since no caption font has them. Per clip, change the
+the whole clip). **Rounded corners** (0–100%) round the box, up to pill-shaped ends; on hooks of
+several lines the box follows each line and the joins between lines are rounded too. Emoji are left off the video, since no caption font has them. Per clip, change the
 text in Review or the editor (**✨ Suggest** writes five new ones with Gemini), and in the editor turn
 it off, move it, or change when it shows. `AUTO_HOOK=false` in `.env` turns hooks off unless a clip
 asks for one. Clips made before this version have OpenShorts' own hook in the video, so their hook
