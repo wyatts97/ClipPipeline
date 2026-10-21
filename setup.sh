@@ -577,7 +577,8 @@ ask_app_keys() {  # ask_app_keys "YouTube" ID_KEY SECRET_KEY "where to get them"
   env_set "$secret_key" "$ANSWER"
 }
 
-postiz_up() { curl -sf -o /dev/null "$POSTIZ_LOCAL/"; }
+# Its backend, not just the web pages: those answer first, and /auth fails with a 500 until the backend does.
+postiz_up() { curl -sf -o /dev/null "$POSTIZ_LOCAL/api/auth/can-register"; }
 
 setup_postiz_key() {
   local host key code

@@ -490,6 +490,13 @@ it as described under Troubleshooting (this replaces any edits you made to the w
 - **Postiz doesn't come up:** `docker compose logs postiz-db temporal postiz`. `postiz-db` stops with a
   message when `POSTIZ_HOSTNAME` or `POSTIZ_JWT_SECRET` is missing (`bash setup.sh --publish` sets
   both). Temporal takes about a minute on its first start, Postiz a few minutes.
+- **Postiz shows "Application error: a client-side exception"** (the browser console says `/auth` gave a
+  500): its web pages are up but its backend isn't answering yet. `curl -s http://localhost:4007/api/auth/can-register`
+  on the server prints `{"register":true}` once it is. If that never comes, `docker compose logs --tail=200 postiz`
+  shows why (a database, Redis or Temporal error near the end); `docker compose ps` shows Postiz as
+  unhealthy meanwhile. `cannot have more than 3 search attribute of type Text` there means a Temporal
+  set up by an older version of this stack: `docker compose up -d` with the current compose file runs
+  `temporal-attrs`, which frees the slots Temporal's sample search attributes took, then starts Postiz again.
 - **Clips aren't scheduled:** the dashboard's Publishing page shows why (no channel connected, a
   setting Postiz refused, Postiz down) with a **Retry** button; Telegram says so too.
 - **A post failed:** Postiz's calendar shows the platform's reason under the post. An expired login

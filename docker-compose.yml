@@ -216,19 +216,21 @@ services:
       - postiz_uploads:/uploads
     ports:
       - "127.0.0.1:${POSTIZ_PORT:-4007}:5000"   # for the host's cloudflared; open it through its hostname
+    # Healthy once the backend answers, not just the web pages (they come up first and fail with a
+    # 500 on /auth until then): the same call the sign-up page makes.
     healthcheck:
-      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/',r=>process.exit(r.statusCode<500?0:1)).on('error',()=>process.exit(1))"]
+      test: ["CMD", "node", "-e", "require('http').get('http://localhost:5000/api/auth/can-register',r=>process.exit(r.statusCode===200?0:1)).on('error',()=>process.exit(1))"]
       interval: 30s
       timeout: 10s
       retries: 5
-      start_period: 180s
+      start_period: 300s
     depends_on:
       postiz-db:
         condition: service_completed_successfully
       postiz-redis:
         condition: service_healthy
-      temporal:
-        condition: service_healthy
+      temporal-attrs:
+        condition: service_completed_successfully
 
   # One-shot: checks the settings Postiz needs and creates its database in the shared Postgres.
   postiz-db:
@@ -276,6 +278,9 @@ services:
       POSTGRES_PWD: ${POSTGRES_PASSWORD}
       POSTGRES_SEEDS: postgres
       DYNAMIC_CONFIG_FILE_PATH: config/dynamicconfig/development-sql.yaml
+      # Search lives in Postgres, which has room for 3 Text search attributes. Postiz needs 2, so
+      # Temporal's sample ones (2 of them Text) stay out; see temporal-attrs.
+      SKIP_ADD_CUSTOM_SEARCH_ATTRIBUTES: "true"
     volumes:
       - ./postiz/dynamicconfig:/etc/temporal/config/dynamicconfig:ro
     healthcheck:
@@ -286,6 +291,34 @@ services:
       start_period: 60s
     depends_on:
       postgres:
+        condition: service_healthy
+
+  # One-shot, before Postiz: waits for Temporal's default namespace, then frees the Text search
+  # attribute slots Temporal's samples took on installs made before SKIP_ADD_CUSTOM_SEARCH_ATTRIBUTES
+  # (Postiz's backend won't start otherwise: "cannot have more than 3 search attribute of type Text").
+  temporal-attrs:
+    profiles: ["publish"]
+    image: temporalio/auto-setup:${TEMPORAL_VERSION:-1.28.1}
+    restart: "no"
+    entrypoint:
+      - sh
+      - -c
+      - |
+        attrs() { temporal operator search-attribute "$$@" --address temporal:7233 --namespace default; }
+        tries=0
+        until attrs list >/dev/null 2>&1; do
+          tries=$$((tries + 1))
+          [ "$$tries" -lt 60 ] || { echo "Temporal's default namespace never showed up"; exit 1; }
+          sleep 2
+        done
+        for name in CustomStringField CustomTextField; do
+          if attrs list | grep -qw "$$name"; then
+            attrs remove --name "$$name" --yes && echo "Removed Temporal's sample search attribute $$name"
+          fi
+        done
+        echo "Temporal is ready for Postiz"
+    depends_on:
+      temporal:
         condition: service_healthy
 
   # Optional: only for servers without their own cloudflared. Its tunnel route points at http://n8n:5678.
