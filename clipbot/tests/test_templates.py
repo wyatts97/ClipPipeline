@@ -301,7 +301,7 @@ def test_template_api(dash):
     assert [t["id"] for t in data["items"]] == ["standard", "hormozi", "meme", "sneaky", "hype"]
     assert data["default"] == "standard" and "oneword" in data["presets"] and "moment" in data["triggers"]
     assert list(data["kinds"]) == list(templates.MOMENT_KINDS) and data["gemini"] is False
-    assert {"family": "Anton", "file": "Anton-Regular.ttf", "bundled": True} in data["fonts"]
+    assert {"family": "Anton", "file": "Anton-Regular.ttf", "bundled": True, "em": 0.577, "weight": 400} in data["fonts"]
     meme = next(t for t in data["items"] if t["id"] == "meme")
     assert meme["missing_sounds"] == ["vine-boom"]
 
@@ -328,7 +328,7 @@ def test_sound_and_font_uploads(dash, tmp_path):
 
     font = (BUNDLED / "Bangers-Regular.ttf").read_bytes()
     assert dash.put("/api/fonts/MyFont.ttf", content=font).json() == {"family": "Bangers", "file": "MyFont.ttf",
-                                                                        "bundled": False}
+                                                                        "bundled": False, "em": 0.569, "weight": 400}
     assert dash.put("/api/fonts/bad.ttf", content=b"nope").status_code == 422
     assert dash.get("/api/fonts/Anton-Regular.ttf/file").headers["content-type"] == "font/ttf"
     assert dash.delete("/api/fonts/Anton-Regular.ttf").status_code == 404    # bundled ones stay

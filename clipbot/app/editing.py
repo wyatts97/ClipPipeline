@@ -2,7 +2,9 @@
 
 Stored per clip (clips.edit, JSON):
     {"segments": [[start, end], ...],              # kept stretches, in order
-     "zooms": [{"s": start, "e": end, "scale": 1.15}, ...]}
+     "zooms": [{"s": start, "e": end, "scale": 1.15}, ...],
+     "hook": {"enabled": true, "s": 0, "e": 4.5, "position": "top"}}   # optional: this clip's hook line
+                                                    # (e null = to the end; missing keys = the template's)
 
 Every time here, like the clip's words and hand-placed sound effects, is on the timeline of the
 clip without captions (data/clean/...). The render plays the segments back to back; map_time and
@@ -56,7 +58,39 @@ def normalize(raw: Optional[dict[str, Any]], duration: float) -> dict[str, Any]:
             zooms.append({"s": round(start, 3), "e": round(end, 3),
                           "scale": round(min(2.0, max(1.05, _f(z.get("scale"), 1.15))), 3)})
     zooms.sort(key=lambda z: z["s"])
-    return {"segments": merged[:MAX_SEGMENTS] or full(duration)["segments"], "zooms": zooms}
+    out: dict[str, Any] = {"segments": merged[:MAX_SEGMENTS] or full(duration)["segments"], "zooms": zooms}
+    hook = normalize_hook(raw.get("hook"), duration)
+    if hook:
+        out["hook"] = hook
+    return out
+
+
+def normalize_hook(raw: Any, duration: float) -> dict[str, Any]:
+    if not isinstance(raw, dict):
+        return {}
+    hook: dict[str, Any] = {}
+    if isinstance(raw.get("enabled"), bool):
+        hook["enabled"] = raw["enabled"]
+    if raw.get("s") is not None:
+        start = min(max(0.0, _f(raw["s"])), max(0.0, duration - 0.3))
+        hook["s"] = round(start, 3)
+        hook["e"] = None if raw.get("e") is None else round(min(duration, max(start + 0.3, _f(raw["e"]))), 3)
+    if raw.get("position") in ("top", "middle", "bottom"):
+        hook["position"] = raw["position"]
+    return hook
+
+
+def hook_window(edit: dict[str, Any], template_duration: float, out_duration: float) -> tuple[float, float]:
+    """When the hook shows, on the edited timeline: the clip's own window if set, else from the start
+    for the template's duration (0 = the whole clip)."""
+    hook = edit.get("hook") or {}
+    if "s" in hook:
+        end = hook.get("e")
+        parts = map_range(hook["s"], end if end is not None else float("inf"), edit["segments"])
+        if not parts:
+            return 0.0, 0.0
+        return parts[0][0], (parts[-1][1] if end is not None else out_duration)
+    return 0.0, (out_duration if template_duration <= 0 else min(out_duration, template_duration))
 
 
 def is_cut(edit: dict[str, Any], duration: float) -> bool:
@@ -129,5 +163,11 @@ def shift(edit: Optional[dict[str, Any]], sfx: list[dict[str, Any]], by: float, 
     else:
         moved = {"segments": [[s + by, e + by] for s, e in edit["segments"]],
                  "zooms": [{**z, "s": z["s"] + by, "e": z["e"] + by} for z in edit["zooms"]]}
+    hook = dict((edit or {}).get("hook") or {})
+    if "s" in hook:
+        hook["s"] = hook["s"] + by
+        hook["e"] = None if hook.get("e") is None else hook["e"] + by
+    if hook:
+        moved["hook"] = hook
     return (normalize(moved, new_duration),
             [{**e, "t": round(_f(e.get("t")) + by, 3)} for e in sfx if 0 <= _f(e.get("t")) + by < new_duration])

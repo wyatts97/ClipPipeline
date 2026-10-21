@@ -58,6 +58,7 @@ class Rendered:
     notes: list[str] = field(default_factory=list)   # e.g. a sound that isn't in data/sounds
     error: Optional[str] = None                      # the render failed; the clip has no template
     duration: Optional[float] = None                 # of the finished clip (after the editor's cuts)
+    hook_text: str = ""                              # the hook line on the video ("" = none)
 
 
 class Pipeline:
@@ -108,7 +109,7 @@ class Pipeline:
             "target_clips": job.target_clips,
             "clip_min_seconds": s.clip_min_seconds,
             "clip_max_seconds": s.clip_max_seconds,
-            "auto_hook": s.auto_hook,
+            "auto_hook": False,          # clipbot burns the hook itself, in the clip's template
             "layouts": [p.strip() for p in s.layouts.split(",") if p.strip()],
             # clipbot burns the captions itself, in the clip's template (render_clip_files)
             "captions": False,
@@ -233,7 +234,8 @@ class Pipeline:
                 duration = await media.probe_duration(source)
                 words, splits = await self.clip_text(job, idx, local)
                 done = await self.render_clip_files(job, source, master, words, splits, job.template,
-                                                    [], meta, duration, seed=f"{job.id}_{idx}")
+                                                    [], meta, duration, seed=f"{job.id}_{idx}",
+                                                    hook_text=info.get("viral_hook_text"))
                 await media.make_preview(master, preview, s.preview_max_mb, s.preview_height)
             except (media.MediaError, OpenShortsError, httpx.HTTPError, OSError) as e:
                 problems.append(f"clip {idx + 1}: {e}")
@@ -252,6 +254,7 @@ class Pipeline:
                 problems.append(f"clip {idx + 1}: no words from OpenShorts, so no captions")
             if done.moments is not None:
                 meta["moments"] = done.moments
+            meta["hook_rendered"] = done.hook_text
             if done.template.get("credit"):
                 meta["credit"] = done.template["credit"]
             title = info.get("title") or info.get("video_title_for_youtube_short")
@@ -313,7 +316,8 @@ class Pipeline:
                                 splits: list[tuple[float, float]], template_id: Optional[str],
                                 manual_sfx: list[dict[str, Any]], meta: dict[str, Any],
                                 duration: float, seed: str = "",
-                                edit: Optional[dict[str, Any]] = None) -> Rendered:
+                                edit: Optional[dict[str, Any]] = None,
+                                hook_text: Optional[str] = None) -> Rendered:
         """Render source (no captions) into dst with a template and the editor's edit. A failed
         render copies the source, so the clip still exists; the error says why. Words, effects and
         zooms come in on the source's timeline and are moved onto the edited one here."""
@@ -335,9 +339,13 @@ class Pipeline:
             shown = editing.map_words(words, segments) if cut else words
             shown_splits = [r for a, b in splits for r in editing.map_range(a, b, segments)] if cut else splits
             style = template["captions"]
-            if s.captions and style["enabled"] and shown:
+            captions_on = bool(s.captions and style["enabled"] and shown)
+            hook = self.hook_plan(template, edit, hook_text, out_duration)
+            done.hook_text = captions.strip_emoji(hook["text"]) if hook else ""
+            if captions_on or hook:
                 ass = work / "captions.ass"
-                if captions.write_ass(ass, shown, style, shown_splits):
+                if captions.write_ass(ass, shown if captions_on else [], {**style, "enabled": captions_on},
+                                      shown_splits, hook):
                     plan.ass, plan.fonts_dir = ass, fonts.render_fonts_dir(s)
             music = template["music"]
             if music["sound"]:
@@ -387,12 +395,29 @@ class Pipeline:
             shutil.rmtree(work, ignore_errors=True)
         return done
 
+    def hook_plan(self, template: dict[str, Any], edit: dict[str, Any], text: Optional[str],
+                  out_duration: float) -> Optional[dict[str, Any]]:
+        """The hook line for a render: the clip's text in the template's look, or None. The clip's own
+        settings (the editor's hook track) beat the template's; AUTO_HOOK=false turns hooks off unless
+        a clip asks for one."""
+        look = template["hook"]
+        own = edit.get("hook") or {}
+        enabled = own.get("enabled", look["enabled"] and self.settings.auto_hook)
+        text = captions.strip_emoji(text or "")
+        if not enabled or not text:
+            return None
+        start, end = editing.hook_window(edit, look["duration"], out_duration)
+        if end - start < 0.3:
+            return None
+        return {"text": text, "style": look, "start": start, "end": end,
+                "position": own.get("position", look["position"])}
+
     def clean_source(self, clip: Clip) -> Path:
         return self.settings.data_dir / "clean" / f"{clip.job_id}_{clip.idx}.mp4"
 
     async def rerender(self, clip_id: str, template_id: Optional[str] = None,
                        sfx: Optional[list[dict[str, Any]]] = None, edit: Optional[dict[str, Any]] = None,
-                       words: Optional[list[dict[str, Any]]] = None) -> None:
+                       words: Optional[list[dict[str, Any]]] = None, hook_text: Optional[str] = None) -> None:
         """Render a pending clip again: another template, effects placed by hand, and/or the editor's
         cuts, zooms and caption text. Whatever isn't given stays as it was."""
         clip = self.store.get_clip(clip_id)
@@ -403,9 +428,14 @@ class Pipeline:
         manual = clip.manual_sfx() if sfx is None else sfx
         template_id = template_id or clip.template
         meta = dict(clip.meta)
+        # Made when OpenShorts drew the hook into the clip itself: the clean copy has it already.
+        legacy_hook = "hook_rendered" not in meta
         if words is not None:
             meta.setdefault("words_original", clip.word_list())      # for "reset captions"
             self.store.update_clip(clip.id, words=json.dumps(words), meta=meta)
+        if hook_text is not None:
+            meta["viral_hook_text"] = hook_text.strip()
+            self.store.update_clip_text(clip.id, clip.title, hook_text.strip(), meta)
         tmp = Path(clip.path).with_name(f"{clip.job_id}_{clip.idx}.rendering.mp4")
         try:
             source_duration = await media.probe_duration(source)
@@ -415,7 +445,8 @@ class Pipeline:
             clip = self.store.get_clip(clip.id)
             done = await self.render_clip_files(job, source, tmp, clip.word_list(), clip.split_list(), template_id,
                                                 manual, dict(clip.meta), source_duration,
-                                                seed=f"{clip.job_id}_{clip.idx}", edit=edit)
+                                                seed=f"{clip.job_id}_{clip.idx}", edit=edit,
+                                                hook_text=None if legacy_hook else clip.hook)
             tmp.replace(clip.path)
             preview = Path(clip.preview_path or self.settings.folder("previews") / f"{clip.job_id}_{clip.idx}.mp4")
             await media.make_preview(Path(clip.path), preview, self.settings.preview_max_mb,
@@ -432,6 +463,8 @@ class Pipeline:
         if done.moments is not None:
             meta["moments"] = done.moments
             meta.pop("punchlines", None)
+        if not legacy_hook:
+            meta["hook_rendered"] = done.hook_text
         meta.pop("credit", None)
         if done.template.get("credit"):
             meta["credit"] = done.template["credit"]
@@ -486,6 +519,7 @@ class Pipeline:
                                   old_duration, new_duration)
         meta = {k: v for k, v in clip.meta.items() if k not in ("moments", "punchlines", "words_original")}
         meta.update(start=result.get("start", meta.get("start")), end=result.get("end", meta.get("end")))
+        meta.setdefault("hook_rendered", "")     # OpenShorts' re-cut has no hook, so clipbot draws it now
         self.store.update_clip(clip.id, words=json.dumps(words) if words else None,
                                splits=json.dumps(splits) if splits else None, meta=meta,
                                edit=json.dumps(edit), sfx=json.dumps(sfx) if sfx else None)

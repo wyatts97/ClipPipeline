@@ -5,6 +5,7 @@ A template, as stored (JSON) and edited in the dashboard:
     {"name": "Meme",
      "captions": {...captions.normalize_style...},
      "music": {"sound": "sneaky-snitch", "volume": 0.18, "duck": true, "start": 0},
+     "hook": {...captions.normalize_hook...: the look of the hook line at the start},
      "voice_volume": 1.0,
      "sfx": [{"sounds": ["vine-boom", "bruh"], "at": "moment", "kinds": ["punchline", "shock"],
               "words": [], "volume": 1.0, "max": 2}],
@@ -57,16 +58,21 @@ SNEAKY_CREDIT = ('Music: "Sneaky Snitch" Kevin MacLeod (incompetech.com), licens
 
 # Seeded on first start; editable and deletable like any other.
 BUILT_IN: dict[str, dict[str, Any]] = {
-    "standard": {"name": "Standard", "captions": captions.PRESETS["default"]},
-    "hormozi": {"name": "Hormozi", "captions": captions.PRESETS["hormozi"]},
+    "standard": {"name": "Standard", "captions": captions.PRESETS["default"], "hook": captions.DEFAULT_HOOK},
+    "hormozi": {"name": "Hormozi", "captions": captions.PRESETS["hormozi"],
+                "hook": {**captions.DEFAULT_HOOK, "box_color": "#FFE500", "uppercase": True}},
     "meme": {"name": "Meme",
              "captions": {**captions.PRESETS["oneword"], "font_name": "Luckiest Guy", "font_size": 60,
                           "border_width": 4},
+             "hook": {**captions.DEFAULT_HOOK, "style": "outline", "font_name": "Luckiest Guy", "font_size": 34,
+                      "text_color": "#FFFFFF", "uppercase": True},
              "sfx": [{"sounds": ["vine-boom"], "at": "moment", "kinds": ["punchline", "shock"], "max": 2}]},
     "sneaky": {"name": "Sneaky", "captions": captions.PRESETS["clean"],
+               "hook": {**captions.DEFAULT_HOOK, "box_color": "#121214", "text_color": "#FFFFFF"},
                "music": {"sound": "sneaky-snitch", "volume": 0.18, "duck": True},
                "credit": SNEAKY_CREDIT},
     "hype": {"name": "Hype", "captions": captions.PRESETS["lime"],
+             "hook": {**captions.DEFAULT_HOOK, "box_color": "#A3FF12", "uppercase": True},
              "sfx": [{"sounds": ["vine-boom"], "at": "peak", "max": 1}]},
 }
 DEFAULT_TEMPLATE = "standard"
@@ -117,6 +123,7 @@ def normalize(raw: dict[str, Any]) -> dict[str, Any]:
     return {
         "name": str(raw.get("name") or "Template").strip()[:60] or "Template",
         "captions": captions.normalize_style(raw.get("captions")),
+        "hook": captions.normalize_hook(raw.get("hook")),
         "music": {"sound": sound_name(music.get("sound")), "volume": _num(music.get("volume"), 0, 1, 0.15),
                   "duck": bool(music.get("duck", True)), "start": _num(music.get("start"), 0, 3600, 0)},
         "voice_volume": _num(raw.get("voice_volume"), 0, 2, 1.0),
@@ -221,6 +228,50 @@ def cached_moments(meta: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
     if isinstance(meta.get("punchlines"), list):
         return [{"t": float(t), "kind": "punchline"} for t in meta["punchlines"]]
     return None
+
+
+# ---- hook ideas from Gemini ---------------------------------------------------------------
+HOOK_PROMPT = """Write {n} different hook lines for the start of this short vertical clip cut from a livestream.
+A hook is the text overlay that makes people stop scrolling in the first second: max 8 words, punchy,
+a question, a "POV:", a bold claim or a tease of what happens. Same language as the transcript. No
+hashtags, no emoji, no quotes around it. Vary the style between the lines.
+{context}
+Transcript:
+{lines}"""
+
+
+async def suggest_hooks(settings: Settings, words: list[dict[str, Any]], title: Optional[str] = None,
+                        current: Optional[str] = None, n: int = 5,
+                        client: Optional[httpx.AsyncClient] = None) -> Optional[list[str]]:
+    """Hook lines for a clip, or None when Gemini isn't set up or failed."""
+    if not settings.gemini_api_key:
+        return None
+    lines = " ".join(w["w"] for w in words[:900]) or "(no speech)"
+    context = "\n".join(x for x in (f"Clip title: {title}" if title else "",
+                                    f"The current hook, which needs replacing: {current}" if current else "") if x)
+    body = {"contents": [{"parts": [{"text": HOOK_PROMPT.format(n=n, context=context, lines=lines)}]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9,
+                                 "responseSchema": {"type": "OBJECT", "properties": {
+                                     "hooks": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["hooks"]}}}
+    url = f"{settings.gemini_api_url}/v1beta/models/{settings.gemini_model}:generateContent"
+    own = client is None
+    client = client or httpx.AsyncClient(timeout=60)
+    try:
+        resp = await client.post(url, json=body, headers={"x-goog-api-key": settings.gemini_api_key})
+        resp.raise_for_status()
+        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        hooks = []
+        for item in json.loads(text).get("hooks") or []:
+            line = captions.strip_emoji(str(item)).strip().strip('"').strip()
+            if line and line.lower() not in (h.lower() for h in hooks):
+                hooks.append(line[:80])
+        return hooks[:n]
+    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as e:
+        log.warning("hook ideas failed: %s", e)
+        return None
+    finally:
+        if own:
+            await client.aclose()
 
 
 # ---- moments from Gemini ------------------------------------------------------------------

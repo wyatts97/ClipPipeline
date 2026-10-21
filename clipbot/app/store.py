@@ -614,9 +614,16 @@ class Store:
 
     # ---- templates and app settings -------------------------------------------
     def seed_templates(self, built_in: dict[str, dict[str, Any]], default: str) -> None:
-        """First start only: the built-in templates and the default."""
+        """First start only: the built-in templates and the default. Later starts give built-ins saved
+        before hooks were part of templates their own hook look."""
         with self._lock:
             if self._db.execute("SELECT COUNT(*) FROM templates").fetchone()[0]:
+                for tid, data in built_in.items():
+                    row = self._db.execute("SELECT data FROM templates WHERE id=?", (tid,)).fetchone()
+                    saved = json.loads(row["data"]) if row else None
+                    if saved is not None and "hook" not in saved and "hook" in data:
+                        self._db.execute("UPDATE templates SET data=? WHERE id=?",
+                                         (json.dumps({**saved, "hook": data["hook"]}), tid))
                 return
             now = time.time()
             for tid, data in built_in.items():

@@ -14,6 +14,7 @@ import json
 import os
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -144,6 +145,9 @@ def main() -> None:
         assert first["video"]["bytes"] > 1000 and "Big play" in first["caption"], first
         assert "🎨 Standard" in first["caption"], first["caption"]           # captions rendered by clipbot
         assert not any("no words" in t or "template failed" in t for t in texts), texts
+        with sqlite3.connect(work / "data/clipbot.sqlite3") as db:          # clipbot drew the hook, emoji left off
+            hooks = [json.loads(m).get("hook_rendered") for (m,) in db.execute("SELECT meta FROM clips")]
+        assert sorted(hooks) == ["", "No way he hit that"], hooks             # the second clip has no hook text
         keyboard = json.loads(first["reply_markup"])["inline_keyboard"][0]
         assert [b["text"] for b in keyboard] == ["✅ Post", "❌ Skip"], keyboard
         ok_data, skip_data = keyboard[0]["callback_data"], json.loads(

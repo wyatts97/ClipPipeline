@@ -14,8 +14,8 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  api, type CaptionStyle, type MomentKind, type SfxRule, type SoundItem, type Template, type TemplateBody,
-  type TemplatesResponse, type Trigger,
+  api, type CaptionStyle, type HookStyle, type HookStyleName, type MomentKind, type SfxRule, type SoundItem, type Template,
+  type TemplateBody, type TemplatesResponse, type Trigger,
 } from "@/lib/api"
 import { size, tc } from "@/lib/format"
 
@@ -33,6 +33,10 @@ const KIND_LABEL: Record<MomentKind, string> = {
 
 const EFFECT_LABEL: Record<string, string> = {
   none: "Color only", pop: "Pop", glow: "Glow", box: "Outline box", highlight: "Box behind the word",
+}
+
+export const HOOK_STYLE_LABEL: Record<HookStyleName, string> = {
+  box: "Box behind", outline: "Outlined", plain: "Plain with a shadow",
 }
 
 function useTemplates() {
@@ -65,7 +69,7 @@ export function TemplatesPage() {
           <div className="grid grid-cols-1 gap-4 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
             {d.items.map((t) => (
               <article key={t.id} className="flex gap-4 rounded-md border border-border bg-card p-3">
-                <CaptionPreview style={t.captions} fonts={d.fonts} className="w-24 shrink-0" />
+                <CaptionPreview style={t.captions} hook={t.hook} fonts={d.fonts} className="w-24 shrink-0" />
                 <div className="flex min-w-0 flex-1 flex-col gap-2 text-sm">
                   <div className="flex items-baseline gap-2">
                     <h2 className="truncate font-medium">{t.name}</h2>
@@ -99,6 +103,9 @@ export function TemplatesPage() {
 
 function Summary({ t }: { t: Template }) {
   const parts = [t.captions.enabled ? `${t.captions.font_name}, ${EFFECT_LABEL[t.captions.effect]?.toLowerCase()}` : "No captions"]
+  parts.push(t.hook.enabled
+    ? `Hook: ${HOOK_STYLE_LABEL[t.hook.style].toLowerCase()}, ${t.hook.duration ? `first ${t.hook.duration} s` : "whole clip"}`
+    : "No hook")
   if (t.music.sound) parts.push(`♪ ${t.music.sound}`)
   for (const r of t.sfx) {
     const where = r.at === "moment" ? `on ${r.kinds.map((k) => KIND_LABEL[k].toLowerCase()).join(", ")}` : TRIGGER_LABEL[r.at]
@@ -108,12 +115,12 @@ function Summary({ t }: { t: Template }) {
 }
 
 const bodyOf = (t: Template): TemplateBody => ({
-  name: t.name, captions: { ...t.captions }, music: { ...t.music }, voice_volume: t.voice_volume,
+  name: t.name, captions: { ...t.captions }, hook: { ...t.hook }, music: { ...t.music }, voice_volume: t.voice_volume,
   sfx: t.sfx.map((r) => ({ ...r, sounds: [...r.sounds], kinds: [...r.kinds], words: [...r.words] })), credit: t.credit,
 })
 
 const blank = (d: TemplatesResponse): TemplateBody => ({
-  name: "New template", captions: { ...d.presets.default }, music: { sound: null, volume: 0.15, duck: true, start: 0 },
+  name: "New template", captions: { ...d.presets.default }, hook: { ...d.hook_default }, music: { sound: null, volume: 0.15, duck: true, start: 0 },
   voice_volume: 1, sfx: [], credit: "",
 })
 
@@ -133,6 +140,8 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
   const [body, setBody] = useState<TemplateBody>(initial)
   const c = body.captions
   const setC = (patch: Partial<CaptionStyle>) => setBody({ ...body, captions: { ...c, ...patch } })
+  const h = body.hook
+  const setH = (patch: Partial<HookStyle>) => setBody({ ...body, hook: { ...h, ...patch } })
   const save = useMutation({
     mutationFn: () => (id ? api.updateTemplate(id, body) : api.createTemplate(body)),
     onSuccess: (t) => { toast.success(`Saved ${t.name}`); qc.invalidateQueries({ queryKey: ["templates"] }); onDone() },
@@ -207,6 +216,50 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
           </fieldset>
 
           <fieldset className="space-y-3">
+            <legend className="mb-2 flex w-full items-center justify-between font-medium">
+              Hook line
+              <label className="flex items-center gap-2 text-sm font-normal text-muted-foreground">
+                <Checkbox checked={h.enabled} onCheckedChange={(v) => setH({ enabled: !!v })} /> Show the hook
+              </label>
+            </legend>
+            <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
+              <Field label="Look" id="t-hstyle">
+                <NativeSelect id="t-hstyle" value={h.style} disabled={!h.enabled} onChange={(e) => setH({ style: e.target.value as HookStyleName })}>
+                  {data.hook_styles.map((x) => <option key={x} value={x}>{HOOK_STYLE_LABEL[x] ?? x}</option>)}
+                </NativeSelect>
+              </Field>
+              <Field label="Font" id="t-hfont">
+                <NativeSelect id="t-hfont" value={h.font_name} disabled={!h.enabled} onChange={(e) => setH({ font_name: e.target.value })}>
+                  {!data.fonts.some((f) => f.family === h.font_name) && <option value={h.font_name}>{h.font_name} (missing)</option>}
+                  {data.fonts.map((f) => <option key={f.family} value={f.family}>{f.family}</option>)}
+                </NativeSelect>
+              </Field>
+              <Field label={`Size ${h.font_size}`} id="t-hsize">
+                <input id="t-hsize" type="range" min={12} max={90} value={h.font_size} disabled={!h.enabled}
+                  onChange={(e) => setH({ font_size: Number(e.target.value) })} className="w-full accent-primary" />
+              </Field>
+              <ColorField label="Hook text" value={h.text_color} onChange={(v) => setH({ text_color: v })} />
+              {h.style === "box" && <ColorField label="Box" value={h.box_color} onChange={(v) => setH({ box_color: v })} />}
+              {h.style === "outline" && <ColorField label="Hook outline" value={h.outline_color} onChange={(v) => setH({ outline_color: v })} />}
+              <Field label="Position" id="t-hpos">
+                <NativeSelect id="t-hpos" value={h.position} disabled={!h.enabled} onChange={(e) => setH({ position: e.target.value as HookStyle["position"] })}>
+                  {data.positions.map((x) => <option key={x} value={x}>{x}</option>)}
+                </NativeSelect>
+              </Field>
+              <Field label="Show for (s, 0 = whole clip)" id="t-hdur">
+                <Input id="t-hdur" type="number" min={0} max={60} step={0.5} value={h.duration} disabled={!h.enabled}
+                  onChange={(e) => setH({ duration: Math.max(0, Number(e.target.value) || 0) })} />
+              </Field>
+            </div>
+            <label className="flex items-center gap-2"><Checkbox checked={h.uppercase} disabled={!h.enabled} onCheckedChange={(v) => setH({ uppercase: !!v })} /> UPPERCASE</label>
+            <p className="text-xs text-muted-foreground">
+              The line OpenShorts' AI writes for each clip, drawn by clipbot in this look. Change a clip's text, or when and
+              where it shows, in Review or the editor. Emoji are left off the video.
+              {!data.auto_hook && " AUTO_HOOK is false, so hooks only show on clips you turn them on for."}
+            </p>
+          </fieldset>
+
+          <fieldset className="space-y-3">
             <legend className="mb-2 font-medium">Background music</legend>
             <div className="grid grid-cols-2 gap-3 sm:grid-cols-3">
               <Field label="Track" id="t-music">
@@ -253,7 +306,7 @@ function EditorForm({ data, id, initial, onDone }: { data: TemplatesResponse; id
           </Field>
         </div>
         <div className="sm:sticky sm:top-4 sm:self-start">
-          <CaptionPreview style={c} fonts={data.fonts} className="w-full" />
+          <CaptionPreview style={c} hook={h} fonts={data.fonts} className="w-full" />
           <p className="mt-2 text-xs text-muted-foreground">Preview. The render uses the same font file.</p>
         </div>
       </div>

@@ -190,7 +190,7 @@ From now on the bot ignores every other chat.
 | Page | For |
 |---|---|
 | **Overview** | Clips waiting for you, what OpenShorts is rendering right now (with its latest log line), problems with a one-click fix (retry a job, scan again, resend a Telegram message), the last 7 days and recent activity. The strip at the top is always visible: OpenShorts, queue, Telegram delivery, free disk. |
-| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**: the new version is sent to Telegram again with fresh ✅/❌ buttons. **Post it yourself** downloads the clip and copies its TikTok, Instagram and YouTube text (what publishing would post, credit line included). The **Approved** tab downloads all approved clips as one zip, with their `.json` files. |
+| **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **✨ Suggest** asks Gemini for fresh hook lines; **Put this hook on the video** re-renders the clip with the new one. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**: the new version is sent to Telegram again with fresh ✅/❌ buttons. **Post it yourself** downloads the clip and copies its TikTok, Instagram and YouTube text (what publishing would post, credit line included). The **Approved** tab downloads all approved clips as one zip, with their `.json` files. |
 | **Editor** | Review → **Open the editor**: a timeline with the waveform, cuts, captions, sound effects and zooms over a live preview ([below](#clip-editor)). |
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
@@ -299,6 +299,7 @@ right away; **Render** makes the real file and sends it to Telegram again.
 | Captions | The **Captions** tab lists every line: fix a misheard word or empty a line to drop it. Timing stays. **Reset** brings the transcript back. |
 | Effects | **Effect here** (**E**) or the **Effects** tab: sound, volume, preview; drag the diamonds to move them. They come on top of the template's own effects. |
 | Zooms | **Zoom here** (**Z**): a quick punch-in on the picture (captions stay put); drag to move or resize, set how far it zooms. |
+| Hook | The **Hook** tab: the hook text (with **✨ Suggest** from Gemini), on or off for this clip, top/middle/bottom, and when it shows. Drag the hook bar to move it, its ends to make it show longer. A dashed bar is the template's timing. |
 
 The **Length** tab has OpenShorts cut the clip again from the stream: start up to 15 s earlier, end
 later, or change the framing (follow the speaker, or the whole frame with blurred bars). Your cuts,
@@ -371,8 +372,8 @@ hands it the job's id. If the dashboard says deletions are waiting, start it: `d
 
 ## Templates: captions, music and sound effects
 
-OpenShorts cuts and reframes the clip and burns in the hook line; clipbot then gives it the captions,
-music and sound effects of a **template**. It keeps a copy without captions plus the clip's words until
+OpenShorts cuts and reframes the clip and writes its hook line; clipbot then gives it the captions,
+hook, music and sound effects of a **template**. It keeps a copy without captions plus the clip's words until
 you decide on it, so you can switch a clip to another template in Review and render it again.
 
 Five come built in (edit, copy or delete them on the **Templates** page):
@@ -387,6 +388,15 @@ Five come built in (edit, copy or delete them on the **Templates** page):
 
 Pick one per job with `t=<name>` in Telegram (`https://twitch.tv/videos/123 1:02:00-1:12:00 t=meme`) or in
 **New job**; jobs without one use the default.
+
+**The hook line** is the text over the first seconds that makes people stop scrolling. OpenShorts' AI
+writes one per clip; clipbot draws it in the template's hook look: a box behind the text, an outline,
+or a plain shadow, in any font and color, at the top, middle or bottom, for the first few seconds (or
+the whole clip). Emoji are left off the video, since no caption font has them. Per clip, change the
+text in Review or the editor (**✨ Suggest** writes five new ones with Gemini), and in the editor turn
+it off, move it, or change when it shows. `AUTO_HOOK=false` in `.env` turns hooks off unless a clip
+asks for one. Clips made before this version have OpenShorts' own hook in the video, so their hook
+can't change (a re-cut in the editor's **Length** tab fixes that).
 
 **Sounds** live in `data/sounds/`; upload them on the Templates page or copy them there. A template names
 a sound by its file name without the extension, so `vine-boom.mp3` is `vine-boom`. Nothing is bundled:

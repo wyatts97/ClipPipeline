@@ -1,8 +1,8 @@
 import { cn } from "cn"
 import { useLayoutEffect, useMemo, useRef, useState } from "react"
 
-import type { HandEffect, Word, Zoom } from "@/lib/api"
-import { MIN_SEGMENT, type Segment } from "@/lib/edit"
+import type { ClipHook, HandEffect, Word, Zoom } from "@/lib/api"
+import { type HookWindow, MIN_SEGMENT, type Segment } from "@/lib/edit"
 
 export type Selection = { kind: "segment" | "sfx" | "zoom"; index: number } | null
 
@@ -10,14 +10,18 @@ const RULER = 20
 const CLIP = 64
 const TRACK = 28
 const GAP = 6
-const LANES = { clip: RULER, words: RULER + CLIP + GAP, sfx: RULER + CLIP + GAP * 2 + TRACK, zoom: RULER + CLIP + GAP * 3 + TRACK * 2 }
-const HEIGHT = LANES.zoom + TRACK + 4
+const LANES = {
+  clip: RULER, words: RULER + CLIP + GAP, sfx: RULER + CLIP + GAP * 2 + TRACK, zoom: RULER + CLIP + GAP * 3 + TRACK * 2,
+  hook: RULER + CLIP + GAP * 4 + TRACK * 3,
+}
+const HEIGHT = LANES.hook + TRACK + 4
 
 type Drag =
   | { kind: "seek" }
   | { kind: "segment"; index: number; edge: "start" | "end" }
   | { kind: "sfx"; index: number; offset: number }
   | { kind: "zoom"; index: number; edge: "start" | "end" | "move"; offset: number }
+  | { kind: "hook"; edge: "start" | "end" | "move"; offset: number }
 
 /** The editor's timeline, in source seconds. Changes during a drag go to onLive; the final value
  * goes to onCommit (for undo). */
@@ -28,16 +32,18 @@ export function EditTimeline(props: {
   words: Word[]
   sfx: HandEffect[]
   zooms: Zoom[]
+  /** The hook's window (null: this clip's hook can't change) and the clip's own hook settings. */
+  hook: { window: HookWindow; own: ClipHook; text: string } | null
   peaks: number[]
   perSecond: number
   selection: Selection
   scale: number
   onSeek: (t: number) => void
   onSelect: (s: Selection) => void
-  onLive: (patch: { segments?: Segment[]; sfx?: HandEffect[]; zooms?: Zoom[] }) => void
+  onLive: (patch: { segments?: Segment[]; sfx?: HandEffect[]; zooms?: Zoom[]; hook?: ClipHook }) => void
   onCommit: () => void
 }) {
-  const { duration, segments, sfx, zooms, scale } = props
+  const { duration, segments, sfx, zooms, scale, hook } = props
   const wrap = useRef<HTMLDivElement>(null)
   const svg = useRef<SVGSVGElement>(null)
   const drag = useRef<Drag | null>(null)
@@ -91,6 +97,18 @@ export function EditTimeline(props: {
       props.onSeek(d.edge === "start" ? segs[d.index][0] : Math.max(0, segs[d.index][1] - 0.05))
     } else if (d.kind === "sfx") {
       props.onLive({ sfx: sfx.map((x, i) => (i === d.index ? { ...x, t: +Math.max(0, t - d.offset).toFixed(2) } : x)) })
+    } else if (d.kind === "hook") {
+      if (!hook) return
+      const { s, e } = hook.window
+      let ns = s
+      let ne = e
+      if (d.edge === "move") {
+        ns = Math.min(duration - (e - s), Math.max(0, t - d.offset))
+        ne = ns + (e - s)
+      } else if (d.edge === "start") ns = Math.min(e - MIN_SEGMENT, Math.max(0, t))
+      else ne = Math.max(s + MIN_SEGMENT, Math.min(duration, t))
+      // Dragged to the very end: "until the end", so it stays there after a trim.
+      props.onLive({ hook: { ...hook.own, s: +ns.toFixed(2), e: ne >= duration - 0.05 ? null : +ne.toFixed(2) } })
     } else {
       const z = zooms[d.index]
       let next: Zoom
@@ -199,6 +217,23 @@ export function EditTimeline(props: {
           )
         })}
 
+        {/* hook */}
+        {hook && (
+          <g>
+            <rect x={x(hook.window.s)} y={LANES.hook} width={Math.max(4, x(hook.window.e) - x(hook.window.s))} height={TRACK - 4} rx={3}
+              className={cn("cursor-grab", hook.window.on ? "fill-chart-5/35 stroke-chart-5" : "fill-muted-foreground/10 stroke-muted-foreground/50")}
+              strokeDasharray={hook.window.own ? undefined : "4 3"}
+              onPointerDown={(ev) => start(ev, { kind: "hook", edge: "move", offset: timeAt(ev.clientX) - hook.window.s })} />
+            <text x={x(hook.window.s) + 4} y={LANES.hook + 16} className="pointer-events-none fill-foreground text-[10px]">
+              {(hook.window.on ? hook.text || "No hook text" : "Hook off").slice(0, Math.max(0, Math.floor((x(hook.window.e) - x(hook.window.s) - 8) / 6)))}
+            </text>
+            <rect x={x(hook.window.s) - 3} y={LANES.hook} width={6} height={TRACK - 4} className="cursor-ew-resize fill-transparent"
+              onPointerDown={(ev) => start(ev, { kind: "hook", edge: "start", offset: 0 })} />
+            <rect x={x(hook.window.e) - 3} y={LANES.hook} width={6} height={TRACK - 4} className="cursor-ew-resize fill-transparent"
+              onPointerDown={(ev) => start(ev, { kind: "hook", edge: "end", offset: 0 })} />
+          </g>
+        )}
+
         {/* playhead */}
         <line x1={x(props.time)} x2={x(props.time)} y1={0} y2={HEIGHT} className="pointer-events-none stroke-primary" strokeWidth={2} />
         <path d={`M ${x(props.time) - 5} 0 L ${x(props.time) + 5} 0 L ${x(props.time)} 7 Z`} className="pointer-events-none fill-primary" />
@@ -212,5 +247,6 @@ export const TRACK_LABELS = [
   { label: "Clip", height: CLIP + GAP },
   { label: "Captions", height: TRACK + GAP },
   { label: "Effects", height: TRACK + GAP },
-  { label: "Zooms", height: TRACK + 4 },
+  { label: "Zooms", height: TRACK + GAP },
+  { label: "Hook", height: TRACK + 4 },
 ]

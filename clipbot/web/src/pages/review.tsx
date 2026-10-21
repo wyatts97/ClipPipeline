@@ -1,10 +1,11 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { Copy, Download, Scissors } from "lucide-react"
+import { Copy, Download, Scissors, Sparkles } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link } from "react-router"
 import { toast } from "sonner"
 
+import { stripEmoji } from "@/components/caption-preview"
 import { ClipThumb } from "@/components/clip-thumb"
 import { NativeSelect } from "@/components/native-select"
 import { Status } from "@/components/status"
@@ -204,11 +205,7 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
             <Label htmlFor="title">Title</Label>
             <Input id="title" {...field("title")} />
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="hook">Hook text on the video</Label>
-            <Input id="hook" {...field("hook")} />
-            <p className="text-xs text-muted-foreground">Already burned into this render; editing it updates the saved metadata.</p>
-          </div>
+          <HookField clip={clip} value={draft.hook ?? ""} onChange={(hook) => setDraft({ ...draft, hook })} />
           <div className="space-y-1.5">
             <Label htmlFor="tiktok">TikTok caption</Label>
             <Textarea id="tiktok" rows={3} {...field("description_tiktok")} />
@@ -244,6 +241,65 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
         )}
       </div>
     </>
+  )
+}
+
+/** The hook line: edit it, get ideas from Gemini, and draw the new one onto the video. */
+export function HookField({ clip, value, onChange, id = "hook" }: {
+  clip: Clip; value: string; onChange: (v: string) => void; id?: string
+}) {
+  const qc = useQueryClient()
+  const [ideas, setIdeas] = useState<string[] | null>(null)
+  const suggest = useMutation({
+    mutationFn: () => api.suggestHooks(clip.id),
+    onSuccess: (r) => { setIdeas(r.suggestions); if (!r.suggestions.length) toast("No ideas this time. Try again.") },
+  })
+  const apply = useMutation({
+    mutationFn: () => api.saveEdit(clip.id, { hook_text: value }),
+    onSuccess: () => {
+      toast("Rendering…", { description: "The clip reloads with the new hook." })
+      qc.invalidateQueries({ queryKey: ["clips"] })
+    },
+  })
+  const rendering = clip.render_state === "rendering"
+  const drawn = clip.hook_rendered          // null: OpenShorts drew it, it can't change
+  const differs = drawn !== null && clip.hook_on && stripEmoji(value) !== drawn
+
+  return (
+    <div className="space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <Label htmlFor={id}>Hook text on the video</Label>
+        {clip.can_render && drawn !== null && (
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={suggest.isPending}
+            onClick={() => suggest.mutate()}>
+            <Sparkles /> {suggest.isPending ? "Thinking…" : "Suggest"}
+          </Button>
+        )}
+      </div>
+      <Input id={id} value={value} maxLength={200} onChange={(e) => onChange(e.target.value)} />
+      {ideas && ideas.length > 0 && (
+        <ul className="space-y-1 rounded-md border border-border p-1.5" aria-label="Hook ideas">
+          {ideas.map((idea) => (
+            <li key={idea}>
+              <button type="button" onClick={() => { onChange(idea); setIdeas(null) }}
+                className="w-full rounded-sm px-2 py-1 text-left text-sm hover:bg-accent">{idea}</button>
+            </li>
+          ))}
+        </ul>
+      )}
+      {differs && clip.can_render && (
+        <Button size="sm" className="w-full" disabled={rendering || apply.isPending} onClick={() => apply.mutate()}>
+          {rendering ? "Rendering…" : "Put this hook on the video"}
+        </Button>
+      )}
+      <p className="text-xs text-muted-foreground">
+        {drawn === null ? "OpenShorts drew this clip's hook into the video, so changing it only updates the saved text."
+          : !clip.hook_on ? "This clip shows no hook (turned off in its template or the editor). The text is still saved."
+            : !clip.can_render ? "Drawn into this render; editing it updates the saved text."
+              : differs ? "The video still shows the old hook until you put this one on. Emoji are left off the video."
+                : "Drawn by clipbot in the template's hook look. Change when and where it shows in the editor."}
+      </p>
+    </div>
   )
 }
 

@@ -1,6 +1,6 @@
 // The clip editor's time maps and caption grouping, mirroring clipbot/app/editing.py and
 // captions.group_words so the live preview matches the render.
-import type { ClipEdit, Word } from "./api"
+import type { CaptionPosition, ClipEdit, HookStyle, Word } from "./api"
 
 export const MIN_SEGMENT = 0.3
 export const FRAME = 1 / 30
@@ -20,6 +20,44 @@ export function mapTime(t: number, segments: Segment[]): number | null {
 
 export function outputDuration(segments: Segment[]): number {
   return segments.reduce((n, [s, e]) => n + e - s, 0)
+}
+
+/** The source time that plays at time t of the edited clip (mapTime the other way). */
+export function sourceTime(t: number, segments: Segment[]): number {
+  let offset = 0
+  for (const [s, e] of segments) {
+    if (t < offset + e - s) return s + t - offset
+    offset += e - s
+  }
+  return segments[segments.length - 1]?.[1] ?? t
+}
+
+export interface HookWindow {
+  s: number            // source seconds
+  e: number
+  on: boolean
+  own: boolean         // the clip's own timing (else the template's)
+  position: CaptionPosition
+  outEnd: number | null   // template timing: where it stops on the edited clip
+}
+
+/** When and where the hook shows, like pipeline.hook_plan and editing.hook_window. */
+export function hookWindow(edit: ClipEdit, look: HookStyle, autoHook: boolean, duration: number): HookWindow {
+  const own = edit.hook ?? {}
+  const segments = edit.segments as Segment[]
+  const on = own.enabled ?? (look.enabled && autoHook)
+  const position = own.position ?? look.position
+  if (own.s !== undefined) return { s: own.s, e: own.e ?? duration, on, own: true, position, outEnd: null }
+  const total = outputDuration(segments)
+  const end = look.duration > 0 ? Math.min(total, look.duration) : total
+  return { s: segments[0]?.[0] ?? 0, e: sourceTime(end, segments), on, own: false, position, outEnd: end }
+}
+
+/** Whether the hook is on screen at source time t. */
+export function hookShows(w: HookWindow, t: number, segments: Segment[]): boolean {
+  const out = mapTime(t, segments)
+  if (!w.on || out === null) return false
+  return w.outEnd !== null ? out < w.outEnd : t >= w.s && t < w.e
 }
 
 /** The kept segment containing t, or the next one after it (null past the end). */

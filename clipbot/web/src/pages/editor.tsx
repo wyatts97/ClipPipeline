@@ -1,27 +1,32 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
 import {
-  ArrowLeft, ChevronLeft, ChevronRight, Pause, Play, Plus, Redo2, Scissors, Trash2, Undo2, ZoomIn,
+  ArrowLeft, ChevronLeft, ChevronRight, Pause, Play, Plus, Redo2, Scissors, Sparkles, Trash2, Undo2, ZoomIn,
 } from "lucide-react"
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { Link, useParams } from "react-router"
 import { toast } from "sonner"
 
-import { CaptionLayer, useFont } from "@/components/caption-preview"
+import { CaptionLayer, emOf, HookLayer, useFont } from "@/components/caption-preview"
 import { EditTimeline, TRACK_LABELS, type Selection } from "@/components/edit-timeline"
 import { NativeSelect } from "@/components/native-select"
 import { Button } from "@/components/ui/button"
+import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
-import { api, type ClipEdit, type EditorData, type HandEffect, type TemplatesResponse, type Word, type Zoom } from "@/lib/api"
 import {
-  captionAt, FRAME, fmt, groupWords, keptWords, mapTime, nextKept, outputDuration, retime, segmentAt, split,
-  type Segment, zoomAt,
+  api, type CaptionPosition, type ClipEdit, type ClipHook, type EditorData, type HandEffect, type HookStyle,
+  type TemplatesResponse, type Word, type Zoom,
+} from "@/lib/api"
+import {
+  captionAt, FRAME, fmt, groupWords, hookShows, hookWindow, type HookWindow, keptWords, mapTime, MIN_SEGMENT, nextKept,
+  outputDuration, retime, segmentAt, split, type Segment, zoomAt,
 } from "@/lib/edit"
 import { SoundSelect } from "@/pages/templates"
 
-interface Doc { edit: ClipEdit; sfx: HandEffect[]; words: Word[]; template: string }
+interface Doc { edit: ClipEdit; sfx: HandEffect[]; words: Word[]; template: string; hookText: string }
 
 export function EditorPage() {
   const { clipId } = useParams()
@@ -51,7 +56,9 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
   const qc = useQueryClient()
   const clipId = data.clip.id
   const fallbackTemplate = data.template ?? templates.default ?? templates.items[0]?.id ?? ""
-  const initial = useMemo<Doc>(() => ({ edit: data.edit, sfx: data.sfx, words: data.words, template: fallbackTemplate }),
+  const initial = useMemo<Doc>(() => ({
+    edit: data.edit, sfx: data.sfx, words: data.words, template: fallbackTemplate, hookText: data.clip.hook ?? "",
+  }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
     [])
   const [doc, setDoc] = useState<Doc>(initial)
@@ -74,7 +81,10 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
     setDoc({
       ...cur,
       sfx: patch.sfx ?? cur.sfx,
-      edit: { segments: patch.segments ?? cur.edit.segments, zooms: patch.zooms ?? cur.edit.zooms },
+      edit: {
+        ...cur.edit, segments: patch.segments ?? cur.edit.segments, zooms: patch.zooms ?? cur.edit.zooms,
+        hook: patch.hook ?? cur.edit.hook,
+      },
     })
   }, [])
   const endDrag = useCallback(() => {
@@ -102,7 +112,10 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
   const segments = doc.edit.segments as Segment[]
   const template = templates.items.find((t) => t.id === doc.template) ?? templates.items[0]
   const style = template?.captions
+  const look = template?.hook ?? templates.hook_default
   useFont(templates.fonts, style?.font_name ?? "Anton")
+  useFont(templates.fonts, look.font_name)
+  const hookFixed = data.clip.hook_rendered === null     // OpenShorts drew it into the video
   const dirty = JSON.stringify(doc) !== JSON.stringify(saved)
   const rendering = data.clip.render_state === "rendering"
 
@@ -214,7 +227,10 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
 
   // ---- render ------------------------------------------------------------------------------------
   const render = useMutation({
-    mutationFn: () => api.saveEdit(clipId, { template: doc.template || undefined, sfx: doc.sfx, edit: doc.edit, words: doc.words }),
+    mutationFn: () => api.saveEdit(clipId, {
+      template: doc.template || undefined, sfx: doc.sfx, edit: doc.edit, words: doc.words,
+      hook_text: hookFixed ? undefined : doc.hookText,
+    }),
     onSuccess: () => { setSaved(doc); qc.invalidateQueries({ queryKey: ["editor", clipId] }) },
   })
   const wasRendering = useRef(rendering)
@@ -235,6 +251,7 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
     [doc.words, segments, style])
   const caption = captionAt(blocks, time)
   const zoom = zoomAt(doc.edit, time)
+  const hookWin = hookWindow(doc.edit, look, templates.auto_hook, duration)
   const outTime = mapTime(time, segments)
   const outTotal = outputDuration(segments)
   const peaks = useQuery({ queryKey: ["peaks", data.peaks_url], queryFn: () => api.peaks(data.peaks_url), staleTime: Infinity })
@@ -265,14 +282,16 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
             <Button size="sm" variant={view === "edit" ? "secondary" : "ghost"} onClick={() => setView("edit")}>Edit preview</Button>
             <Button size="sm" variant={view === "render" ? "secondary" : "ghost"} onClick={() => setView("render")}>Last render</Button>
             <span className="ml-auto self-center text-xs text-muted-foreground">
-              {view === "edit" ? "Live preview: cuts, captions, zooms and your effects. Music and template effects play in the render." : "The finished clip as Telegram got it."}
+              {view === "edit" ? "Live preview: cuts, captions, the hook, zooms and your effects. Music and template effects play in the render." : "The finished clip as Telegram got it."}
             </span>
           </div>
           {view === "edit" ? (
             <div className="relative aspect-[9/16] h-[min(62vh,44rem)] overflow-hidden rounded-sm bg-black" style={{ containerType: "size" }}>
               <video ref={video} src={data.source_url} playsInline preload="auto" className="absolute inset-0 size-full object-contain"
                 style={{ transform: `scale(${zoom})` }} onClick={toggle} />
-              {style && <CaptionLayer style={style} line={caption.line} active={caption.active} />}
+              {!hookFixed && hookShows(hookWin, time, segments) && <HookLayer hook={look} text={doc.hookText} position={hookWin.position}
+                em={emOf(templates.fonts, look.font_name)} />}
+              {style && <CaptionLayer style={style} line={caption.line} active={caption.active} em={emOf(templates.fonts, style.font_name)} />}
               {outTime === null && <div className="pointer-events-none absolute inset-0 grid place-items-center bg-black/60 text-sm text-white/80">Cut</div>}
             </div>
           ) : (
@@ -283,6 +302,7 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
         <Tabs defaultValue="captions" className="min-w-0">
           <TabsList className="w-full">
             <TabsTrigger value="captions">Captions</TabsTrigger>
+            <TabsTrigger value="hook">Hook</TabsTrigger>
             <TabsTrigger value="effects">Effects</TabsTrigger>
             <TabsTrigger value="zooms">Zooms</TabsTrigger>
             <TabsTrigger value="length">Length</TabsTrigger>
@@ -290,6 +310,12 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
           <TabsContent value="captions">
             <CaptionsPanel words={doc.words} segments={segments} maxChars={style?.max_chars ?? 16} maxDuration={style?.max_duration ?? 1.4}
               original={data.words_original ?? data.words} onSeek={seek} onChange={(words) => commit({ ...doc, words })} />
+          </TabsContent>
+          <TabsContent value="hook">
+            <HookPanel clipId={clipId} fixed={hookFixed} text={doc.hookText} own={doc.edit.hook ?? {}} window={hookWin} look={look}
+              time={time} playhead={playhead} duration={duration} onSeek={seek}
+              onText={(hookText) => commit({ ...doc, hookText })}
+              onChange={(hook) => setEdit({ hook: Object.keys(hook).length ? hook : undefined })} />
           </TabsContent>
           <TabsContent value="effects">
             <EffectsPanel sfx={doc.sfx} sounds={templates.sounds} onSeek={seek} onAdd={addEffect} onPlay={playSound}
@@ -328,12 +354,14 @@ function Editor({ data, templates }: { data: EditorData; templates: TemplatesRes
           </div>
           <EditTimeline duration={duration} time={time} segments={segments} words={doc.words} sfx={doc.sfx}
             zooms={doc.edit.zooms} peaks={peaks.data?.peaks ?? []} perSecond={peaks.data?.per_second ?? 50}
+            hook={hookFixed ? null : { window: hookWin, own: doc.edit.hook ?? {}, text: doc.hookText }}
             selection={selection} scale={scale} onSeek={seek} onSelect={setSelection}
             onLive={live} onCommit={endDrag} />
         </div>
         <p className="text-xs text-muted-foreground">
           Space plays · ←/→ one frame (Shift: one second) · S splits at the playhead · select a part and Delete cuts it · drag the
-          edges of a part to trim it · Z adds a zoom · E an effect · Ctrl+Z undoes. Rendering sends the new version to Telegram.
+          edges of a part to trim it · drag the hook or its ends · Z adds a zoom · E an effect · Ctrl+Z undoes. Rendering sends
+          the new version to Telegram.
         </p>
       </section>
     </div>
@@ -382,13 +410,119 @@ function CaptionsPanel({ words, segments, maxChars, maxDuration, original, onSee
   )
 }
 
-function LineInput({ text, onCommit }: { text: string; onCommit: (text: string) => void }) {
+function LineInput({ text, onCommit, id, className = "h-8" }: {
+  text: string; onCommit: (text: string) => void; id?: string; className?: string
+}) {
   const [value, setValue] = useState(text)
   useEffect(() => setValue(text), [text])
   const done = () => { if (value.trim() !== text) onCommit(value.trim()) }
   return (
-    <Input value={value} className="h-8" onChange={(e) => setValue(e.target.value)} onBlur={done}
+    <Input id={id} value={value} className={className} maxLength={200} onChange={(e) => setValue(e.target.value)} onBlur={done}
       onKeyDown={(e) => { if (e.key === "Enter") (e.target as HTMLInputElement).blur(); if (e.key === "Escape") setValue(text) }} />
+  )
+}
+
+function HookPanel({ clipId, fixed, text, own, window: w, look, time, playhead, duration, onSeek, onText, onChange }: {
+  clipId: string; fixed: boolean; text: string; own: ClipHook; window: HookWindow; look: HookStyle; time: number
+  playhead: () => number; duration: number; onSeek: (t: number) => void; onText: (text: string) => void
+  onChange: (hook: ClipHook) => void
+}) {
+  const [ideas, setIdeas] = useState<string[] | null>(null)
+  const suggest = useMutation({
+    mutationFn: () => api.suggestHooks(clipId),
+    onSuccess: (r) => { setIdeas(r.suggestions); if (!r.suggestions.length) toast("No ideas this time. Try again.") },
+  })
+  if (fixed) {
+    return (
+      <p className="pt-2 text-sm text-muted-foreground">
+        OpenShorts drew this clip's hook into the video before clipbot drew hooks itself, so it can't change here. Clips
+        made from now on, and this one after a re-cut (Length), get an editable hook.
+      </p>
+    )
+  }
+  const set = (patch: Partial<ClipHook>) => {
+    const next: ClipHook = { ...own, ...patch }
+    for (const k of Object.keys(next) as (keyof ClipHook)[]) if (next[k] === undefined) delete next[k]
+    onChange(next)
+  }
+  const at = +time.toFixed(2)
+  const withoutTiming = { ...own }
+  delete withoutTiming.s
+  delete withoutTiming.e
+  return (
+    <div className="space-y-5 pt-2 text-sm">
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between gap-2">
+          <Label htmlFor="ed-hook">Hook text</Label>
+          <Button variant="ghost" size="sm" className="h-7 px-2 text-xs" disabled={suggest.isPending} onClick={() => suggest.mutate()}>
+            <Sparkles /> {suggest.isPending ? "Thinking…" : "Suggest"}
+          </Button>
+        </div>
+        <LineInput id="ed-hook" text={text} onCommit={onText} className="h-9" />
+        {ideas && ideas.length > 0 && (
+          <ul className="space-y-1 rounded-md border border-border p-1.5" aria-label="Hook ideas">
+            {ideas.map((idea) => (
+              <li key={idea}>
+                <button type="button" onClick={() => { onText(idea); setIdeas(null) }}
+                  className="w-full rounded-sm px-2 py-1 text-left hover:bg-accent">{idea}</button>
+              </li>
+            ))}
+          </ul>
+        )}
+        <p className="text-xs text-muted-foreground">Press Enter or click away to see it. Emoji are left off the video.</p>
+      </div>
+
+      <label className="flex items-center gap-2">
+        <Checkbox checked={w.on} onCheckedChange={(v) => set({ enabled: !!v })} /> Show the hook on this clip
+      </label>
+
+      <label className="block space-y-1 text-xs text-muted-foreground">Position
+        <NativeSelect value={own.position ?? ""} onChange={(e) => set({ position: (e.target.value || undefined) as CaptionPosition | undefined })}>
+          <option value="">The template's ({look.position})</option>
+          <option value="top">top</option>
+          <option value="middle">middle</option>
+          <option value="bottom">bottom</option>
+        </NativeSelect>
+      </label>
+
+      <div className="space-y-2">
+        <span className="text-xs text-muted-foreground">When it shows</span>
+        <p>
+          {w.own ? (
+            <>
+              <button className="timecode text-primary hover:underline" onClick={() => onSeek(w.s)}>{fmt(w.s)}</button> to{" "}
+              {own.e == null ? "the end" : <button className="timecode text-primary hover:underline" onClick={() => onSeek(w.e)}>{fmt(w.e)}</button>}
+            </>
+          ) : look.duration ? `The template's: the first ${look.duration} s` : "The template's: the whole clip"}
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          <Button size="sm" variant="outline" disabled={at > duration - MIN_SEGMENT}
+            onClick={() => {
+              const t = +playhead().toFixed(2)
+              set({ s: t, e: own.s !== undefined && own.e == null ? null : w.e > t + MIN_SEGMENT ? +w.e.toFixed(2) : null })
+            }}>
+            Start at playhead
+          </Button>
+          <Button size="sm" variant="outline" disabled={at < MIN_SEGMENT}
+            onClick={() => {
+              const t = +playhead().toFixed(2)
+              set({ s: +Math.max(0, Math.min(w.s, t - MIN_SEGMENT)).toFixed(2), e: t })
+            }}>
+            End at playhead
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => set({ s: +w.s.toFixed(2), e: null })}>Until the end</Button>
+          {w.own && <Button size="sm" variant="ghost" onClick={() => onChange(withoutTiming)}>Template's timing</Button>}
+        </div>
+      </div>
+
+      <div className="space-y-2 border-t border-border pt-4">
+        <p className="text-xs text-muted-foreground">
+          The look (font, colors, box) comes from the template. Drag the hook on the timeline to move it, or its ends to change
+          how long it shows. Render to put it on the video.
+        </p>
+        {Object.keys(own).length > 0 && <Button size="sm" variant="ghost" onClick={() => onChange({})}>Reset to the template</Button>}
+      </div>
+    </div>
   )
 }
 

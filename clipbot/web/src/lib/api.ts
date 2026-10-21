@@ -81,11 +81,17 @@ export interface Clip {
   download_url: string
   post_text: { youtube_title: string; youtube: string; tiktok: string; instagram: string }
   edited: boolean
+  /** The hook line drawn on the video now ("" = none). null: OpenShorts drew it, so it can't change. */
+  hook_rendered: string | null
+  /** Whether a render draws the hook (the clip's own switch, else the template's and AUTO_HOOK). */
+  hook_on: boolean
 }
 
 export interface Word { w: string; s: number; e: number }
 export interface Zoom { s: number; e: number; scale: number }
-export interface ClipEdit { segments: [number, number][]; zooms: Zoom[] }
+/** This clip's own hook settings; a missing key means the template's. e null: to the end. */
+export interface ClipHook { enabled?: boolean; s?: number; e?: number | null; position?: CaptionPosition }
+export interface ClipEdit { segments: [number, number][]; zooms: Zoom[]; hook?: ClipHook }
 
 export interface EditorData {
   clip: Clip
@@ -154,6 +160,21 @@ export interface CaptionStyle {
   bg_color: string
 }
 
+export type HookStyleName = "box" | "outline" | "plain"
+
+export interface HookStyle {
+  enabled: boolean
+  style: HookStyleName
+  font_name: string
+  font_size: number
+  text_color: string
+  box_color: string
+  outline_color: string
+  position: CaptionPosition
+  duration: number      // seconds from the start; 0 = the whole clip
+  uppercase: boolean
+}
+
 export interface SfxRule {
   sounds: string[]      // one is picked per effect (never the same twice in a row)
   at: Trigger
@@ -166,6 +187,7 @@ export interface SfxRule {
 export interface TemplateBody {
   name: string
   captions: CaptionStyle
+  hook: HookStyle
   music: { sound: string | null; volume: number; duck: boolean; start: number }
   voice_volume: number
   sfx: SfxRule[]
@@ -178,7 +200,9 @@ export interface Template extends TemplateBody {
   missing_sounds: string[]
 }
 
-export interface FontItem { family: string; file: string; bundled: boolean }
+/** em: the font's em next to its ASS size (how libass sizes it); weight: its OS/2 weight. For previews
+ * that match the burn. */
+export interface FontItem { family: string; file: string; bundled: boolean; em: number; weight: number }
 export interface SoundItem { name: string; file: string; size: number; duration: number | null }
 
 export interface TemplatesResponse {
@@ -192,6 +216,9 @@ export interface TemplatesResponse {
   sounds: string[]
   kinds: Record<MomentKind, string>
   gemini: boolean
+  hook_styles: HookStyleName[]
+  hook_default: HookStyle
+  auto_hook: boolean
 }
 
 export interface Scan {
@@ -464,8 +491,9 @@ export const api = {
 
   editor: (clipId: string) => request<EditorData>(`/api/clips/${clipId}/editor`),
   peaks: (url: string) => request<{ per_second: number; peaks: number[] }>(url),
-  saveEdit: (clipId: string, body: { template?: string; sfx?: HandEffect[]; edit?: ClipEdit; words?: Word[] }) =>
+  saveEdit: (clipId: string, body: { template?: string; sfx?: HandEffect[]; edit?: ClipEdit; words?: Word[]; hook_text?: string }) =>
     post<Clip>(`/api/clips/${clipId}/edit`, body),
+  suggestHooks: (clipId: string) => post<{ suggestions: string[] }>(`/api/clips/${clipId}/hook-suggestions`),
   recut: (clipId: string, body: { extend_start: number; extend_end: number; framing?: string | null }) =>
     post<Clip>(`/api/clips/${clipId}/recut`, body),
 

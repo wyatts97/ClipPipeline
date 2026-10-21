@@ -108,6 +108,7 @@ async def seed(settings: Settings) -> None:
         await media.make_thumbnail(master, thumbs / f"{done.id}_{i}.jpg")
         clip = store.add_clip(done.id, i, title, hook, {
             "video_title_for_youtube_short": title, "viral_hook_text": hook,
+            "hook_rendered": "",          # the demo videos have no hook yet: re-render to draw it
             "video_description_for_tiktok": f"{title} #twitch #streamer #clips",
             "video_description_for_instagram": f"{title}. Follow for daily clips."}, float(5 + i), str(master), None)
         # Re-renderable in Review: a copy without captions, and the words to caption it with.

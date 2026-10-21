@@ -99,7 +99,7 @@ def test_url_job_end_to_end(env, settings):
     assert job.status == "processing" and job.openshorts_job == OS_JOB
     body = fake_os.process_bodies[0]
     assert body["acknowledged"] is True and body["url"] == "https://youtu.be/abc"
-    assert body["layouts"] == ["auto"] and body["target_clips"] == 3 and body["auto_hook"] is True
+    assert body["layouts"] == ["auto"] and body["target_clips"] == 3 and body["auto_hook"] is False   # clipbot burns it
     assert body["captions"] is False   # clipbot burns them, in the job's template
 
     run(pipeline.poll_job(job))

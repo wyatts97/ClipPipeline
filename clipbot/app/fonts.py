@@ -49,8 +49,29 @@ def family_name(path: Path) -> Optional[str]:
         return None
 
 
+def metrics(path: Path) -> dict[str, float]:
+    """What the dashboard previews need to match the burned text: em, how big the font's em is next to
+    an ASS font size (libass sizes a font so its Windows ascent plus descent, OS/2 usWinAscent +
+    usWinDescent, fills the size, like VSFilter did), and weight (OS/2 usWeightClass: libass makes
+    lighter fonts bold itself)."""
+    try:
+        data = path.read_bytes()
+        (num_tables,) = struct.unpack(">H", data[4:6])
+        tables = {}
+        for i in range(num_tables):
+            tag, _, offset, _ = struct.unpack(">4sIII", data[12 + 16 * i: 28 + 16 * i])
+            tables[tag] = offset
+        (units,) = struct.unpack(">H", data[tables[b"head"] + 18: tables[b"head"] + 20])
+        os2 = tables[b"OS/2"]
+        (weight,) = struct.unpack(">H", data[os2 + 4: os2 + 6])
+        ascent, descent = struct.unpack(">HH", data[os2 + 74: os2 + 78])
+        return {"em": round(units / (ascent + descent), 3) if ascent + descent else 0.7, "weight": weight or 400}
+    except (OSError, struct.error, KeyError):
+        return {"em": 0.7, "weight": 400}
+
+
 def list_fonts(settings: Settings) -> list[dict]:
-    """[{family, file, bundled}] for every usable font, bundled first."""
+    """[{family, file, bundled, em, weight}] for every usable font, bundled first."""
     out, seen = [], set()
     for folder, bundled in ((BUNDLED_DIR, True), (settings.data_dir / "fonts", False)):
         if not folder.is_dir():
@@ -61,7 +82,7 @@ def list_fonts(settings: Settings) -> list[dict]:
             family = family_name(path)
             if family and family.lower() not in seen:
                 seen.add(family.lower())
-                out.append({"family": family, "file": path.name, "bundled": bundled})
+                out.append({"family": family, "file": path.name, "bundled": bundled, **metrics(path)})
     return out
 
 

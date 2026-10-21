@@ -154,11 +154,16 @@ def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional
     version = int(video.stat().st_mtime) if video.is_file() else 0
     clean = settings.data_dir / "clean" / f"{clip.job_id}_{clip.idx}.mp4"
     template = store.get_template(clip.template) if store and clip.template else None
+    own_hook = (json.loads(clip.edit) if clip.edit else {}).get("hook") or {}
+    hook_look = captions.normalize_hook((template or {}).get("hook"))
     return {
         "template": clip.template, "template_name": (template or {}).get("name"),
         "sfx": clip.manual_sfx(), "render_state": clip.render_state, "render_error": clip.render_error,
         "can_render": clip.status == "pending" and clean.is_file(), "credit": meta.get("credit"),
         "edited": edited(clip),
+        "hook_rendered": meta.get("hook_rendered"),
+        # Whether a render draws the hook: the clip's own switch, else its template's and AUTO_HOOK.
+        "hook_on": bool(own_hook.get("enabled", hook_look["enabled"] and settings.auto_hook)),
         "word_count": len(clip.word_list()),
         "download_url": f"/api/clips/{clip.id}/download",
         "post_text": {"youtube_title": youtube_title(clip), "youtube": caption_for("youtube", clip),
@@ -691,6 +696,7 @@ AUDIO_TYPES = {".mp3": "audio/mpeg", ".wav": "audio/wav", ".ogg": "audio/ogg", "
 class TemplateIn(BaseModel):
     name: str
     captions: dict[str, Any] = {}
+    hook: dict[str, Any] = {}
     music: dict[str, Any] = {}
     voice_volume: float = 1.0
     sfx: list[dict[str, Any]] = []
@@ -737,7 +743,9 @@ async def list_templates(request: Request):
             "presets": captions.PRESETS, "effects": list(captions.EFFECTS), "positions": list(captions.POSITIONS),
             "triggers": list(templates.TRIGGERS), "fonts": fonts.list_fonts(settings),
             "sounds": [s["name"] for s in await _sound_items(settings)],
-            "kinds": templates.MOMENT_KINDS, "gemini": bool(settings.gemini_api_key)}
+            "kinds": templates.MOMENT_KINDS, "gemini": bool(settings.gemini_api_key),
+            "hook_styles": list(captions.HOOK_STYLES), "hook_default": captions.DEFAULT_HOOK,
+            "auto_hook": settings.auto_hook}
 
 
 @router.post("/templates", dependencies=authed, status_code=201)
@@ -844,7 +852,7 @@ async def upload_font(filename: str, request: Request):
     if not family:
         path.unlink(missing_ok=True)
         raise HTTPException(422, "That file isn't a font clipbot can read.")
-    return {"family": family, "file": safe, "bundled": False}
+    return {"family": family, "file": safe, "bundled": False, **fonts.metrics(path)}
 
 
 @router.delete("/fonts/{filename}", dependencies=authed)
@@ -920,6 +928,7 @@ class EditIn(BaseModel):
     sfx: Optional[list[dict[str, Any]]] = None
     edit: Optional[dict[str, Any]] = None
     words: Optional[list[WordIn]] = None
+    hook_text: Optional[str] = None       # the hook line ("" = none on this clip)
 
 
 class RecutIn(BaseModel):
@@ -1006,10 +1015,28 @@ async def edit_clip_render(clip_id: str, body: EditIn, request: Request):
     if body.words is not None:
         words = [{"w": w.w.strip(), "s": round(w.s, 3), "e": round(max(w.e, w.s + 0.05), 3)}
                  for w in body.words if w.w.strip()]
+    hook_text = body.hook_text[:200] if body.hook_text is not None else None
+    if hook_text is not None and "hook_rendered" not in clip.meta:
+        raise HTTPException(409, "This clip's hook is part of the video OpenShorts made (before clipbot drew hooks), "
+                                 "so it can't be changed. New clips can.")
     store.update_clip(clip.id, render_state="rendering", render_error=None)
-    _background(request, request.app.state.pipeline.rerender(clip.id, body.template, sfx, body.edit, words))
+    _background(request, request.app.state.pipeline.rerender(clip.id, body.template, sfx, body.edit, words,
+                                                             hook_text))
     clip = store.get_clip(clip.id)
     return clip_out(settings, clip, store.get_job(clip.job_id), store)
+
+
+@router.post("/clips/{clip_id}/hook-suggestions", dependencies=authed)
+async def hook_suggestions(clip_id: str, request: Request):
+    """Fresh hook lines from Gemini, written from the clip's words."""
+    settings, store = settings_of(request), store_of(request)
+    clip = _clip_or_404(store, clip_id)
+    if not settings.gemini_api_key:
+        raise HTTPException(503, "Hook ideas need GEMINI_API_KEY for clipbot (docker compose up -d clipbot after setting it).")
+    hooks = await templates.suggest_hooks(settings, clip.word_list(), clip.title, clip.hook)
+    if hooks is None:
+        raise HTTPException(502, "Gemini didn't answer. Try again in a moment.")
+    return {"suggestions": hooks}
 
 
 @router.post("/clips/{clip_id}/recut", dependencies=authed, status_code=202)

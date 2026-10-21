@@ -1,4 +1,5 @@
-"""Burned-in captions as an ASS file: the active word highlighted, the TikTok/CapCut look.
+"""Burned-in captions and the hook line as an ASS file: the active word highlighted, the TikTok/CapCut
+look, and the hook (the short line at the start of a clip) in its own style.
 
 Adapted from OpenShorts' subtitles.py (MIT, github.com/mutonby/openshorts): the same word
 grouping, ASS styles, effects and presets, so a clip captioned here looks like one OpenShorts
@@ -41,6 +42,17 @@ PRESETS: dict[str, dict[str, Any]] = {
               "max_chars": 12},
 }
 
+HOOK_STYLES = ("box", "outline", "plain")
+# OpenShorts' own default ("pill"): a white box, black Montserrat ExtraBold, 5 seconds at the top.
+DEFAULT_HOOK: dict[str, Any] = {
+    "enabled": True, "style": "box", "font_name": "Montserrat ExtraBold", "font_size": 30,
+    "text_color": "#000000", "box_color": "#FFFFFF", "outline_color": "#000000", "position": "top",
+    "duration": 5.0, "uppercase": False,
+}
+HOOK_MARGIN = {"top": 38, "middle": 0, "bottom": 88}     # bottom sits above the captions
+# Emoji: the burned line has no emoji font, so they're left out of it (the saved text keeps them).
+_EMOJI = re.compile("[\U0001F000-\U0001FAFF\u2600-\u27BF\u2B00-\u2BFF\uFE00-\uFE0F\u200D\u20E3]")
+
 _HEX = re.compile(r"^#?([0-9A-Fa-f]{6})$")
 _FONT_SAFE = re.compile(r"[^A-Za-z0-9 _-]")
 
@@ -80,6 +92,46 @@ def normalize_style(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
         "bg_opacity": _clamp(raw.get("bg_opacity"), 0.0, 1.0, d["bg_opacity"]),
         "bg_color": color(raw.get("bg_color"), d["bg_color"]),
     }
+
+
+def normalize_hook(raw: Optional[dict[str, Any]]) -> dict[str, Any]:
+    """A complete, safe hook style."""
+    raw = raw or {}
+    d = DEFAULT_HOOK
+    return {
+        "enabled": bool(raw.get("enabled", d["enabled"])),
+        "style": raw.get("style") if raw.get("style") in HOOK_STYLES else d["style"],
+        "font_name": _FONT_SAFE.sub("", str(raw.get("font_name") or d["font_name"]))[:60] or d["font_name"],
+        "font_size": int(_clamp(raw.get("font_size"), 12, 90, d["font_size"])),
+        "text_color": color(raw.get("text_color"), d["text_color"]),
+        "box_color": color(raw.get("box_color"), d["box_color"]),
+        "outline_color": color(raw.get("outline_color"), d["outline_color"]),
+        "position": raw.get("position") if raw.get("position") in POSITIONS else d["position"],
+        "duration": round(_clamp(raw.get("duration"), 0, 60, d["duration"]), 2),   # 0 = the whole clip
+        "uppercase": bool(raw.get("uppercase", d["uppercase"])),
+    }
+
+
+def strip_emoji(text: str) -> str:
+    return re.sub(r"[ \t]{2,}", " ", _EMOJI.sub("", text or "")).strip()
+
+
+def _hook_style_line(h: dict[str, Any], position: str) -> str:
+    size = max(10, int(h["font_size"] * 0.85))
+    align = {"top": 8, "middle": 5, "bottom": 2}[position]
+    margin = HOOK_MARGIN[position]
+    text = _ass_color(h["text_color"])
+    if h["style"] == "box":
+        box = _ass_color(h["box_color"])
+        pad = max(3, round(size * 0.28))
+        return (f"Style: Hook,{h['font_name']},{size},{text},{text},{box},{box},1,0,0,0,100,100,0,0,3,{pad},0,"
+                f"{align},28,28,{margin},1\n")
+    if h["style"] == "outline":
+        outline = _ass_color(h["outline_color"])
+        return (f"Style: Hook,{h['font_name']},{size},{text},{text},{outline},&H00000000,1,0,0,0,100,100,0,0,1,"
+                f"{max(2, round(size * 0.1))},0,{align},28,28,{margin},1\n")
+    return (f"Style: Hook,{h['font_name']},{size},{text},{text},&H00000000,&H73000000,1,0,0,0,100,100,0,0,1,0,2,"
+            f"{align},28,28,{margin},1\n")
 
 
 # ---- words ---------------------------------------------------------------------------
@@ -145,12 +197,15 @@ def _escape(text: str) -> str:
 
 
 def build_ass(words: list[dict[str, Any]], style: dict[str, Any],
-              split_ranges: Optional[list[tuple[float, float]]] = None) -> Optional[str]:
+              split_ranges: Optional[list[tuple[float, float]]] = None,
+              hook: Optional[dict[str, Any]] = None) -> Optional[str]:
     """The ASS document for these words in this style, or None when there is nothing to show.
-    split_ranges: clip stretches where OpenShorts stacked two speakers; captions sit on the seam there."""
+    split_ranges: clip stretches where OpenShorts stacked two speakers; captions sit on the seam there.
+    hook: {"text", "style" (normalize_hook), "start", "end", "position"} for the hook line."""
     s = normalize_style(style)
-    blocks = group_words(words, s["max_chars"], s["max_duration"])
-    if not blocks:
+    blocks = group_words(words, s["max_chars"], s["max_duration"]) if s["enabled"] else []
+    hook_text = strip_emoji(hook.get("text") or "") if hook else ""
+    if not blocks and not hook_text:
         return None
     size = max(10, int(s["font_size"] * 0.85))
     align = {"top": 8, "middle": 5, "bottom": 2}[s["position"]]
@@ -205,6 +260,13 @@ def build_ass(words: list[dict[str, Any]], style: dict[str, Any],
                     parts.append(text)
             seam = "{\\an5}" if any(a <= start < b for a, b in seams) else ""
             events.append(f"Dialogue: 0,{_ass_time(start)},{_ass_time(end)},Default,,0,0,0,,{seam}{' '.join(parts)}")
+    if hook_text and hook["end"] > hook["start"]:
+        h = normalize_hook(hook.get("style"))
+        position = hook.get("position") if hook.get("position") in POSITIONS else h["position"]
+        styles += _hook_style_line(h, position)
+        text = _escape(hook_text.upper() if h["uppercase"] else hook_text).replace("\n", "\\N")
+        events.append(f"Dialogue: 1,{_ass_time(hook['start'])},{_ass_time(hook['end'])},Hook,,0,0,0,,"
+                      f"{{\\fad(120,150)}}{text}")
     if not events:
         return None
     return ("[Script Info]\nScriptType: v4.00+\nPlayResY: 288\nWrapStyle: 0\nScaledBorderAndShadow: yes\n\n"
@@ -216,8 +278,9 @@ def build_ass(words: list[dict[str, Any]], style: dict[str, Any],
 
 
 def write_ass(path: Path, words: list[dict[str, Any]], style: dict[str, Any],
-              split_ranges: Optional[list[tuple[float, float]]] = None) -> bool:
-    doc = build_ass(words, style, split_ranges)
+              split_ranges: Optional[list[tuple[float, float]]] = None,
+              hook: Optional[dict[str, Any]] = None) -> bool:
+    doc = build_ass(words, style, split_ranges, hook)
     if doc is None:
         return False
     path.write_text(doc, encoding="utf-8")
