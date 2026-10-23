@@ -473,15 +473,15 @@ encoding run on the CPU. The weak Ryzen iGPU isn't used.
 
 ```bash
 docker compose build --pull clipbot && docker compose up -d clipbot   # refreshes yt-dlp
-scripts/fetch-openshorts.sh main && docker compose build openshorts && docker compose up -d openshorts
+sh scripts/fetch-openshorts.sh main && docker compose build openshorts && docker compose up -d openshorts
 ```
 
 The second line moves OpenShorts off the pinned commit. If clipbot can no longer talk to it,
-go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild. The script also applies this
+go back with `sh scripts/fetch-openshorts.sh` (no argument) and rebuild. The script also applies this
 repo's patches (`openshorts/patches`) and stops with an error when one no longer fits a newer commit.
 
 **From a version before the Director:** `git pull`, then
-`scripts/fetch-openshorts.sh && docker compose build clipbot openshorts && docker compose up -d`. The
+`sh scripts/fetch-openshorts.sh && docker compose build clipbot openshorts && docker compose up -d`. The
 OpenShorts rebuild adds the patch that cuts the clips Gemini chose; until then the Director's clips
 are ignored and OpenShorts picks its own.
 
