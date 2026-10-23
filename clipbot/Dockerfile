@@ -39,6 +39,8 @@ RUN pip install --no-cache-dir -r requirements.txt \
 COPY app ./app
 # Caption fonts for templates (OFL / Apache 2.0, licenses in fonts/licenses). Yours go in data/fonts.
 COPY fonts ./fonts
+# Emoji stickers for the editor's Pictures (Noto Emoji, Apache 2.0, licenses in stickers/licenses).
+COPY stickers ./stickers
 COPY --from=web /web/dist ./web
 
 ENV PYTHONUNBUFFERED=1 \

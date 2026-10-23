@@ -8,6 +8,7 @@ import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import shutil
 import time
 import zipfile
@@ -20,7 +21,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import captions, director, editing, fonts, media, render, storage, templates
+from . import captions, director, editing, fonts, images, media, render, sounds, storage, templates
 from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
 from .platforms import Channel, channel_url, detect_channel, detect_vod, timestamp_link
@@ -31,12 +32,13 @@ from .store import Clip, Job, MomentRow, Post, Scan, Store, Watch
 
 COOKIE = "cp_session"
 SESSION_DAYS = 30
-MIN_SOURCE_SECONDS = 45          # OpenShorts refuses shorter sources
+MIN_RANGE_SECONDS = 20           # the shortest range to clip (OpenShorts takes 15 s: docker-compose)
 LEVELS = {"error": ["ERROR", "CRITICAL"], "warning": ["WARNING", "ERROR", "CRITICAL"],
           "info": ["INFO", "WARNING", "ERROR", "CRITICAL"]}
 ACTIVE = ("queued", "downloading", "submitting", "processing")
 
 router = APIRouter(prefix="/api")
+log = logging.getLogger("clipbot.dashboard")
 _login_failures: dict[str, list[float]] = {}
 
 
@@ -225,8 +227,8 @@ def check_range(settings: Settings, start: Optional[float], end: Optional[float]
         return
     if start < 0 or end <= start:
         raise HTTPException(422, "The end has to come after the start.")
-    if end - start < MIN_SOURCE_SECONDS:
-        raise HTTPException(422, f"Make the range at least {MIN_SOURCE_SECONDS} seconds; OpenShorts needs that much.")
+    if end - start < MIN_RANGE_SECONDS:
+        raise HTTPException(422, f"Make the range at least {MIN_RANGE_SECONDS} seconds so there's something to clip.")
     if end - start > settings.max_range_minutes * 60:
         raise HTTPException(422, f"Ranges are limited to {settings.max_range_minutes} minutes (MAX_RANGE_MINUTES).")
     if duration and end > duration + 1:
@@ -758,15 +760,17 @@ def _template_or_404(store: Store, template_id: str) -> dict[str, Any]:
 async def _sound_items(settings: Settings) -> list[dict[str, Any]]:
     folder = settings.data_dir / "sounds"
     paths = sorted(p for p in folder.iterdir() if p.suffix.lower() in templates.SOUND_EXTS) if folder.is_dir() else []
+    meta = sounds.load_meta(settings)
+    return list(await asyncio.gather(*(_sound_item(settings, p, meta) for p in paths)))
 
-    async def item(path: Path) -> dict[str, Any]:
-        try:
-            duration = await media.probe_duration(path)
-        except media.MediaError:
-            duration = None
-        return {"name": path.stem, "file": path.name, "size": path.stat().st_size, "duration": duration}
 
-    return list(await asyncio.gather(*(item(p) for p in paths)))
+async def _sound_item(settings: Settings, path: Path, meta: Optional[dict] = None) -> dict[str, Any]:
+    try:
+        duration = await media.probe_duration(path)
+    except media.MediaError:
+        duration = None
+    return {"name": path.stem, "file": path.name, "size": path.stat().st_size, "duration": duration,
+            **sounds.describe(settings, path.stem, meta)}
 
 
 @router.get("/templates", dependencies=authed)
@@ -823,7 +827,80 @@ async def make_default_template(template_id: str, request: Request):
 
 @router.get("/sounds", dependencies=authed)
 async def list_sounds(request: Request):
-    return {"items": await _sound_items(settings_of(request))}
+    settings = settings_of(request)
+    return {"items": await _sound_items(settings), "categories": list(sounds.CATEGORIES),
+            "freesound": bool(settings.freesound_api_key), "pack": _pack_state(request)}
+
+
+def _pack_state(request: Request) -> dict[str, Any]:
+    state = getattr(request.app.state, "sound_pack", None) or {}
+    return {"running": bool(state.get("running")), "result": state.get("result"),
+            "size": len(sounds.MEME_PACK) + len(sounds.PACK_MUSIC)}
+
+
+@router.post("/sounds/packs/meme", dependencies=authed, status_code=202)
+async def install_meme_pack(request: Request):
+    """Download the meme pack onto this server, in the background (GET /sounds shows progress)."""
+    settings = settings_of(request)
+    state = getattr(request.app.state, "sound_pack", None)
+    if not (state and state.get("running")):
+        state = request.app.state.sound_pack = {"running": True, "result": None}
+
+        async def run() -> None:
+            try:
+                state["result"] = await sounds.install_pack(settings)
+            except Exception as e:      # noqa: BLE001 - reported on the page
+                log.exception("meme pack failed")
+                state["result"] = {"added": [], "kept": [], "failed": {"pack": str(e)}}
+            finally:
+                state["running"] = False
+
+        _background(request, run())
+    return _pack_state(request)
+
+
+class SoundEdit(BaseModel):
+    category: Optional[str] = None
+    favorite: Optional[bool] = None
+
+
+@router.patch("/sounds/{name}", dependencies=authed)
+async def edit_sound(name: str, body: SoundEdit, request: Request):
+    settings = settings_of(request)
+    path = templates.find_sound(settings, templates.sound_name(name))
+    if not path:
+        raise HTTPException(404, "No such sound.")
+    if body.category is not None and body.category not in sounds.CATEGORIES:
+        raise HTTPException(422, "No such category.")
+    sounds.set_meta(settings, path.stem, category=body.category or sounds.describe(settings, path.stem)["category"],
+                    favorite=body.favorite)
+    return await _sound_item(settings, path)
+
+
+@router.get("/sounds/search", dependencies=authed)
+async def search_sounds(request: Request, q: str = "", source: str = "myinstants"):
+    if source not in ("myinstants", "freesound"):
+        raise HTTPException(422, "source is myinstants or freesound")
+    try:
+        return {"items": await sounds.search(settings_of(request), q, source)}
+    except sounds.SoundError as e:
+        raise HTTPException(503 if "FREESOUND_API_KEY" in str(e) else 502, str(e))
+
+
+class SoundImport(BaseModel):
+    item: dict[str, Any]
+    name: Optional[str] = None
+    category: Optional[str] = None
+
+
+@router.post("/sounds/import", dependencies=authed, status_code=201)
+async def import_sound(body: SoundImport, request: Request):
+    settings = settings_of(request)
+    try:
+        name = await sounds.import_sound(settings, body.item, body.name, body.category)
+    except sounds.SoundError as e:
+        raise HTTPException(422, str(e))
+    return await _sound_item(settings, templates.find_sound(settings, name))
 
 
 @router.put("/sounds/{filename}", dependencies=authed, status_code=201)
@@ -837,7 +914,7 @@ async def upload_sound(filename: str, request: Request):
     if not body or len(body) > MAX_SOUND_BYTES:
         raise HTTPException(413, f"Sounds can be up to {MAX_SOUND_BYTES // 1024 // 1024} MB.")
     for old in (settings.data_dir / "sounds").glob("*"):
-        if old.stem.lower() == name.lower():
+        if old.suffix.lower() in templates.SOUND_EXTS and old.stem.lower() == name.lower():
             old.unlink()                   # replacing a sound of the same name, maybe another format
     path = templates.sounds_dir(settings) / f"{name}{suffix}"
     path.write_bytes(body)
@@ -846,7 +923,9 @@ async def upload_sound(filename: str, request: Request):
     except media.MediaError:
         path.unlink(missing_ok=True)
         raise HTTPException(422, "That file isn't audio ffmpeg can read.")
-    return {"name": name, "file": path.name, "size": len(body), "duration": duration}
+    if name not in sounds.load_meta(settings):
+        sounds.set_meta(settings, name, source="upload")
+    return {"name": name, "file": path.name, "size": len(body), "duration": duration, **sounds.describe(settings, name)}
 
 
 @router.delete("/sounds/{name}", dependencies=authed)
@@ -855,6 +934,7 @@ async def delete_sound(name: str, request: Request):
     if not path:
         raise HTTPException(404, "No such sound.")
     path.unlink()
+    sounds.drop_meta(settings_of(request), path.stem)
     return {"ok": True}
 
 
@@ -864,6 +944,92 @@ async def sound_file(name: str, request: Request):
     if not path:
         raise HTTPException(404, "No such sound.")
     return FileResponse(path, media_type=AUDIO_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+
+
+# ---- pictures (the editor's overlays) -------------------------------------------------------------
+IMAGE_TYPES = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".gif": "image/gif", ".webp": "image/webp"}
+
+
+@router.get("/images", dependencies=authed)
+async def list_images(request: Request):
+    return {"items": images.items(settings_of(request)),
+            "stickers": [{"name": n, "ref": f"{images.STICKER}{n}", "url": f"/api/stickers/{n}.png"} for n in images.stickers()]}
+
+
+@router.put("/images/{filename}", dependencies=authed, status_code=201)
+async def upload_image(filename: str, request: Request):
+    body = await request.body()
+    if not body:
+        raise HTTPException(422, "That file is empty.")
+    settings = settings_of(request)
+    try:
+        name = await images.save_upload(settings, filename, body)
+    except images.ImageError as e:
+        raise HTTPException(422, str(e))
+    return images.item(settings, images.find_image(settings, name))
+
+
+class ImageImport(BaseModel):
+    url: str
+    name: Optional[str] = None
+
+
+@router.post("/images/import", dependencies=authed, status_code=201)
+async def import_image(body: ImageImport, request: Request):
+    settings = settings_of(request)
+    try:
+        name = await images.import_url(settings, body.url.strip(), body.name)
+    except images.ImageError as e:
+        raise HTTPException(422, str(e))
+    return images.item(settings, images.find_image(settings, name))
+
+
+@router.delete("/images/{name}", dependencies=authed)
+async def delete_image(name: str, request: Request):
+    settings = settings_of(request)
+    path = images.find_image(settings, images.image_name(name))
+    if not path:
+        raise HTTPException(404, "No such picture.")
+    path.unlink()
+    images.drop_meta(settings, path.stem)
+    return {"ok": True}
+
+
+@router.get("/images/{name}/file", dependencies=authed)
+async def image_file(name: str, request: Request):
+    path = images.find_image(settings_of(request), images.image_name(name))
+    if not path:
+        raise HTTPException(404, "No such picture.")
+    return FileResponse(path, media_type=IMAGE_TYPES.get(path.suffix.lower(), "application/octet-stream"))
+
+
+@router.get("/stickers/{filename}", dependencies=authed)
+async def sticker_file(filename: str, request: Request):
+    path = images.find_image(settings_of(request), images.STICKER + Path(filename).stem)
+    if not path:
+        raise HTTPException(404, "No such sticker.")
+    return FileResponse(path, media_type="image/png", headers={"Cache-Control": "max-age=604800"})
+
+
+class FrameGrab(BaseModel):
+    t: float
+    crop: Optional[dict[str, float]] = None      # x, y, w, h: shares of the frame
+    name: Optional[str] = None
+
+
+@router.post("/clips/{clip_id}/frame", dependencies=authed, status_code=201)
+async def grab_frame(clip_id: str, body: FrameGrab, request: Request):
+    """A frame of the clip (or a box of it) into the picture library: a reaction face to bring back later."""
+    settings = settings_of(request)
+    clip = _clip_or_404(store_of(request), clip_id)
+    source = request.app.state.pipeline.clean_source(clip)
+    if not source.is_file():
+        source = Path(clip.path)
+    try:
+        name = await images.grab_frame(settings, source, body.t, body.crop, body.name)
+    except images.ImageError as e:
+        raise HTTPException(422, str(e))
+    return images.item(settings, images.find_image(settings, name))
 
 
 @router.get("/fonts", dependencies=authed)
@@ -1039,7 +1205,17 @@ async def edit_clip_render(clip_id: str, body: EditIn, request: Request):
     and render the clip again."""
     settings, store = settings_of(request), store_of(request)
     clip = _editable(request, clip_id)
-    if body.template and store.get_template(body.template) is None:
+    sfx, words, hook_text = _edit_inputs(request, clip, body)
+    store.update_clip(clip.id, render_state="rendering", render_error=None)
+    _background(request, request.app.state.pipeline.rerender(clip.id, body.template, sfx, body.edit, words,
+                                                             hook_text))
+    clip = store.get_clip(clip.id)
+    return clip_out(settings, clip, store.get_job(clip.job_id), store)
+
+
+def _edit_inputs(request: Request, clip: Clip, body: EditIn) -> tuple[Optional[list], Optional[list], Optional[str]]:
+    """The editor's effects, words and hook text, cleaned up (None: keep the clip's)."""
+    if body.template and store_of(request).get_template(body.template) is None:
         raise HTTPException(422, "No such template.")
     sfx = None
     if body.sfx is not None:
@@ -1053,11 +1229,47 @@ async def edit_clip_render(clip_id: str, body: EditIn, request: Request):
     if hook_text is not None and "hook_rendered" not in clip.meta:
         raise HTTPException(409, "This clip's hook is part of the video OpenShorts made (before clipbot drew hooks), "
                                  "so it can't be changed. New clips can.")
-    store.update_clip(clip.id, render_state="rendering", render_error=None)
-    _background(request, request.app.state.pipeline.rerender(clip.id, body.template, sfx, body.edit, words,
-                                                             hook_text))
-    clip = store.get_clip(clip.id)
-    return clip_out(settings, clip, store.get_job(clip.job_id), store)
+    return sfx, words, hook_text
+
+
+def _drafts(request: Request) -> dict[str, dict[str, Any]]:
+    request.app.state.drafts = getattr(request.app.state, "drafts", None) or {}
+    return request.app.state.drafts
+
+
+@router.post("/clips/{clip_id}/draft", dependencies=authed, status_code=202)
+async def draft_render(clip_id: str, body: EditIn, request: Request):
+    """A quick 480p render of the editor's unsaved work (GET .../draft says when it's ready). The clip
+    itself doesn't change and Telegram hears nothing."""
+    clip = _editable(request, clip_id)
+    sfx, words, hook_text = _edit_inputs(request, clip, body)
+    drafts = _drafts(request)
+    if (drafts.get(clip.id) or {}).get("state") == "rendering":
+        return drafts[clip.id]
+    state = drafts[clip.id] = {"state": "rendering", "url": None, "error": None}
+
+    async def run() -> None:
+        try:
+            path = await request.app.state.pipeline.draft(clip.id, body.template, sfx, body.edit, words, hook_text)
+            state.update(state="done", url=f"/api/clips/{clip.id}/draft.mp4?v={int(path.stat().st_mtime * 1000)}")
+        except (media.MediaError, OSError) as e:
+            state.update(state="failed", error=str(e)[:500] or type(e).__name__)
+
+    _background(request, run())
+    return state
+
+
+@router.get("/clips/{clip_id}/draft", dependencies=authed)
+async def draft_state(clip_id: str, request: Request):
+    return _drafts(request).get(clip_id) or {"state": None, "url": None, "error": None}
+
+
+@router.get("/clips/{clip_id}/draft.mp4", dependencies=authed)
+async def draft_file(clip_id: str, request: Request):
+    path = settings_of(request).data_dir / "tmp" / "drafts" / f"{_clip_or_404(store_of(request), clip_id).id}.mp4"
+    if not path.is_file():
+        raise HTTPException(404, "No draft yet.")
+    return FileResponse(path, media_type="video/mp4", headers={"Cache-Control": "no-store"})
 
 
 @router.post("/clips/{clip_id}/hook-suggestions", dependencies=authed)
@@ -1266,10 +1478,13 @@ async def list_scans(request: Request, limit: int = 100):
 async def get_scan(scan_id: str, request: Request):
     store = store_of(request)
     scan = _scan_or_404(store, scan_id)
+    settings = settings_of(request)
     return {**scan_out(store, scan),
             "moments": [moment_out(store, scan, m) for m in store.moments_for_scan(scan.id)],
             "timeline": store.get_timeline(scan.id),
-            "logs": store.query_logs(scan_id=scan.id, limit=100)}
+            "logs": store.query_logs(scan_id=scan.id, limit=100),
+            "limits": {"min_range_seconds": MIN_RANGE_SECONDS, "max_range_minutes": settings.max_range_minutes,
+                       "clip_min_seconds": settings.clip_min_seconds, "max_clips": 15}}
 
 
 @router.post("/scans", dependencies=authed, status_code=201)

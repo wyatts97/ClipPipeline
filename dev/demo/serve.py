@@ -26,6 +26,7 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "clipbot"))
 
 from app import media, storage  # noqa: E402
+from app import sounds as app_sounds  # noqa: E402
 from app.chat import ChatMessage  # noqa: E402
 from app.clips_api import ClipMarker  # noqa: E402
 from app.config import Settings  # noqa: E402
@@ -130,6 +131,13 @@ async def seed(settings: Settings) -> None:
                     str(sounds / "demo-boom.wav")], check=True)
     subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=520:duration=12",
                     "-ac", "2", str(sounds / "demo-music.mp3")], check=True)
+    meme = (("vine-boom", "impact", 60, True), ("huh", "reaction", 900, True), ("bruh", "reaction", 180, False),
+            ("sad-trombone", "fail", 300, False), ("airhorn", "hype", 1200, True), ("record-scratch", "transition", 2400, False))
+    for name, category, hz, star in meme:
+        subprocess.run(["ffmpeg", "-y", "-v", "error", "-f", "lavfi", "-i", f"sine=frequency={hz}:duration=0.8",
+                        str(sounds / f"{name}.mp3")], check=True)
+        app_sounds.set_meta(settings, name, category=category, source="myinstants", favorite=star)
+    app_sounds.set_meta(settings, "demo-music", category="music", source="freesound", license="CC0", author="demo")
     old = job("https://youtu.be/zn1dXa6W7t4", 600, 735, 2, "done", 86400 * 2,
               os_job="5a1c0d4e-0000-4000-8000-0000000001d0")
     for i, decision in enumerate(("ok", "no")):

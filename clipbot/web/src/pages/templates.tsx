@@ -1,11 +1,12 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
-import { Play, Plus, Trash2, Upload } from "lucide-react"
+import { Plus, Star, Trash2, Upload } from "lucide-react"
 import { useRef, useState } from "react"
 import { toast } from "sonner"
 
 import { CaptionPreview } from "@/components/caption-preview"
 import { NativeSelect } from "@/components/native-select"
+import { CATEGORY_LABEL, MemePackButton, PlayButton, SoundSearch, soundCredit, soundUrl, usePreview, useSounds } from "@/components/sounds"
 import { Button } from "@/components/ui/button"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
@@ -14,7 +15,7 @@ import { Sheet, SheetContent, SheetDescription, SheetFooter, SheetHeader, SheetT
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
 import {
-  api, type CaptionStyle, type HookStyle, type HookStyleName, type MomentKind, type SfxRule, type SoundItem, type Template,
+  api, type CaptionStyle, type HookStyle, type HookStyleName, type MomentKind, type SfxRule, type SoundCategory, type SoundItem, type Template,
   type TemplateBody, type TemplatesResponse, type Trigger,
 } from "@/lib/api"
 import { size, tc } from "@/lib/format"
@@ -78,7 +79,7 @@ export function TemplatesPage() {
                   <p className="font-mono text-xs text-muted-foreground">t={t.id}</p>
                   <Summary t={t} />
                   {t.missing_sounds.length > 0 && (
-                    <p className="text-xs text-destructive">Missing sound{t.missing_sounds.length > 1 ? "s" : ""}: {t.missing_sounds.join(", ")}. Upload below.</p>
+                    <p className="text-xs text-destructive">Missing sound{t.missing_sounds.length > 1 ? "s" : ""}: {t.missing_sounds.join(", ")}. Install the meme pack or upload below.</p>
                   )}
                   <div className="mt-auto flex flex-wrap gap-1.5 pt-1">
                     <Button size="sm" variant="outline" onClick={() => setEditing({ id: t.id, body: bodyOf(t) })}>Edit</Button>
@@ -426,7 +427,9 @@ export function SoundSelect({ id, sounds, value, onChange, allowNone }: {
 // ---- sounds and fonts ---------------------------------------------------------------------
 function Library({ data }: { data: TemplatesResponse }) {
   const qc = useQueryClient()
-  const sounds = useQuery({ queryKey: ["sounds"], queryFn: api.sounds })
+  const sounds = useSounds()
+  const [shelf, setShelf] = useState<"all" | "favorite" | SoundCategory>("all")
+  const { playing, play } = usePreview()
   const soundInput = useRef<HTMLInputElement>(null)
   const fontInput = useRef<HTMLInputElement>(null)
   const refresh = () => { qc.invalidateQueries({ queryKey: ["sounds"] }); qc.invalidateQueries({ queryKey: ["templates"] }) }
@@ -440,29 +443,62 @@ function Library({ data }: { data: TemplatesResponse }) {
     onSuccess: (items) => { toast.success(`Added ${items.map((f) => f.family).join(", ")}`); refresh() },
   })
   const deleteSound = useMutation({ mutationFn: api.deleteSound, onSuccess: refresh })
+  const editSound = useMutation({
+    mutationFn: ({ name, ...body }: { name: string; category?: SoundCategory; favorite?: boolean }) => api.editSound(name, body),
+    onSuccess: refresh,
+    onError: (e) => toast.error(e.message),
+  })
+  const items = sounds.data?.items ?? []
+  const count = (f: typeof shelf) => items.filter((s) => f === "all" || (f === "favorite" ? s.favorite : s.category === f)).length
+  const shelves = (["all", "favorite", ...(sounds.data?.categories ?? [])] as (typeof shelf)[]).filter((f) => f === "all" || count(f))
+  const shown = items.filter((s) => shelf === "all" || (shelf === "favorite" ? s.favorite : s.category === shelf))
   const deleteFont = useMutation({ mutationFn: api.deleteFont, onSuccess: refresh })
 
   return (
-    <div className="grid grid-cols-1 gap-10 lg:grid-cols-2">
+    <div className="grid grid-cols-1 gap-10 xl:grid-cols-[minmax(0,3fr)_minmax(0,2fr)]">
       <section className="space-y-3">
-        <div className="flex items-center gap-3">
-          <div className="mr-auto">
+        <div className="flex flex-wrap items-center gap-3">
+          <div className="mr-auto min-w-56 flex-1">
             <h2 className="font-medium">Sounds</h2>
-            <p className="text-sm text-muted-foreground">Music beds and effects. Templates use them by name, so a file named <code className="font-mono">vine-boom.mp3</code> is "vine-boom".</p>
+            <p className="text-sm text-muted-foreground">Music beds and effects. Templates use them by name, so a file named <code className="font-mono">vine-boom.mp3</code> is "vine-boom". A ★ puts a sound on keys 1–9 in the editor.</p>
           </div>
+          <MemePackButton data={sounds.data} />
           <input ref={soundInput} type="file" accept="audio/*,.mp3,.wav,.ogg,.m4a,.flac,.opus" multiple hidden
             onChange={(e) => { const files = [...(e.target.files ?? [])]; e.target.value = ""; if (files.length) uploadSounds.mutate(files) }} />
           <Button variant="outline" onClick={() => soundInput.current?.click()} disabled={uploadSounds.isPending}><Upload /> Upload</Button>
         </div>
-        {!sounds.data?.items.length ? (
+        {!items.length ? (
           <div className="rounded-md border border-dashed border-border px-6 py-8 text-center text-sm text-muted-foreground">
-            No sounds yet. The built-in templates look for <code className="font-mono">vine-boom</code> and <code className="font-mono">sneaky-snitch</code>.
+            No sounds yet. Install the meme pack for vine boom, HUH, bruh and about 30 more, plus the music the
+            built-in templates use.
           </div>
         ) : (
-          <ul className="divide-y divide-border rounded-md border border-border bg-card">
-            {sounds.data.items.map((s) => <SoundRow key={s.file} sound={s} onDelete={() => deleteSound.mutate(s.name)} />)}
-          </ul>
+          <>
+            <div className="flex flex-wrap gap-1.5" aria-label="Sound categories">
+              {shelves.map((f) => (
+                <button key={f} type="button" aria-pressed={shelf === f} onClick={() => setShelf(f)}
+                  className={cn("rounded-sm border px-2 py-0.5 text-xs", shelf === f ? "border-primary bg-primary/10 text-foreground" : "border-border text-muted-foreground hover:text-foreground")}>
+                  {f === "all" ? "All" : f === "favorite" ? "★" : CATEGORY_LABEL[f]} <span className="text-muted-foreground">{count(f)}</span>
+                </button>
+              ))}
+            </div>
+            <ul className="max-h-[30rem] divide-y divide-border overflow-y-auto rounded-md border border-border bg-card">
+              {shown.map((s) => (
+                <SoundRow key={s.file} sound={s} playing={playing === s.name} categories={sounds.data?.categories ?? []}
+                  onPlay={() => play(s.name, soundUrl(s.name))} onDelete={() => deleteSound.mutate(s.name)}
+                  onEdit={(body) => editSound.mutate({ name: s.name, ...body })} />
+              ))}
+            </ul>
+          </>
         )}
+        <div className="space-y-2 rounded-md border border-border p-3">
+          <h3 className="text-sm font-medium">Find more sounds</h3>
+          <SoundSearch freesound={!!sounds.data?.freesound} />
+          <p className="text-xs text-muted-foreground">
+            Meme sounds (the pack and Myinstants) aren't licensed: platforms rarely claim them, but posting them is on you.
+            CC0 sounds from Freesound are free to use anywhere.
+          </p>
+        </div>
       </section>
 
       <section className="space-y-3">
@@ -490,23 +526,27 @@ function Library({ data }: { data: TemplatesResponse }) {
   )
 }
 
-function SoundRow({ sound, onDelete }: { sound: SoundItem; onDelete: () => void }) {
-  const audio = useRef<HTMLAudioElement>(null)
-  const [playing, setPlaying] = useState(false)
+function SoundRow({ sound, playing, categories, onPlay, onDelete, onEdit }: {
+  sound: SoundItem; playing: boolean; categories: SoundCategory[]
+  onPlay: () => void; onDelete: () => void; onEdit: (body: { category?: SoundCategory; favorite?: boolean }) => void
+}) {
   return (
-    <li className="flex items-center gap-3 px-3 py-2 text-sm">
-      <Button variant="ghost" size="icon" aria-label={`Play ${sound.name}`} onClick={() => {
-        const a = audio.current
-        if (!a) return
-        if (playing) { a.pause(); a.currentTime = 0 } else void a.play()
-      }}>
-        <Play className={cn(playing && "text-primary")} />
+    <li className="flex items-center gap-2 px-2 py-1.5 text-sm">
+      <PlayButton playing={playing} label={sound.name} onClick={onPlay} />
+      <Button variant="ghost" size="icon" aria-label={sound.favorite ? `Unstar ${sound.name}` : `Star ${sound.name}`} aria-pressed={sound.favorite}
+        onClick={() => onEdit({ favorite: !sound.favorite })}>
+        <Star className={cn(sound.favorite && "fill-primary text-primary")} />
       </Button>
-      <audio ref={audio} src={`/api/sounds/${encodeURIComponent(sound.name)}/file`} preload="none"
-        onPlay={() => setPlaying(true)} onPause={() => setPlaying(false)} onEnded={() => setPlaying(false)} />
-      <span className="min-w-0 flex-1 truncate">{sound.name}</span>
-      <span className="text-xs text-muted-foreground timecode">{sound.duration ? tc(sound.duration) : "–"}</span>
-      <span className="w-14 text-right text-xs text-muted-foreground">{size(sound.size)}</span>
+      <span className="min-w-0 flex-1">
+        <span className="block truncate">{sound.name}</span>
+        <span className="block truncate text-xs text-muted-foreground">{soundCredit(sound)}</span>
+      </span>
+      <NativeSelect aria-label={`Category of ${sound.name}`} className="h-7 w-auto text-xs" value={sound.category}
+        onChange={(e) => onEdit({ category: e.target.value as SoundCategory })}>
+        {categories.map((c) => <option key={c} value={c}>{CATEGORY_LABEL[c]}</option>)}
+      </NativeSelect>
+      <span className="w-10 text-right text-xs text-muted-foreground timecode">{sound.duration ? tc(sound.duration) : "–"}</span>
+      <span className="hidden w-14 text-right text-xs text-muted-foreground sm:inline">{size(sound.size)}</span>
       <Button variant="ghost" size="icon" aria-label={`Delete ${sound.name}`} onClick={onDelete}><Trash2 /></Button>
     </li>
   )

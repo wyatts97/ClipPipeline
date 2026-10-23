@@ -159,6 +159,8 @@ services:
       GEMINI_MODEL: ${GEMINI_MODEL:-}
       DIRECTOR: ${DIRECTOR:-true}
       DIRECTOR_MODEL: ${DIRECTOR_MODEL:-}
+      # Royalty-free (CC0) sound search on the dashboard: a free key from freesound.org/apiv2/apply.
+      FREESOUND_API_KEY: ${FREESOUND_API_KEY:-}
     volumes:
       - ./data:/data                              # pending/ approved/ rejected/ live here
       - openshorts_output:/openshorts-output:ro   # read-only: sizes for the Storage page;

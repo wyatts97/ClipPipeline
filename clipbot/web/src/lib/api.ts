@@ -101,10 +101,41 @@ export interface Clip {
 }
 
 export interface Word { w: string; s: number; e: number }
-export interface Zoom { s: number; e: number; scale: number }
+/** punch snaps in (the default), smooth eases in and out, push creeps in over the whole zoom, shake
+ * punches in with a fading camera shake, out starts close and pulls back. */
+export type ZoomStyle = "punch" | "smooth" | "push" | "shake" | "out"
+/** x, y: the point it zooms toward, 0-1 (default the centre). */
+export interface Zoom { s: number; e: number; scale: number; style?: ZoomStyle; x?: number; y?: number }
 /** This clip's own hook settings; a missing key means the template's. e null: to the end. */
 export interface ClipHook { enabled?: boolean; s?: number; e?: number | null; position?: CaptionPosition }
-export interface ClipEdit { segments: [number, number][]; zooms: Zoom[]; hook?: ClipHook }
+/** plain, gray (black and white), zoom (a slow push in), scratch (gray, with the record-scratch sound). */
+export type FreezeStyle = "plain" | "gray" | "zoom" | "scratch"
+/** Hold the frame at source time t for d seconds. */
+export interface Freeze { t: number; d: number; style?: FreezeStyle }
+export type SmoothTransition = "fade" | "white" | "black" | "slideleft" | "slideright" | "slideup" | "slidedown" | "wipe"
+  | "zoomin" | "circle" | "pixelize" | "blur"
+export type AccentTransition = "flash" | "glitch" | "shake" | "punch"
+/** On the cut where the kept part ending at `after` (source time) stops. Smooth ones overlap the two
+ * sides for d seconds; accents land on the cut. */
+export interface Transition { after: number; type: SmoothTransition | AccentTransition; d?: number }
+export type PictureMove = "none" | "fade" | "pop" | "zoom" | "spin" | "slide-left" | "slide-right" | "slide-up" | "slide-down"
+export type PictureMotion = "none" | "shake" | "pulse" | "float" | "spin"
+/** A picture on top of the clip, from s to e (source time). image: a library picture's name or
+ * "sticker:<name>"; x, y: its centre and w its width, as shares of the frame; rot in degrees. */
+export interface Overlay {
+  image: string; s: number; e: number; x: number; y: number; w: number; rot: number; opacity: number
+  enter: PictureMove; exit: PictureMove; motion: PictureMotion
+}
+export interface ClipEdit {
+  segments: [number, number][]; zooms: Zoom[]; freezes?: Freeze[]; transitions?: Transition[]; overlays?: Overlay[]
+  hook?: ClipHook
+}
+export interface PictureItem {
+  name: string; ref: string; file: string; size: number; width: number | null; height: number | null
+  animated: boolean; source: "upload" | "url" | "frame"; url: string
+}
+export interface Sticker { name: string; ref: string; url: string }
+export interface DraftState { state: "rendering" | "done" | "failed" | null; url: string | null; error: string | null }
 
 export interface EditorData {
   clip: Clip
@@ -218,7 +249,25 @@ export interface Template extends TemplateBody {
 /** em: the font's em next to its ASS size (how libass sizes it); weight: its OS/2 weight. For previews
  * that match the burn. */
 export interface FontItem { family: string; file: string; bundled: boolean; em: number; weight: number }
-export interface SoundItem { name: string; file: string; size: number; duration: number | null }
+export type SoundCategory = "impact" | "reaction" | "fail" | "hype" | "transition" | "funny" | "suspense" | "music" | "other"
+export type SoundSource = "upload" | "myinstants" | "freesound" | "incompetech"
+export interface SoundItem {
+  name: string; file: string; size: number; duration: number | null
+  category: SoundCategory; source: SoundSource; license: string | null; author: string | null; favorite: boolean
+}
+export interface PackResult { added: string[]; kept: string[]; failed: Record<string, string> }
+export interface SoundsResponse {
+  items: SoundItem[]
+  categories: SoundCategory[]
+  /** Freesound search works (FREESOUND_API_KEY is set). */
+  freesound: boolean
+  pack: { running: boolean; result: PackResult | null; size: number }
+}
+/** A sound found on Myinstants or Freesound, to import. */
+export interface FoundSound {
+  source: "myinstants" | "freesound"; id: string; title: string; preview_url: string
+  duration: number | null; license: string | null; author: string | null
+}
 
 export interface TemplatesResponse {
   items: Template[]
@@ -287,6 +336,7 @@ export interface ScanDetail extends Scan {
   moments: Moment[]
   timeline: Timeline | null
   logs: LogItem[]
+  limits: { min_range_seconds: number; max_range_minutes: number; clip_min_seconds: number; max_clips: number }
 }
 
 export interface Problem {
@@ -494,7 +544,13 @@ export const api = {
     request<Template>(`/api/templates/${id}`, { method: "PUT", body: JSON.stringify(body) }),
   deleteTemplate: (id: string) => request<{ ok: boolean }>(`/api/templates/${id}`, { method: "DELETE" }),
   defaultTemplate: (id: string) => post<{ default: string }>(`/api/templates/${id}/default`),
-  sounds: () => request<{ items: SoundItem[] }>("/api/sounds"),
+  sounds: () => request<SoundsResponse>("/api/sounds"),
+  editSound: (name: string, body: { category?: SoundCategory; favorite?: boolean }) =>
+    request<SoundItem>(`/api/sounds/${encodeURIComponent(name)}`, { method: "PATCH", body: JSON.stringify(body) }),
+  installMemePack: () => post<SoundsResponse["pack"]>("/api/sounds/packs/meme"),
+  searchSounds: (q: string, source: FoundSound["source"]) =>
+    request<{ items: FoundSound[] }>(`/api/sounds/search${query({ q, source })}`),
+  importSound: (item: FoundSound, category?: SoundCategory) => post<SoundItem>("/api/sounds/import", { item, category }),
   uploadSound: (file: File) => upload<SoundItem>(`/api/sounds/${encodeURIComponent(file.name)}`, file),
   deleteSound: (name: string) => request<{ ok: boolean }>(`/api/sounds/${encodeURIComponent(name)}`, { method: "DELETE" }),
   uploadFont: (file: File) => upload<FontItem>(`/api/fonts/${encodeURIComponent(file.name)}`, file),
@@ -516,6 +572,17 @@ export const api = {
   peaks: (url: string) => request<{ per_second: number; peaks: number[] }>(url),
   saveEdit: (clipId: string, body: { template?: string; sfx?: HandEffect[]; edit?: ClipEdit; words?: Word[]; hook_text?: string }) =>
     post<Clip>(`/api/clips/${clipId}/edit`, body),
+  /** A quick 480p render of unsaved work; the clip doesn't change. */
+  draft: (clipId: string, body: { template?: string; sfx?: HandEffect[]; edit?: ClipEdit; words?: Word[]; hook_text?: string }) =>
+    post<DraftState>(`/api/clips/${clipId}/draft`, body),
+  draftState: (clipId: string) => request<DraftState>(`/api/clips/${clipId}/draft`),
+  images: () => request<{ items: PictureItem[]; stickers: Sticker[] }>("/api/images"),
+  uploadImage: (file: File) => upload<PictureItem>(`/api/images/${encodeURIComponent(file.name)}`, file),
+  importImage: (url: string) => post<PictureItem>("/api/images/import", { url }),
+  deleteImage: (name: string) => request<{ ok: boolean }>(`/api/images/${encodeURIComponent(name)}`, { method: "DELETE" }),
+  /** A frame of the clip (crop: a box of it, shares of the frame) into the picture library. */
+  grabFrame: (clipId: string, body: { t: number; crop?: { x: number; y: number; w: number; h: number } }) =>
+    post<PictureItem>(`/api/clips/${clipId}/frame`, body),
   suggestHooks: (clipId: string) => post<{ suggestions: string[] }>(`/api/clips/${clipId}/hook-suggestions`),
   recut: (clipId: string, body: { extend_start: number; extend_end: number; framing?: string | null }) =>
     post<Clip>(`/api/clips/${clipId}/recut`, body),

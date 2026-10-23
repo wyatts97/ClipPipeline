@@ -74,6 +74,7 @@ class Settings:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.1-flash-lite"
     gemini_api_url: str = "https://generativelanguage.googleapis.com"
+    freesound_api_key: str = ""            # royalty-free (CC0) sound search on the dashboard
     # the Director: Gemini watches candidate moments (and ranges you send) and picks the exact clips
     director: bool = True
     director_model: str = "gemini-3.1-flash-lite"
@@ -146,6 +147,7 @@ class Settings:
             gemini_model=os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite",
             gemini_api_url=(os.environ.get("GEMINI_API_URL", "").strip().rstrip("/")
                             or "https://generativelanguage.googleapis.com"),
+            freesound_api_key=os.environ.get("FREESOUND_API_KEY", "").strip(),
             director=_bool("DIRECTOR", True),
             director_model=(os.environ.get("DIRECTOR_MODEL", "").strip()
                             or os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"),

@@ -195,7 +195,7 @@ From now on the bot ignores every other chat.
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log, what Gemini picked and the clips it made; retry failed or cancelled jobs, cancel running ones, delete failed and cancelled ones (🗑 per job, or **Clear failed**). **New job** takes a link plus optional in/out timecodes and what to look for. |
 | **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, template, and **notes for clipping** (who's who, nicknames, running jokes) that Gemini reads for every clip. |
-| **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
+| **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out (20 s or longer), pick how many clips (1–5, or type up to 15), then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
 | **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
 | **Storage** | Free disk, what takes the space, and every job with files left: **Delete files** per job or **Clean up finished jobs**. |
 | **Logs & errors** | clipbot's log (errors and warnings by default, click a row for the traceback), Telegram messages that are queued or gave up (send again or delete), and failed n8n runs once `N8N_API_KEY` is set. |
@@ -328,15 +328,24 @@ right away; **Render** makes the real file and sends it to Telegram again.
 |---|---|
 | Clip | Split at the playhead (**S**), select a part and **Delete** it, drag a part's edges to trim it. The waveform shows where the talking is. |
 | Captions | The **Captions** tab lists every line: fix a misheard word or empty a line to drop it. Timing stays. **Reset** brings the transcript back. |
-| Effects | **Effect here** (**E**) or the **Effects** tab: sound, volume, preview; drag the diamonds to move them. They come on top of the template's own effects. |
-| Zooms | **Zoom here** (**Z**): a quick punch-in on the picture (captions stay put); drag to move or resize, set how far it zooms. |
+| Sounds | The **Sounds** tab is a sound board: your sounds by category, ▶ previews one, **+** drops it at the playhead, and a ★ puts it on keys **1–9** so you can drop it while the clip plays. **E** drops the last one again. **Find more sounds online** searches Myinstants (memes) or Freesound (CC0). Each placed sound has its own volume; drag the diamonds to move them. They come on top of the template's own effects. |
+| Zooms | **Zoom here** (**Z**) or the **Zooms** tab: **punch in** (a quick snap), **smooth** (eases in and out), **slow push** (creeps in over the whole zoom), **shake** (punch in with a camera shake, for impacts) or **zoom out** (starts close, pulls back), and how far. Select a zoom and click the picture to aim it at a face or the action. Captions stay put; drag a zoom to move or resize it. |
 | Hook | The **Hook** tab: the hook text (with **✨ Suggest** from Gemini), on or off for this clip, top/middle/bottom, and when it shows. Drag the hook bar to move it, its ends to make it show longer. A dashed bar is the template's timing. |
+| Transitions | Each cut gets a **⧉** marker on the clip track; click it (or open the **Cuts** tab) to pick how one kept part moves into the next. **Smooth** ones blend the two sides for 0.2–1 s, so the clip gets that much shorter: crossfade, fade through white or black, slide (4 ways), wipe, zoom in, circle, pixelate, blur whip. **On the cut** ones keep the timing: flash, glitch, camera shake, zoom punch. |
+| Freezes | **Freeze here** (**F**) holds the frame at the playhead for 0.3–5 s while the sound stops: plain, black and white, a slow zoom in, or **record scratch** (black and white plus the meme pack's `record-scratch`). Drag the ❄ marker to move it. |
+| Pictures | The **Pictures** tab drops a picture at the playhead: 42 emoji **stickers** (💀 🤯 🔥 🗿 …), or **yours**: upload PNG, JPEG, WebP or GIFs (they loop), paste a link, **Grab frame** (this frame of the clip) or **Grab a box** (drag over a face on the preview, for a reaction callback later). On the preview, drag a picture to move it, the square handle sizes it, the round one turns it; the tab sets how it comes in and goes (fade, pop, zoom, spin, slide from a side), how it moves (shake, pulse, float, spin) and its opacity. Drag its bar on the timeline to change when it shows. Pictures sit under the captions and hook. |
 
-The **Length** tab has OpenShorts cut the clip again from the stream: start up to 15 s earlier, end
+**Longer or reframed** (at the bottom of the **Cuts** tab) has OpenShorts cut the clip again from the stream: start up to 15 s earlier, end
 later, or change the framing (follow the speaker, or the whole frame with blurred bars). Your cuts,
 zooms and effects move along with the new start. This needs OpenShorts' copy of the source, which it
 keeps for a day (`OPENSHORTS_RETENTION_SECONDS` in `.env` to keep it longer); after that a clip can
 still be cut shorter, just not longer.
+
+The preview plays the source with one video, so it holds freezes for real but only hints at
+transitions (a dip, a slide, a flash). **Draft** renders the edit as it stands at 480p in a few seconds
+and shows it next to **Last render**, without saving anything or sending it to Telegram; **Render** makes
+the real one. Your pictures live in `data/images/`; the stickers are Google's Noto Emoji (Apache 2.0,
+in `clipbot/stickers`).
 
 Space plays, ←/→ step a frame (Shift: a second), Ctrl+Z / Ctrl+Shift+Z undo and redo, **Timeline
 zoom** stretches the timeline for fine trims.
@@ -428,17 +437,28 @@ several lines the box follows each line and the joins between lines are rounded 
 text in Review or the editor (**✨ Suggest** writes five new ones with Gemini), and in the editor turn
 it off, move it, or change when it shows. `AUTO_HOOK=false` in `.env` turns hooks off unless a clip
 asks for one. Clips made before this version have OpenShorts' own hook in the video, so their hook
-can't change (a re-cut in the editor's **Length** tab fixes that).
+can't change (a re-cut in the editor's **Cuts** tab, **Longer or reframed**, fixes that).
 
 **Sounds** live in `data/sounds/`; upload them on the Templates page or copy them there. A template names
-a sound by its file name without the extension, so `vine-boom.mp3` is `vine-boom`. Nothing is bundled:
-- **Sneaky Snitch** is Kevin MacLeod's ([incompetech.com](https://incompetech.com)), free under
-  Creative Commons BY 4.0 as long as each post credits him. The Sneaky template adds that credit line to
-  every post's caption.
-- For a **vine boom** and other effects, use files you're allowed to use (royalty-free sound effect
-  libraries have them).
-- Skip copyrighted songs: YouTube and TikTok mute or claim them. Check each campaign's rules too; some
-  forbid added music or want their own sound added in the TikTok app.
+a sound by its file name without the extension, so `vine-boom.mp3` is `vine-boom`. Each sound has a
+category (impact, reactions, fails, hype, transitions, funny, suspense, music), and a ★ puts it on the
+editor's number keys. Nothing is stored in this repo; three ways to fill the library:
+- **Install meme pack** (Templates page) downloads about 30 popular meme sounds from
+  [Myinstants](https://www.myinstants.com) onto your server: vine boom, metal pipe, taco bell bong,
+  bruh, HUH, wow, emotional damage, sad violin, airhorn, record scratch, among us and more, plus
+  **Sneaky Snitch** for the Sneaky template. A sound that's gone from the site is skipped and named;
+  pressing it again fetches only what's missing.
+- **Find more sounds** searches Myinstants (memes) or [Freesound](https://freesound.org) (CC0 only)
+  and adds a result to the library. Freesound search needs a free key: apply at
+  freesound.org/apiv2/apply and put it in `.env` as `FREESOUND_API_KEY`.
+- **Upload** your own files.
+
+Licensing: meme sounds aren't licensed. Platforms rarely claim them, but posting them is on you. CC0
+sounds from Freesound are free to use anywhere. **Sneaky Snitch** is Kevin MacLeod's
+([incompetech.com](https://incompetech.com)), free under Creative Commons BY 4.0 as long as each post
+credits him; the Sneaky template adds that credit line to every post's caption. Skip copyrighted songs:
+YouTube and TikTok mute or claim them. Check each campaign's rules too; some forbid added music or want
+their own sound added in the TikTok app.
 
 **Where effects land:**
 

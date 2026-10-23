@@ -141,7 +141,7 @@ def test_jobs_create_cancel_retry(dash):
     assert dash.app.state.store.get_job(job["id"]).chat_id == 111  # notifications go to your chat
 
     for bad, needle in (({"url": "youtu.be/x"}, "https://"),
-                        ({"url": "https://x.y/v", "start": "1:00", "end": "1:20"}, "at least 45"),
+                        ({"url": "https://x.y/v", "start": "1:00", "end": "1:15"}, "at least 20"),
                         ({"url": "https://x.y/v", "start": "5:00"}, "both"),
                         ({"url": "https://x.y/v", "start": "abc", "end": "1:00"}, "isn't a time")):
         resp = dash.post("/api/jobs", json=bad)

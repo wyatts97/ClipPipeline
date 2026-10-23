@@ -61,7 +61,7 @@ def test_timestamp_inside_url_is_not_a_range():
 
 @pytest.mark.parametrize("text,needle", [
     ("https://youtu.be/x 10:00-5:00", "ends before"),
-    ("https://youtu.be/x 10:00-10:30", "at least"),
+    ("https://youtu.be/x 10:00-10:15", "at least"),
     ("https://youtu.be/x 0:00-3:00:00", "limit is 90"),
     ("https://youtu.be/x clips=40", "between 1 and 15"),
 ])

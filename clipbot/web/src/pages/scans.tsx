@@ -191,7 +191,10 @@ function SelectionPanel({ scan, selection, setSelection, moment }: {
     )
   }
   const length = selection.end - selection.start
-  const tooShort = length < 45
+  const { min_range_seconds: minLength, clip_min_seconds: clipMin, max_clips: maxClips } = scan.limits
+  const tooShort = length < minLength
+  const clips = Math.min(maxClips, Math.max(1, Number(count) || 1))
+  const crowded = !tooShort && clips * clipMin > length + 1
   const commit = () => {
     const s = parseTc(inText)
     const e = parseTc(outText)
@@ -213,13 +216,22 @@ function SelectionPanel({ scan, selection, setSelection, moment }: {
       </div>
       <div className="pb-1.5 text-sm">
         <span className={cn("timecode", tooShort && "text-destructive")}>{tc(length)}</span>
-        <span className="ml-1 text-muted-foreground">{tooShort ? "too short, needs 0:45" : moment ? `moment ${moment.rank}` : "selected"}</span>
+        <span className="ml-1 text-muted-foreground">{tooShort ? `too short, needs ${tc(minLength)}` : moment ? `moment ${moment.rank}` : "selected"}</span>
       </div>
       <div className="space-y-1">
         <span className="block text-xs text-muted-foreground">Clips</span>
-        <ToggleGroup type="single" variant="outline" size="sm" value={count} onValueChange={(v) => v && setCount(v)}>
-          {["1", "2", "3"].map((n) => <ToggleGroupItem key={n} value={n} className="w-8">{n}</ToggleGroupItem>)}
-        </ToggleGroup>
+        <div className="flex items-center gap-1.5">
+          <ToggleGroup type="single" variant="outline" size="sm" value={count} onValueChange={(v) => v && setCount(v)}>
+            {["1", "2", "3", "4", "5"].map((n) => <ToggleGroupItem key={n} value={n} className="w-8">{n}</ToggleGroupItem>)}
+          </ToggleGroup>
+          <Input aria-label="More clips" type="number" min={1} max={maxClips} placeholder="More" className="h-8 w-16"
+            value={Number(count) > 5 ? count : ""} onChange={(e) => setCount(e.target.value ? String(Math.min(maxClips, Math.max(1, Number(e.target.value)))) : "5")} />
+        </div>
+        {crowded && (
+          <span className="block max-w-56 text-xs text-muted-foreground">
+            {clips} clips of {clipMin}+ s need {tc(clips * clipMin)}; Gemini cuts fewer if the range can't hold them.
+          </span>
+        )}
       </div>
       <div className="ml-auto flex gap-2">
         <Button variant="ghost" asChild>
@@ -227,7 +239,7 @@ function SelectionPanel({ scan, selection, setSelection, moment }: {
         </Button>
         <Button variant="ghost" onClick={() => setSelection(null)}>Clear</Button>
         <Button disabled={tooShort || clip.isPending || !!moment?.job}
-          onClick={() => clip.mutate({ start: selection.start, end: selection.end, clips: Number(count), moment_id: moment?.id })}>
+          onClick={() => clip.mutate({ start: selection.start, end: selection.end, clips, moment_id: moment?.id })}>
           {moment?.job ? "Already clipped" : "Clip this range"}
         </Button>
       </div>

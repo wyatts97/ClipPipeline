@@ -73,7 +73,7 @@ def _clean_url(url: str) -> str:
     return url.rstrip(").,;!?]>")
 
 
-def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int = 60) -> Command:
+def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int = 20) -> Command:
     text = (text or "").strip()
     if not text:
         return Command("help")

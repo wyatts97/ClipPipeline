@@ -20,7 +20,7 @@ from typing import Any, Optional
 
 import httpx
 
-from . import captions, chat, clips_api, director, editing, fonts, media, render, scoring, storage, templates
+from . import captions, chat, clips_api, director, editing, fonts, images, media, render, scoring, storage, templates
 from .config import Settings
 from .diagnose import failure_hint, failure_reason, retry_delay
 from .gemini import GeminiError, QuotaExhausted
@@ -436,27 +436,39 @@ class Pipeline:
                                 manual_sfx: list[dict[str, Any]], meta: dict[str, Any],
                                 duration: float, seed: str = "",
                                 edit: Optional[dict[str, Any]] = None,
-                                hook_text: Optional[str] = None) -> Rendered:
+                                hook_text: Optional[str] = None, draft: bool = False) -> Rendered:
         """Render source (no captions) into dst with a template and the editor's edit. A failed
         render copies the source, so the clip still exists; the error says why. Words, effects and
-        zooms come in on the source's timeline and are moved onto the edited one here."""
+        zooms come in on the source's timeline and are moved onto the edited one here. A draft is
+        quick and small, and doesn't ask Gemini for moments."""
         s = self.settings
         tid, template = self.resolve_template(template_id)
         done = Rendered(tid, template, moments=templates.cached_moments(meta))
         work = s.folder("tmp") / f"render-{dst.stem}"
         work.mkdir(parents=True, exist_ok=True)
         edit = editing.normalize(edit, duration)
-        segments = edit["segments"]
         cut = editing.is_cut(edit, duration)
         out_duration = editing.output_duration(edit) if cut else duration
         done.duration = out_duration
+        extra = editing.accents(edit)
         plan = render.Plan(duration=out_duration, voice_volume=template["voice_volume"],
-                           segments=segments if cut else None, zooms=editing.zoom_ranges(edit))
+                           segments=edit["segments"] if cut else None, zooms=editing.zoom_ranges(edit) + extra["zooms"],
+                           timeline=editing.timeline(edit) if editing.reshapes(edit) else None,
+                           gray=extra["gray"], flashes=extra["flash"], glitches=extra["glitch"], draft=draft)
         try:
-            if plan.zooms:
+            for o in editing.overlay_ranges(edit):
+                path = images.find_image(s, o["image"])
+                if not path:
+                    done.notes.append(f"the picture {o['image']} isn't in the library any more")
+                    continue
+                plan.overlays.append({**o, "path": path, "size": await render.video_size(path),
+                                      "gif": path.suffix.lower() == ".gif"})
+            if plan.zooms or plan.overlays:
                 plan.size = await render.video_size(source)
-            shown = editing.map_words(words, segments) if cut else words
-            shown_splits = [r for a, b in splits for r in editing.map_range(a, b, segments)] if cut else splits
+            if plan.timeline:
+                plan.fps = await render.video_fps(source)
+            shown = editing.map_words(words, edit) if cut else words
+            shown_splits = [r for a, b in splits for r in editing.map_range(a, b, edit)] if cut else splits
             style = template["captions"]
             captions_on = bool(s.captions and style["enabled"] and shown)
             hook = self.hook_plan(template, edit, hook_text, out_duration)
@@ -476,7 +488,7 @@ class Pipeline:
                 else:
                     done.notes.append(f"the {template['name']} template's music ({music['sound']}) isn't in "
                                       "data/sounds; upload it on the dashboard's Templates page")
-            if templates.wants_moments(template) and done.moments is None and words:
+            if templates.wants_moments(template) and done.moments is None and words and not draft:
                 done.moments = await templates.find_moments(s, words)
                 if done.moments is None:     # asked again on the next render
                     done.notes.append("moment effects were skipped: " + (
@@ -487,9 +499,11 @@ class Pipeline:
                                           if moment else None)
             moments, manual = done.moments, manual_sfx
             if cut:
-                peak = editing.map_time(peak, segments) if peak is not None else None
-                moments = editing.map_points(moments or [], segments) if moments is not None else None
-                manual = editing.map_points(manual_sfx, segments)
+                peak = editing.map_time(peak, edit) if peak is not None else None
+                moments = editing.map_points(moments or [], edit) if moments is not None else None
+                manual = editing.map_points(manual_sfx, edit)
+            scratch = templates.find_sound(s, "record-scratch") if extra["scratch"] else None
+            manual = manual + [{"sound": "record-scratch", "t": t, "volume": 1.0} for t in extra["scratch"] if scratch]
             missing = set()
             for event in templates.place_effects(template, shown, out_duration, peak, moments, manual, seed):
                 path = templates.find_sound(s, event["sound"])
@@ -585,6 +599,7 @@ class Pipeline:
                                                 seed=f"{clip.job_id}_{clip.idx}", edit=edit,
                                                 hook_text=None if legacy_hook else clip.hook)
             tmp.replace(clip.path)
+            (self.settings.data_dir / "tmp" / "drafts" / f"{clip.id}.mp4").unlink(missing_ok=True)
             preview = Path(clip.preview_path or self.settings.folder("previews") / f"{clip.job_id}_{clip.idx}.mp4")
             await media.make_preview(Path(clip.path), preview, self.settings.preview_max_mb,
                                      self.settings.preview_height)
@@ -611,6 +626,36 @@ class Pipeline:
                                render_error=error[:1000] if error else None, duration=done.duration)
         log.info("clip %s: rendered with the %s template", clip.id, done.template["name"], extra={"job_id": job.id})
         self.resend_clip(job, self.store.get_clip(clip.id), done)
+
+    async def draft(self, clip_id: str, template_id: Optional[str] = None,
+                    sfx: Optional[list[dict[str, Any]]] = None, edit: Optional[dict[str, Any]] = None,
+                    words: Optional[list[dict[str, Any]]] = None, hook_text: Optional[str] = None) -> Path:
+        """A quick 480p render of the editor's work as it stands, to check freezes, transitions and
+        timing. Nothing is saved: the clip stays as it is and Telegram hears nothing."""
+        clip = self.store.get_clip(clip_id)
+        job = self.store.get_job(clip.job_id) if clip else None
+        if not clip or not job:
+            raise media.MediaError("no such clip")
+        source = self.clean_source(clip)
+        folder = self.settings.folder("tmp") / "drafts"
+        folder.mkdir(parents=True, exist_ok=True)
+        for old in folder.glob("*.mp4"):                  # drafts are for now: two days at most
+            if time.time() - old.stat().st_mtime > 2 * 86400:
+                old.unlink(missing_ok=True)
+        dst, tmp = folder / f"{clip.id}.mp4", folder / f"{clip.id}.rendering.mp4"
+        duration = await media.probe_duration(source)
+        edit = editing.normalize(edit if edit is not None else (json.loads(clip.edit) if clip.edit else None), duration)
+        legacy_hook = "hook_rendered" not in clip.meta
+        done = await self.render_clip_files(
+            job, source, tmp, clip.word_list() if words is None else words, clip.split_list(),
+            template_id or clip.template, clip.manual_sfx() if sfx is None else sfx, dict(clip.meta), duration,
+            seed=f"{clip.job_id}_{clip.idx}", edit=edit,
+            hook_text=None if legacy_hook else (clip.hook if hook_text is None else hook_text), draft=True)
+        if done.error:
+            tmp.unlink(missing_ok=True)
+            raise media.MediaError(done.error)
+        tmp.replace(dst)
+        return dst
 
     async def recut(self, clip_id: str, extend_start: float = 0.0, extend_end: float = 0.0,
                     framing: Optional[str] = None) -> None:
