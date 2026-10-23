@@ -1,5 +1,6 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query"
 import { cn } from "cn"
+import { Trash2 } from "lucide-react"
 import { useState } from "react"
 import { Link, useNavigate, useParams } from "react-router"
 import { toast } from "sonner"
@@ -36,18 +37,34 @@ function useJobActions() {
     mutationFn: api.cancelJob,
     onSuccess: (job) => { toast(`Job ${job.id} cancelled`); refresh() },
   })
-  return { retry, cancel }
+  const remove = useMutation({
+    mutationFn: api.deleteJob,
+    onSuccess: (r, id) => { toast(`Job ${id} deleted`, { description: r.freed ? `Freed ${size(r.freed)}.` : undefined }); refresh() },
+  })
+  const clearFailed = useMutation({
+    mutationFn: api.clearFailedJobs,
+    onSuccess: (r) => {
+      toast(`Deleted ${r.deleted} job${r.deleted === 1 ? "" : "s"}`, { description: r.freed ? `Freed ${size(r.freed)}.` : undefined })
+      refresh()
+    },
+  })
+  return { retry, cancel, remove, clearFailed }
 }
+
+const deletable = (j: Job) => j.status === "failed" || j.status === "cancelled"
 
 export function JobsPage() {
   const { jobId } = useParams()
   const navigate = useNavigate()
   const [filter, setFilter] = useState<Filter>("all")
   const [creating, setCreating] = useState(false)
+  const [clearing, setClearing] = useState(false)
+  const { remove, clearFailed } = useJobActions()
   const jobs = useQuery({ queryKey: ["jobs"], queryFn: () => api.jobs(), refetchInterval: 5000 })
   const items = (jobs.data?.items ?? []).filter((j) =>
     filter === "all" ? true : filter === "active" ? isActive(j.status)
-      : filter === "done" ? j.status === "done" : j.status === "failed" || j.status === "cancelled")
+      : filter === "done" ? j.status === "done" : deletable(j))
+  const failedCount = (jobs.data?.items ?? []).filter(deletable).length
 
   return (
     <div className="mx-auto max-w-7xl space-y-6">
@@ -60,6 +77,11 @@ export function JobsPage() {
           <ToggleGroupItem value="done">Done</ToggleGroupItem>
           <ToggleGroupItem value="failed">Failed</ToggleGroupItem>
         </ToggleGroup>
+        {failedCount > 0 && (
+          <Button variant="outline" onClick={() => setClearing(true)} disabled={clearFailed.isPending}>
+            <Trash2 /> Clear failed ({failedCount})
+          </Button>
+        )}
         <Button onClick={() => setCreating(true)}>New job</Button>
       </div>
 
@@ -77,6 +99,7 @@ export function JobsPage() {
                 <TableHead className="w-40">Range</TableHead>
                 <TableHead className="w-20 text-right">Clips</TableHead>
                 <TableHead className="w-32 text-right">Started</TableHead>
+                <TableHead className="w-12"><span className="sr-only">Delete</span></TableHead>
               </TableRow>
             </TableHeader>
             <TableBody>
@@ -100,6 +123,14 @@ export function JobsPage() {
                     {job.status === "done" ? job.clip_count : <span className="text-muted-foreground">{job.target_clips}</span>}
                   </TableCell>
                   <TableCell className="text-right text-muted-foreground">{ago(job.created)}</TableCell>
+                  <TableCell className="py-0 text-right">
+                    {deletable(job) && (
+                      <Button variant="ghost" size="icon" aria-label={`Delete job ${job.id}`} disabled={remove.isPending}
+                        onClick={(ev) => { ev.stopPropagation(); remove.mutate(job.id) }}>
+                        <Trash2 />
+                      </Button>
+                    )}
+                  </TableCell>
                 </TableRow>
               ))}
             </TableBody>
@@ -109,6 +140,24 @@ export function JobsPage() {
 
       <JobSheet jobId={jobId} onClose={() => navigate("/jobs")} />
       <NewJobDialog open={creating} onOpenChange={setCreating} />
+      <Dialog open={clearing} onOpenChange={setClearing}>
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Delete {failedCount} failed job{failedCount === 1 ? "" : "s"}?</DialogTitle>
+            <DialogDescription>
+              Failed and cancelled jobs go for good: their files, their logs and anything they left unreviewed. Jobs
+              with approved clips stay.
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setClearing(false)}>Keep them</Button>
+            <Button variant="destructive" disabled={clearFailed.isPending}
+              onClick={() => clearFailed.mutate(undefined, { onSettled: () => setClearing(false) })}>
+              Delete
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   )
 }
@@ -120,7 +169,7 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
     enabled: !!jobId,
     refetchInterval: (q) => (q.state.data && isActive(q.state.data.status) ? 3000 : false),
   })
-  const { retry, cancel } = useJobActions()
+  const { retry, cancel, remove } = useJobActions()
   const d = job.data
 
   return (
@@ -147,6 +196,7 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
               <dd>{clock(d.created)}{isActive(d.status) && <span className="ml-2 text-muted-foreground timecode">running {elapsed(d.created)}</span>}</dd>
               <dt className="text-muted-foreground">Template</dt>
               <dd>{d.template ?? "default"}</dd>
+              {d.note && (<><dt className="text-muted-foreground">Looking for</dt><dd>{d.note}</dd></>)}
               {d.openshorts_job && (<><dt className="text-muted-foreground">OpenShorts job</dt><dd className="font-mono text-xs">{d.openshorts_job}</dd></>)}
               {d.retry_of && (<><dt className="text-muted-foreground">Retry of</dt><dd><Link to={`/jobs/${d.retry_of}`} className="hover:underline">job {d.retry_of}</Link></dd></>)}
               {d.retried_by && (<><dt className="text-muted-foreground">Retried as</dt><dd><Link to={`/jobs/${d.retried_by}`} className="hover:underline">job {d.retried_by}</Link></dd></>)}
@@ -165,7 +215,31 @@ function JobSheet({ jobId, onClose }: { jobId?: string; onClose: () => void }) {
               {isActive(d.status) && (
                 <Button variant="outline" onClick={() => cancel.mutate(d.id)} disabled={cancel.isPending}>Cancel job</Button>
               )}
+              {deletable(d) && (
+                <Button variant="ghost" disabled={remove.isPending}
+                  onClick={() => remove.mutate(d.id, { onSuccess: onClose })}>
+                  <Trash2 /> Delete job
+                </Button>
+              )}
             </div>
+
+            {d.picks.length > 0 && (
+              <section>
+                <h3 className="mb-1 font-medium">Gemini's picks</h3>
+                <p className="mb-2 text-xs text-muted-foreground">
+                  {d.status === "queued" ? "Spotted in the scan. Gemini watches the range again to cut them exactly." : "What Gemini watched and chose to cut."}
+                </p>
+                <ul className="space-y-1.5">
+                  {d.picks.map((p, i) => (
+                    <li key={i} className="flex gap-3">
+                      <span className="timecode w-24 shrink-0 text-muted-foreground">{tc(p.start)}–{tc(p.end)}</span>
+                      <span className="min-w-0 flex-1">{p.what_happened}</span>
+                      <span className="shrink-0 tabular-nums text-muted-foreground" title="How well Gemini thinks it would do (0-100)">{p.score}</span>
+                    </li>
+                  ))}
+                </ul>
+              </section>
+            )}
 
             {d.clips.length > 0 && (
               <section>
@@ -241,6 +315,7 @@ export function NewJobDialog({ open, onOpenChange, initial }: {
   const [end, setEnd] = useState(initial?.end ?? "")
   const [clips, setClips] = useState("3")
   const [template, setTemplate] = useState("")
+  const [note, setNote] = useState("")
   const templates = useQuery({ queryKey: ["templates"], queryFn: api.templates, enabled: open })
   const s = parseTc(start)
   const e = parseTc(end)
@@ -249,13 +324,14 @@ export function NewJobDialog({ open, onOpenChange, initial }: {
   const create = useMutation({
     mutationFn: () => api.createJob({
       url, start: start || undefined, end: end || undefined, clips: Number(clips) || undefined, template: template || undefined,
+      note: note.trim() || undefined,
     }),
     onSuccess: (job: Job) => {
       toast.success(`Job ${job.id} queued`)
       qc.invalidateQueries({ queryKey: ["jobs"] })
       qc.invalidateQueries({ queryKey: ["overview"] })
       onOpenChange(false)
-      setUrl(""); setStart(""); setEnd("")
+      setUrl(""); setStart(""); setEnd(""); setNote("")
       navigate(`/jobs/${job.id}`)
     },
   })
@@ -291,6 +367,12 @@ export function NewJobDialog({ open, onOpenChange, initial }: {
           <p className="text-sm text-muted-foreground">
             {length !== null ? <>Clips <span className="timecode">{tc(length)}</span> of the video.</> : "Leave start and end empty to use the whole video."}
           </p>
+          <div className="space-y-1.5">
+            <Label htmlFor="job-note">What to look for <span className="font-normal text-muted-foreground">(optional)</span></Label>
+            <Input id="job-note" placeholder="his friend smashes the monitor" value={note} maxLength={300}
+              onChange={(ev) => setNote(ev.target.value)} />
+            <p className="text-xs text-muted-foreground">Gemini watches the range for it and cuts it exactly.</p>
+          </div>
           <div className="space-y-1.5">
             <Label htmlFor="job-template">Template</Label>
             <NativeSelect id="job-template" value={template} onChange={(ev) => setTemplate(ev.target.value)}>

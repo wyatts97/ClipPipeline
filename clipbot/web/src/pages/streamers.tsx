@@ -16,6 +16,7 @@ import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
+import { Textarea } from "@/components/ui/textarea"
 import { api, type Streamer, type StreamerVod, type Template } from "@/lib/api"
 import { ago, tc } from "@/lib/format"
 
@@ -124,6 +125,33 @@ function AddStreamer({ templates }: { templates: Template[] }) {
   )
 }
 
+/** What Gemini should know about this streamer when it picks clips and writes their copy. */
+function StreamerNotes({ streamer: s }: { streamer: Streamer }) {
+  const { edit } = useStreamerActions()
+  const [notes, setNotes] = useState(s.notes)
+  const changed = notes.trim() !== s.notes
+  return (
+    <details className="border-b border-border px-4 py-3 text-sm">
+      <summary className="cursor-pointer text-muted-foreground select-none hover:text-foreground">
+        Notes for clipping{s.notes ? "" : " (none yet)"}
+      </summary>
+      <div className="mt-2 space-y-2">
+        <Textarea aria-label={`Notes about ${s.label}`} rows={3} value={notes} onChange={(e) => setNotes(e.target.value)}
+          placeholder="Who's who, nicknames, running jokes, the game. E.g. Kevin is his roommate and breaks everything; chat calls him the menace." />
+        <div className="flex flex-wrap items-center gap-3">
+          <Button size="sm" disabled={!changed || edit.isPending}
+            onClick={() => edit.mutate({ id: s.id, body: { notes } }, { onSuccess: () => toast.success("Notes saved") })}>
+            Save notes
+          </Button>
+          <span className="text-xs text-muted-foreground">
+            Gemini reads these for every clip of this streamer, so moments and titles name the right people.
+          </span>
+        </div>
+      </div>
+    </details>
+  )
+}
+
 function StreamerCard({ streamer: s, templates }: { streamer: Streamer; templates: Template[] }) {
   const { edit, check, backfill, scan, remove } = useStreamerActions()
   const [confirming, setConfirming] = useState(false)
@@ -165,6 +193,8 @@ function StreamerCard({ streamer: s, templates }: { streamer: Streamer; template
           <Button size="icon" variant="ghost" aria-label={`Remove ${s.label}`} onClick={() => setConfirming(true)}><Trash2 /></Button>
         </div>
       </header>
+
+      <StreamerNotes key={s.notes} streamer={s} />
 
       {!s.vods.length ? (
         <p className="px-4 py-6 text-sm text-muted-foreground">No past broadcasts found yet.</p>

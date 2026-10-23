@@ -99,6 +99,13 @@ async def seed(settings: Settings) -> None:
 
     vod = "https://www.twitch.tv/videos/2901337436"
     done = job(vod, 2190, 2325, 3, "done", 3600, os_job="5a1c0d4e-0000-4000-8000-00000000d0e1")
+    # What the Director picked for it (shown on the job and in Review).
+    happened = ["His roommate walks in and unplugs the stream mid-fight", "Chat calls the ambush before he sees it",
+                "He clutches a 1v4 with one HP left", "The boss one-shots him during his victory lap",
+                "He argues with chat about the last fight and loses"]
+    store.update_job(done.id, note="the roommate unplugging the stream", preset=json.dumps([
+        {"start": 2190 + i * 25, "end": 2210 + i * 25, "score": 90 - i * 8, "category": "chaos",
+         "what_happened": h} for i, h in enumerate(happened[:3])]))
     titles = [("He really said that on stream", "He said WHAT 😳"), ("Chat lost it after this play", "Wait for it…"),
               ("The cleanest clutch you'll see today", "1v4. No way 🔥"), ("Boss fight goes sideways", "This is fine 🙂"),
               ("Streamer vs. chat, round two", "Chat was right 💀")]
@@ -108,6 +115,7 @@ async def seed(settings: Settings) -> None:
         await media.make_thumbnail(master, thumbs / f"{done.id}_{i}.jpg")
         clip = store.add_clip(done.id, i, title, hook, {
             "video_title_for_youtube_short": title, "viral_hook_text": hook,
+            "what_happened": happened[i], "streamer": "twitch/lirik",
             "hook_rendered": "",          # the demo videos have no hook yet: re-render to draw it
             "video_description_for_tiktok": f"{title} #twitch #streamer #clips",
             "video_description_for_instagram": f"{title}. Follow for daily clips."}, float(5 + i), str(master), None)
@@ -188,9 +196,12 @@ async def seed(settings: Settings) -> None:
                       duration=float(sig.duration), signals='["chat 9,812 msgs", "audio", "4 viewer clips"]')
     scored = score(sig)
     for rank, m in enumerate(find_moments(sig, scored=scored), 1):
-        row = store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info={
-            "chat_ratio": m.chat_ratio, "loud": m.loud, "clips": m.clips, "clip_views": m.clip_views,
-            "replayed": m.replayed, "top_tokens": m.top_tokens})
+        if rank <= 3:     # as the Director would leave them: what it saw, its clips, viewers' titles
+            m.picks = [{"start": m.peak - 20, "end": m.peak + 10, "score": 92 - rank * 9, "category": "funny",
+                        "what_happened": happened[rank], "why": "", "hook": "", "title": "", "tiktok": "",
+                        "instagram": "", "window": f"w{rank}"}]
+            m.clip_titles = ["NO WAY" if rank == 1 else "chat called it"]
+        row = store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info=m.info())
         if rank == 1:
             store.claim_moment(row.id, done.id)
     store.save_timeline(scan.id, timeline(sig, *scored))
@@ -212,7 +223,8 @@ async def seed(settings: Settings) -> None:
 
     # Streamers: one with auto-clip and a VOD list (one live, one scanned, one not), one failing.
     lirik = store.add_watch(CHAT, "twitch", "lirik", None)
-    store.update_watch(lirik.id, auto_clip=2, template="meme", checked=now - 420)
+    store.update_watch(lirik.id, auto_clip=2, template="meme", checked=now - 420,
+                       notes="Kevin is his roommate and breaks everything; chat calls him the menace.")
     store.save_vods(lirik.id, [
         LatestVod("2905550001", "https://www.twitch.tv/videos/2905550001", None, True, "LIVE: late night chaos"),
         LatestVod("2901337436", vod, 3 * 3600.0, False, "VALOR MORTIS! Enshrouded starts SOON", now - 86400),

@@ -33,6 +33,7 @@ import httpx
 
 from . import captions
 from .config import Settings
+from .gemini import Gemini, GeminiError, text_part
 
 log = logging.getLogger("clipbot.templates")
 
@@ -231,10 +232,13 @@ def cached_moments(meta: dict[str, Any]) -> Optional[list[dict[str, Any]]]:
 
 
 # ---- hook ideas from Gemini ---------------------------------------------------------------
-HOOK_PROMPT = """Write {n} different hook lines for the start of this short vertical clip cut from a livestream.
-A hook is the text overlay that makes people stop scrolling in the first second: max 8 words, punchy,
-a question, a "POV:", a bold claim or a tease of what happens. Same language as the transcript. No
-hashtags, no emoji, no quotes around it. Vary the style between the lines.
+HOOK_PROMPT = """Write {n} different hook lines for the start of this short vertical clip cut from a \
+livestream{streamer}. The hook is the text on the video's first seconds.
+Each line: at most 8 words, about this exact moment (name the people or the thing that happens), in
+the plain voice of a clip channel that actually watches this streamer, in the clip's language. No
+hashtags, no emoji, no quotes around it. Never "POV:", "you won't believe", "wait for it", "wait till
+the end", "insane moment", "this is crazy". Vary them: say what happens, lead with the reaction,
+tease the payoff without spoiling it.
 {context}
 Transcript:
 {lines}"""
@@ -242,36 +246,38 @@ Transcript:
 
 async def suggest_hooks(settings: Settings, words: list[dict[str, Any]], title: Optional[str] = None,
                         current: Optional[str] = None, n: int = 5,
-                        client: Optional[httpx.AsyncClient] = None) -> Optional[list[str]]:
-    """Hook lines for a clip, or None when Gemini isn't set up or failed."""
+                        client: Optional[httpx.AsyncClient] = None, *, what_happened: str = "",
+                        streamer: str = "", notes: str = "",
+                        examples: Optional[list[str]] = None) -> Optional[list[str]]:
+    """Hook lines for a clip, written with what the Director saw happen, your notes about the
+    streamer and hooks you posted; None when Gemini isn't set up or failed."""
     if not settings.gemini_api_key:
         return None
     lines = " ".join(w["w"] for w in words[:900]) or "(no speech)"
-    context = "\n".join(x for x in (f"Clip title: {title}" if title else "",
-                                    f"The current hook, which needs replacing: {current}" if current else "") if x)
-    body = {"contents": [{"parts": [{"text": HOOK_PROMPT.format(n=n, context=context, lines=lines)}]}],
-            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.9,
-                                 "responseSchema": {"type": "OBJECT", "properties": {
-                                     "hooks": {"type": "ARRAY", "items": {"type": "STRING"}}}, "required": ["hooks"]}}}
-    url = f"{settings.gemini_api_url}/v1beta/models/{settings.gemini_model}:generateContent"
-    own = client is None
-    client = client or httpx.AsyncClient(timeout=60)
+    context = "\n".join(x for x in (
+        f"What happens in the clip: {what_happened}" if what_happened else "",
+        f"Clip title: {title}" if title else "",
+        f"The current hook, which needs replacing: {current}" if current else "",
+        f"About the streamer, from the channel owner: {notes}" if notes else "",
+        ("Hooks the owner posted recently (match this voice): " + " | ".join(examples)) if examples else "") if x)
+    prompt = HOOK_PROMPT.format(n=n, streamer=f" ({streamer})" if streamer else "", context=context, lines=lines)
+    schema = {"type": "OBJECT", "properties": {"hooks": {"type": "ARRAY", "items": {"type": "STRING"}}},
+              "required": ["hooks"]}
     try:
-        resp = await client.post(url, json=body, headers={"x-goog-api-key": settings.gemini_api_key})
-        resp.raise_for_status()
-        text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+        gem = Gemini(settings, client)
+        try:
+            answer = await gem.generate_json([text_part(prompt)], schema, temperature=0.9, retries=0)
+        finally:
+            await gem.aclose()
         hooks = []
-        for item in json.loads(text).get("hooks") or []:
+        for item in answer.get("hooks") or []:
             line = captions.strip_emoji(str(item)).strip().strip('"').strip()
             if line and line.lower() not in (h.lower() for h in hooks):
                 hooks.append(line[:80])
         return hooks[:n]
-    except (httpx.HTTPError, KeyError, IndexError, ValueError, TypeError) as e:
+    except (GeminiError, TypeError, AttributeError) as e:
         log.warning("hook ideas failed: %s", e)
         return None
-    finally:
-        if own:
-            await client.aclose()
 
 
 # ---- moments from Gemini ------------------------------------------------------------------

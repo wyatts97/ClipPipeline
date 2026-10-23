@@ -71,10 +71,13 @@ def parse_youtube_live_chat(path: Path) -> list[ChatMessage]:
     return messages
 
 
-async def fetch_twitch_chat(vod_id: str, work_dir: Path, binary: str = "TwitchDownloaderCLI") -> list[ChatMessage]:
+async def fetch_twitch_chat(vod_id: str, work_dir: Path, binary: str = "TwitchDownloaderCLI",
+                            start: Optional[float] = None, end: Optional[float] = None) -> list[ChatMessage]:
+    """The VOD's chat replay; with start and end, only that stretch (still in VOD seconds)."""
     work_dir.mkdir(parents=True, exist_ok=True)
     out = work_dir / "chat.json"
-    await run([binary, "chatdownload", "--id", vod_id, "-o", str(out), "--collision", "Overwrite",
+    crop = ["-b", f"{int(start)}s", "-e", f"{int(end) + 1}s"] if start is not None and end is not None else []
+    await run([binary, "chatdownload", "--id", vod_id, "-o", str(out), "--collision", "Overwrite", *crop,
                "--banner", "false", "--log-level", "Error", "--temp-path", str(work_dir)], timeout=3600)
     if not out.is_file():
         raise MediaError("TwitchDownloaderCLI wrote no chat file")

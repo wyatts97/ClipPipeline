@@ -156,7 +156,8 @@ MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"), ("jobs"
               ("clips", "edit", "TEXT"), ("scans", "watch_id", "TEXT"),
               ("watches", "auto_scan", "INTEGER NOT NULL DEFAULT 1"),
               ("watches", "auto_clip", "INTEGER NOT NULL DEFAULT 0"),
-              ("watches", "template", "TEXT"), ("watches", "checked", "REAL"), ("watches", "check_error", "TEXT"))
+              ("watches", "template", "TEXT"), ("watches", "checked", "REAL"), ("watches", "check_error", "TEXT"),
+              ("watches", "notes", "TEXT"), ("jobs", "note", "TEXT"), ("jobs", "preset", "TEXT"))
 LOG_KEEP_DAYS = 14
 LOG_KEEP_ROWS = 20000
 
@@ -179,6 +180,11 @@ class Job:
     updated: float
     retry_of: Optional[str] = None
     template: Optional[str] = None     # template id picked for the job; None = the default
+    note: Optional[str] = None         # what to look for ("friend smashes the monitor"), for the Director
+    preset: Optional[str] = None       # JSON: the Director's clips, in VOD seconds (director.Pick)
+
+    def preset_picks(self) -> list[dict[str, Any]]:
+        return json.loads(self.preset) if self.preset else []
 
 
 @dataclass
@@ -289,6 +295,7 @@ class Watch:
     template: Optional[str] = None     # template for those clips (None = the default)
     checked: Optional[float] = None    # last time its VOD list was read
     check_error: Optional[str] = None
+    notes: Optional[str] = None        # who's who, nicknames, running jokes: the Director reads them
 
 
 @dataclass
@@ -329,17 +336,19 @@ class Store:
     # ---- jobs ------------------------------------------------------------
     def create_job(self, chat_id: int, source_url: str, range_start: Optional[float],
                    range_end: Optional[float], target_clips: int,
-                   retry_of: Optional[str] = None, template: Optional[str] = None) -> Job:
+                   retry_of: Optional[str] = None, template: Optional[str] = None,
+                   note: Optional[str] = None, preset: Optional[list[dict[str, Any]]] = None) -> Job:
         now = time.time()
+        preset_json = json.dumps(preset) if preset else None
         job = Job(new_id(), chat_id, source_url, range_start, range_end, target_clips,
-                  "queued", None, None, now, now, retry_of, template)
+                  "queued", None, None, now, now, retry_of, template, note, preset_json)
         with self._lock:
             self._db.execute(
                 "INSERT INTO jobs (id, chat_id, source_url, range_start, range_end, target_clips, "
-                "status, openshorts_job, error, created, updated, retry_of, template) "
-                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                "status, openshorts_job, error, created, updated, retry_of, template, note, preset) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                 (job.id, job.chat_id, job.source_url, job.range_start, job.range_end,
-                 job.target_clips, job.status, None, None, now, now, retry_of, template))
+                 job.target_clips, job.status, None, None, now, now, retry_of, template, note, preset_json))
         return job
 
     def get_job(self, job_id: str) -> Optional[Job]:
@@ -389,6 +398,23 @@ class Store:
                 "SELECT * FROM jobs WHERE chat_id=? ORDER BY created DESC LIMIT ?",
                 (chat_id, limit)).fetchall()
         return [Job(**dict(r)) for r in rows]
+
+    def delete_job(self, job_id: str) -> None:
+        """A job and what's recorded about it: its clips, log lines and undelivered events. Its scan
+        moment can be clipped again, and a retry of it stands on its own."""
+        with self._lock:
+            self._db.execute("BEGIN")
+            try:
+                self._db.execute("DELETE FROM clips WHERE job_id=?", (job_id,))
+                self._db.execute("DELETE FROM logs WHERE job_id=?", (job_id,))
+                self._db.execute("DELETE FROM outbox WHERE json_extract(payload, '$.job_id')=?", (job_id,))
+                self._db.execute("UPDATE moments SET job_id=NULL WHERE job_id=?", (job_id,))
+                self._db.execute("UPDATE jobs SET retry_of=NULL WHERE retry_of=?", (job_id,))
+                self._db.execute("DELETE FROM jobs WHERE id=?", (job_id,))
+                self._db.execute("COMMIT")
+            except sqlite3.Error:
+                self._db.execute("ROLLBACK")
+                raise
 
     def queue_position(self, job_id: str) -> int:
         """1-based position among jobs not yet handed to OpenShorts."""
@@ -584,6 +610,15 @@ class Store:
                     "title=COALESCE(excluded.title, title), duration=excluded.duration, "
                     "published=COALESCE(excluded.published, published), live=excluded.live",
                     (watch_id, v.vod_id, v.url, v.title, v.duration, v.published, int(v.live), now - i * 0.001))
+
+    def vod_by_id(self, vod_id: Optional[str]) -> Optional[VodRow]:
+        """A VOD of a streamer you watch, by its id on its platform."""
+        if not vod_id:
+            return None
+        with self._lock:
+            row = self._db.execute("SELECT * FROM vods WHERE vod_id=? ORDER BY seen DESC LIMIT 1",
+                                   (vod_id,)).fetchone()
+        return VodRow(**dict(row)) if row else None
 
     def vods_for_watch(self, watch_id: str, limit: int = 20) -> list[VodRow]:
         with self._lock:

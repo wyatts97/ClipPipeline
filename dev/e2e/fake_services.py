@@ -1,9 +1,11 @@
-"""Fake Telegram Bot API (:8081) and fake OpenShorts (:8001) for the end-to-end test.
+"""Fake Telegram Bot API (:8081), fake OpenShorts (:8001) and fake Gemini (:8002) for the end-to-end test.
 
 Telegram: records every call; GET /_calls returns them as JSON.
-OpenShorts: accepts any job (URL or upload), reports it completed with two clips, serves the
-clip bytes. It also serves <stream.mp4> at /media/stream.mp4 (with HTTP ranges) so /scan and
-range downloads have a "VOD" to work on.
+OpenShorts: accepts any job (URL or upload), reports it completed with two clips (or the
+preset_clips it was given, with their copy), serves the clip bytes. It also serves <stream.mp4> at
+/media/stream.mp4 (with HTTP ranges) so /scan and range downloads have a "VOD" to work on.
+Gemini: the File API (upload, ACTIVE, delete) and generateContent: two clips per video for the
+Director, hook lines, no sound-effect moments. Recorded as "process" / "gemini" calls.
 
     python fake_services.py <sample.mp4> [<stream.mp4>]
 """
@@ -20,7 +22,7 @@ from pathlib import Path
 SAMPLE = Path(sys.argv[1]).read_bytes() if len(sys.argv) > 1 else b""
 STREAM = Path(sys.argv[2]).read_bytes() if len(sys.argv) > 2 else b""
 CALLS: list[dict] = []
-STATE = {"webhook_url": "", "message_id": 100}
+STATE = {"webhook_url": "", "message_id": 100, "presets": None, "uploads": 0}
 LOCK = threading.Lock()
 
 
@@ -117,8 +119,11 @@ class OpenShorts(BaseHTTPRequestHandler):
         self.wfile.write(data)
 
     def do_POST(self):
-        parse_body(self)
+        body = parse_body(self)
         if self.path == "/api/process":
+            with LOCK:
+                CALLS.append({"method": "process", "body": body})
+                STATE["presets"] = body.get("preset_clips")
             return self._send({"job_id": "fake-os-job", "status": "queued"})
         if self.path == "/api/uploads":
             return self._send({"upload_id": "up1", "upload_url": "http://ignored/api/uploads/up1"})
@@ -153,6 +158,10 @@ class OpenShorts(BaseHTTPRequestHandler):
         if self.path.startswith("/media/"):
             return self._send_bytes(STREAM)
         if self.path == "/api/status/fake-os-job":
+            presets = STATE["presets"]
+            if presets:      # the patched OpenShorts cuts exactly these and hands their copy back
+                return self._send({"status": "completed", "logs": [], "result": {"clips": [
+                    {**c, "video_url": f"/videos/fake-os-job/{'ab'[i % 2]}.mp4"} for i, c in enumerate(presets)]}})
             return self._send({"status": "completed", "logs": [], "result": {"clips": [
                 {"video_url": "/videos/fake-os-job/a.mp4", "video_title_for_youtube_short": "Big play",
                  "viral_hook_text": "No way he hit that 😳"},
@@ -167,9 +176,68 @@ class OpenShorts(BaseHTTPRequestHandler):
         return self._send({"detail": "not found"}, 404)
 
 
+class Gemini(BaseHTTPRequestHandler):
+    def log_message(self, *args):
+        pass
+
+    def _send(self, obj, status=200, headers=None):
+        data = json.dumps(obj).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _file(self, name):
+        return {"name": name, "uri": f"http://127.0.0.1:8002/v1beta/{name}", "mimeType": "video/mp4", "state": "ACTIVE"}
+
+    def do_GET(self):
+        return self._send(self._file(self.path.split("/v1beta/", 1)[-1]))
+
+    def do_DELETE(self):
+        with LOCK:
+            CALLS.append({"method": "gemini", "body": {"kind": "delete"}})
+        return self._send({})
+
+    def do_POST(self):
+        raw = read_raw(self)
+        if self.path == "/upload/v1beta/files":
+            with LOCK:
+                STATE["uploads"] += 1
+                n = STATE["uploads"]
+            return self._send({}, headers={"x-goog-upload-url": f"http://127.0.0.1:8002/upload-session/{n}"})
+        if self.path.startswith("/upload-session/"):
+            with LOCK:
+                CALLS.append({"method": "gemini", "body": {"kind": "upload", "bytes": len(raw)}})
+            return self._send({"file": self._file(f"files/f{self.path.rsplit('/', 1)[1]}")})
+        body = json.loads(raw)
+        parts = body["contents"][0]["parts"]
+        wanted = list(body["generationConfig"]["responseSchema"]["properties"])
+        if wanted == ["clips"]:       # the Director: two clips in every video it was shown
+            videos = [m.group(1) for part in parts for m in [re.match(r"Video (\w+) \(", part.get("text", ""))] if m]
+            answer = {"clips": [c for v in videos for c in (
+                {"video": v, "start": 1, "end": 21, "score": 91, "category": "chaos", "why": "it's loud",
+                 "what_happened": "the streamer yells at the screen", "hook": "he did not take that well",
+                 "title": "Streamer loses it at the screen", "tiktok": "he lost it #stream", "instagram": "he lost it"},
+                {"video": v, "start": 22, "end": 40, "score": 70, "category": "reaction", "why": "chat",
+                 "what_happened": "chat spams the same joke", "hook": "chat was ready", "title": "Chat was ready",
+                 "tiktok": "chat #stream", "instagram": "chat"})]}
+            with LOCK:
+                CALLS.append({"method": "gemini", "body": {"kind": "director", "videos": videos,
+                                                           "prompt": parts[0]["text"]}})
+        elif wanted == ["hooks"]:
+            answer = {"hooks": ["he did not take that well", "chat saw it coming"]}
+        else:
+            answer = {"moments": []}
+        return self._send({"candidates": [{"content": {"parts": [{"text": json.dumps(answer)}]}}]})
+
+
 def main():
     servers = [ThreadingHTTPServer(("127.0.0.1", 8081), Telegram),
-               ThreadingHTTPServer(("127.0.0.1", 8001), OpenShorts)]
+               ThreadingHTTPServer(("127.0.0.1", 8001), OpenShorts),
+               ThreadingHTTPServer(("127.0.0.1", 8002), Gemini)]
     for s in servers:
         threading.Thread(target=s.serve_forever, daemon=True).start()
     print("fake services up", flush=True)

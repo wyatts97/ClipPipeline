@@ -1,0 +1,94 @@
+diff --git a/app.py b/app.py
+index 2524f96..7d9610e 100644
+--- a/app.py
++++ b/app.py
+@@ -3094,6 +3094,7 @@ async def process_endpoint(
+     captions: Optional[str] = Form(None),
+     upload_id: Optional[str] = Form(None),
+     max_minutes: Optional[str] = Form(None),
++    preset_clips: Optional[str] = Form(None),
+ ):
+     api_key = await resolve_gemini(request)
+     if not api_key and not (llm_backend.active() and not BILLING_ENABLED):
+@@ -3129,6 +3130,7 @@ async def process_endpoint(
+         captions = body.get("captions")
+         upload_id = body.get("upload_id")
+         max_minutes = body.get("max_minutes")
++        preset_clips = body.get("preset_clips")
+ 
+     # Normalize output format (auto = keep pipeline default).
+     if output_format not in ("vertical", "horizontal", "square"):
+@@ -3275,6 +3277,25 @@ async def process_endpoint(
+     if n_clips is not None or min_secs is not None or max_secs is not None:
+         print(f"[gen-controls] job={job_id} clips={n_clips} band={min_secs}-{max_secs}")
+ 
++    # preset_clips: the caller already chose the clips ([{start, end, title/description/hook
++    # fields}], seconds into the source), so the pipeline cuts exactly those instead of asking
++    # the model to pick (main.py, PRESET_CLIPS).
++    if preset_clips:
++        presets = preset_clips
++        if isinstance(presets, str):
++            try:
++                presets = json.loads(presets)
++            except ValueError:
++                raise HTTPException(status_code=400, detail="preset_clips must be JSON")
++        if (not isinstance(presets, list) or not 0 < len(presets) <= 30
++                or not all(isinstance(c, dict) and isinstance(c.get("start"), (int, float))
++                           and isinstance(c.get("end"), (int, float)) and c["end"] > c["start"]
++                           for c in presets)):
++            raise HTTPException(status_code=400,
++                                detail="preset_clips must be 1-30 clips with numeric start < end")
++        env["PRESET_CLIPS"] = json.dumps(presets)
++        print(f"[preset] job={job_id} {len(presets)} clip(s) chosen by the caller")
++
+     # captions=false: the source already carries burned-in subtitles (or the
+     # caller adds its own later), so skip the free auto-caption pass instead
+     # of stacking a second layer. Absent → the deployment default (on).
+diff --git a/main.py b/main.py
+index ecaad43..92ccfc6 100644
+--- a/main.py
++++ b/main.py
+@@ -1836,6 +1836,30 @@ def clear_transcript_checkpoint(output_dir):
+ CLIP_RETRY_PAUSE_SECONDS = float(os.environ.get("CLIP_RETRY_PAUSE_SECONDS", "10"))
+ 
+ 
++def preset_clips(video_duration):
++    """Clips the caller already chose (PRESET_CLIPS, set by /api/process from preset_clips):
++    cut as given instead of asking the model, clamped to the video. None when there are none."""
++    raw = os.environ.get("PRESET_CLIPS", "").strip()
++    if not raw:
++        return None
++    try:
++        items = json.loads(raw)
++    except ValueError:
++        print("⚠️ PRESET_CLIPS isn't valid JSON — picking clips as usual.")
++        return None
++    clips = []
++    for c in items if isinstance(items, list) else []:
++        try:
++            start, end = float(c["start"]), float(c["end"])
++        except (KeyError, TypeError, ValueError):
++            continue
++        start = max(0.0, start)
++        end = min(float(video_duration), end) if video_duration else end
++        if end - start >= 1.0:
++            clips.append({**c, "start": round(start, 3), "end": round(end, 3)})
++    return clips or None
++
++
+ def clip_render_order(shorts):
+     """Indices of ``shorts`` best-first by ``predicted_score`` (ties and
+     unscored clips keep their original order, after the scored ones)."""
+@@ -2507,7 +2531,11 @@ if __name__ == '__main__':
+ 
+         # 4. Gemini Analysis (transcript-driven, or vision for silent videos)
+         early_clips = (early_state or {}).get("clips") if early_state else None
+-        if (transcript is not None and early_clips
++        presets = preset_clips(duration)
++        if presets:
++            print(f"🎯 Cutting the {len(presets)} clip(s) the caller chose — no clip selection.")
++            clips_data = {"shorts": presets}
++        elif (transcript is not None and early_clips
+                 and transcript is early_state["transcript"]):
+             print("♻️ Using the clips Gemini picked while the video downloaded.")
+             clips_data = early_clips

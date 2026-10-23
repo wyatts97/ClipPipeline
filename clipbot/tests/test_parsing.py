@@ -40,6 +40,15 @@ def test_url_with_range_and_clips():
     assert cmd.target_clips == 5
 
 
+def test_what_to_look_for():
+    cmd = parse_message("https://www.twitch.tv/videos/1 1:02:00-1:12:00 clips=3 find: friend smashes the monitor t=meme")
+    assert (cmd.start, cmd.end, cmd.target_clips, cmd.template) == (3720, 4320, 3, "meme")
+    assert cmd.note == "friend smashes the monitor"
+    cmd = parse_message("https://www.twitch.tv/videos/1 look for = kevin breaks stuff around 1:05-1:07 clips=2")
+    assert (cmd.note, cmd.target_clips, cmd.start) == ("kevin breaks stuff around 1:05-1:07", 2, None)
+    assert parse_message("https://www.twitch.tv/videos/1 1:02:00-1:12:00").note is None
+
+
 def test_range_before_url_and_hms_style():
     cmd = parse_message("1h2m-1h12m https://kick.com/video/xyz")
     assert (cmd.start, cmd.end) == (3720, 4320)

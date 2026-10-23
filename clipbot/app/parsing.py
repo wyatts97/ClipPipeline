@@ -11,6 +11,8 @@ Accepted forms (anything else gets the help text):
     <url> 1:02:00-1:12:30         clip only that part (also 62:00-72:30, 1h2m-1h12m)
     <url> clips=5                 how many clips to make (1-15)
     <url> t=meme                  which template (captions, music, sound effects); /templates lists them
+    <url> find: friend smashes the monitor
+                                  what to look for (Gemini watches for it); the rest of the message
 """
 from __future__ import annotations
 
@@ -24,6 +26,7 @@ RANGE_RE = re.compile(
     rf"(?<![\w:])({_TIME})\s*(?:-|–|—|to)\s*({_TIME})(?![\w:])", re.IGNORECASE)
 CLIPS_RE = re.compile(r"\b(?:clips?|n)\s*[=:]\s*(\d{1,2})\b", re.IGNORECASE)
 TEMPLATE_RE = re.compile(r"\b(?:t|template|style)\s*[=:]\s*([\w-]{1,40})", re.IGNORECASE)
+NOTE_RE = re.compile(r"\b(?:find|look\s+for|about|note)\s*[=:]\s*(.+)$", re.IGNORECASE | re.DOTALL)
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
 
 Kind = Literal["help", "status", "clip", "scan", "watch", "unwatch", "watching", "cleanup", "templates",
@@ -40,6 +43,7 @@ class Command:
     error: Optional[str] = None
     arg: Optional[str] = None
     template: Optional[str] = None
+    note: Optional[str] = None        # what to look for, for the Director
 
 
 def parse_timestamp(value: str) -> float:
@@ -105,6 +109,16 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
     url = _clean_url(url_match.group(0))
     rest = (text[:url_match.start()] + " " + text[url_match.end():]).strip()
 
+    note = None
+    note_match = NOTE_RE.search(rest)
+    if note_match:      # the rest of the message, except options written after it (t=meme, clips=3)
+        note, rest = note_match.group(1), rest[:note_match.start()]
+        for option in (TEMPLATE_RE, CLIPS_RE):
+            for found in option.finditer(note):
+                rest += " " + found.group(0)
+            note = option.sub(" ", note)
+        note = " ".join(note.split())[:300] or None
+
     template = None
     template_match = TEMPLATE_RE.search(rest)
     if template_match:
@@ -137,4 +151,4 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
                            error=f"The range is {format_timestamp(length)} long; the limit is "
                                  f"{max_range_minutes} minutes (MAX_RANGE_MINUTES).")
 
-    return Command("clip", url=url, start=start, end=end, target_clips=target, template=template)
+    return Command("clip", url=url, start=start, end=end, target_clips=target, template=template, note=note)

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
 import shutil
 import time
 from dataclasses import dataclass, field
@@ -19,12 +20,14 @@ from typing import Any, Optional
 
 import httpx
 
-from . import captions, editing, fonts, media, render, storage, templates
+from . import captions, chat, clips_api, director, editing, fonts, media, render, scoring, storage, templates
 from .config import Settings
 from .diagnose import failure_hint, failure_reason, retry_delay
+from .gemini import GeminiError, QuotaExhausted
 from .openshorts import OpenShorts, OpenShortsError
 from .parsing import format_timestamp
-from .store import Clip, Job, Store
+from .platforms import detect_vod
+from .store import Clip, Job, Store, Watch
 
 log = logging.getLogger("clipbot.pipeline")
 
@@ -44,10 +47,28 @@ def clip_caption(job: Job, clip: Clip, total: int, template_name: Optional[str] 
         lines.append(clip.title)
     if clip.hook:
         lines.append(f"🪝 {clip.hook}")
+    if clip.meta.get("what_happened"):
+        lines.append(f"👀 {clip.meta['what_happened']}")
     lines.append(f"📼 {job.source_url} ({range_label(job)})")
     lines.append(f"id {clip.id}")
     caption = "\n".join(lines)
     return caption if len(caption) <= CAPTION_LIMIT else caption[:CAPTION_LIMIT - 1] + "…"
+
+
+DIRECTOR_CHUNK = 20 * 60      # a long range is watched in stretches this long
+
+
+def preset_clip(p: director.Pick) -> dict[str, Any]:
+    """A Director pick as one of OpenShorts' preset_clips (openshorts/patches): cut as given, and its
+    copy comes back with the clip like OpenShorts' own."""
+    return {"start": p.start, "end": p.end, "predicted_score": p.score, "category": p.category,
+            "what_happened": p.what_happened, "video_title_for_youtube_short": p.title,
+            "viral_hook_text": p.hook, "video_description_for_tiktok": p.tiktok,
+            "video_description_for_instagram": p.instagram}
+
+
+def streamer_key(watch: Optional[Watch]) -> str:
+    return f"{watch.platform}/{watch.channel}" if watch else ""
 
 
 @dataclass
@@ -143,6 +164,11 @@ class Pipeline:
                                                       tmp_dir, self.settings.cookies_file)
                 if self.cancelled(job.id):
                     return
+                presets = await self.direct_job(job, source, tmp_dir / "director")
+                if self.cancelled(job.id):
+                    return
+                if presets:
+                    options["preset_clips"] = presets
                 self.store.update_job(job.id, status="submitting")
                 upload_id = await self.openshorts.upload_file(source)
                 os_job = await self.openshorts.process(upload_id=upload_id, options=options)
@@ -160,6 +186,94 @@ class Pipeline:
             return
         self.store.update_job(job.id, status="processing", openshorts_job=os_job)
         log.info("job %s: submitted as OpenShorts job %s", job.id, os_job, extra={"job_id": job.id})
+
+    # ---- the Director ---------------------------------------------------------
+    def job_streamer(self, job: Job) -> tuple[Optional[Watch], Optional[str]]:
+        """The streamer a job's VOD belongs to (when you watch them) and the stream's title."""
+        moment = self.store.moment_for_job(job.id)
+        scan = self.store.get_scan(moment.scan_id) if moment else None
+        if scan and scan.watch_id:
+            return self.store.get_watch(scan.watch_id), scan.title
+        vod = self.store.vod_by_id(detect_vod(job.source_url).vod_id)
+        if vod:
+            return self.store.get_watch(vod.watch_id), vod.title
+        scans = self.store.scans_for_url(job.source_url)
+        return None, scans[0].title if scans else None
+
+    async def range_context(self, job: Job, work: Path) -> tuple[list[tuple[float, str, int]], list[tuple[float, str]]]:
+        """Chat and viewers' clip titles for a job's range (Twitch), in VOD seconds; empty when
+        unavailable. Best effort: the Director works without them."""
+        s, vod = self.settings, detect_vod(job.source_url)
+        if vod.platform != "twitch" or not vod.vod_id or job.range_start is None or job.range_end is None:
+            return [], []
+        messages, titles = [], []
+        try:
+            got = await chat.fetch_twitch_chat(vod.vod_id, work / "chat", s.twitch_downloader,
+                                               job.range_start, job.range_end)
+            messages = scoring.chat_sample(got, job.range_start, job.range_end, limit=120)
+        except (media.MediaError, OSError, ValueError) as e:
+            log.info("job %s: no chat for the Director (%s)", job.id, e, extra={"job_id": job.id})
+        if s.twitch_client_id and s.twitch_client_secret:
+            try:
+                markers = await clips_api.twitch_clip_markers(self.notify_client, vod.vod_id,
+                                                              s.twitch_client_id, s.twitch_client_secret)
+                titles = [(m.t, m.title) for m in sorted(markers, key=lambda m: -m.views)
+                          if m.title and job.range_start - 10 <= m.t <= job.range_end]
+            except (httpx.HTTPError, KeyError, ValueError) as e:
+                log.info("job %s: no viewer clips for the Director (%s)", job.id, e, extra={"job_id": job.id})
+        return messages, titles
+
+    async def direct_job(self, job: Job, source: Path, work: Path) -> Optional[list[dict[str, Any]]]:
+        """Gemini watches the downloaded range and chooses the clips (director.py): OpenShorts'
+        preset_clips, in the section's seconds. None lets OpenShorts pick them, as before: no Gemini
+        key, the Director is off, it found nothing, or it failed (logged; Telegram hears about a
+        used-up quota)."""
+        s = self.settings
+        if not (s.director and s.gemini_api_key):
+            return None
+        offset = job.range_start or 0.0
+        work.mkdir(parents=True, exist_ok=True)
+        try:
+            duration = await media.probe_duration(source)
+            watch, title = self.job_streamer(job)
+            messages, titles = await self.range_context(job, work)
+            examples, skipped = director.learned(self.store, streamer_key(watch))
+            hints = [director.Pick.from_dict(p).shifted(-offset) for p in job.preset_picks()]
+            ctx = director.Context(
+                streamer=f"{watch.channel} ({watch.platform.title()})" if watch else "", title=title or "",
+                notes=(watch.notes or "") if watch else "", note=job.note or "", examples=examples,
+                skipped=skipped, hints=hints, want=None if hints else job.target_clips,
+                min_len=s.clip_min_seconds, max_len=s.clip_max_seconds)
+            windows = []
+            parts = max(1, math.ceil(duration / DIRECTOR_CHUNK))        # even stretches, no scrap at the end
+            for i in range(parts):
+                a, b = round(i * duration / parts, 3), round((i + 1) * duration / parts, 3)
+                proxy = await media.make_proxy(source, work / f"w{i + 1}.mp4", start=a, duration=b - a)
+                windows.append(director.Window(
+                    f"w{i + 1}", proxy, a, b,
+                    chat=[(t - offset, text, n) for t, text, n in messages if a <= t - offset < b],
+                    clip_titles=[t for at, t in titles if a - 10 <= at - offset < b][:5]))
+            log.info("job %s: Gemini is watching %s of the stream", job.id, format_timestamp(duration),
+                     extra={"job_id": job.id})
+            picks = await director.direct(s, windows, ctx)
+        except QuotaExhausted as e:
+            log.warning("job %s: %s; OpenShorts picks the clips", job.id, e, extra={"job_id": job.id})
+            self.store.enqueue_event({"event": "message", "chat_id": job.chat_id, "text":
+                                      f"⚠️ {e}, so job {job.id} uses OpenShorts' own picks."})
+            return None
+        except (GeminiError, media.MediaError, OSError) as e:
+            log.warning("job %s: the Director failed (%s); OpenShorts picks the clips", job.id, e,
+                        extra={"job_id": job.id})
+            return None
+        if not picks:
+            log.info("job %s: Gemini found nothing worth posting; OpenShorts picks instead", job.id,
+                     extra={"job_id": job.id})
+            return None
+        self.store.update_job(job.id, preset=json.dumps([p.shifted(offset).to_dict() for p in picks]))
+        log.info("job %s: Gemini picked %d clip(s): %s", job.id, len(picks), "; ".join(
+            f"{format_timestamp(p.start + offset)} {p.what_happened[:80]} ({p.score})" for p in picks),
+            extra={"job_id": job.id})
+        return [preset_clip(p) for p in picks]
 
     def cancelled(self, job_id: str) -> bool:
         job = self.store.get_job(job_id)
@@ -215,6 +329,7 @@ class Pipeline:
         made: list[Clip] = []
         names: dict[str, str] = {}
         problems: list[str] = []
+        streamer = streamer_key(self.job_streamer(job)[0])
         for idx, info in enumerate(results):
             video_url = info.get("video_url")
             if not video_url:
@@ -225,6 +340,8 @@ class Pipeline:
             meta = {k: info.get(k) for k in (
                 "start", "end", "video_title_for_youtube_short", "video_description_for_tiktok",
                 "video_description_for_instagram", "viral_hook_text")}
+            meta.update({k: info[k] for k in ("what_happened", "category", "predicted_score")    # the Director's
+                         if info.get(k) is not None})
             try:
                 local = s.openshorts_output_dir / job.openshorts_job / video_url.rsplit("/", 1)[-1]
                 if local.is_file():
@@ -258,6 +375,8 @@ class Pipeline:
             if done.template.get("credit"):
                 meta["credit"] = done.template["credit"]
             title = info.get("title") or info.get("video_title_for_youtube_short")
+            # The AI's own copy and the streamer, so your edits can teach the Director (director.learned).
+            meta.update(ai_title=title, ai_hook=info.get("viral_hook_text"), streamer=streamer)
             clip = self.store.add_clip(job.id, idx, title, info.get("viral_hook_text"), meta,
                                        duration, str(master), str(preview))
             self.store.update_clip(clip.id, template=done.template_id, words=json.dumps(words) if words else None,
@@ -570,7 +689,8 @@ class Pipeline:
         if not delay or not self.settings.auto_retry or job.retry_of:
             return None
         retry = self.store.create_job(job.chat_id, job.source_url, job.range_start, job.range_end,
-                                      job.target_clips, retry_of=job.id)
+                                      job.target_clips, retry_of=job.id, template=job.template,
+                                      note=job.note, preset=job.preset_picks() or None)
         self.store.update_job(retry.id, created=time.time() + delay)
         log.info("job %s: retrying in %ds as job %s", job.id, delay, retry.id, extra={"job_id": job.id})
         return retry

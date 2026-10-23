@@ -18,13 +18,14 @@ from typing import Optional
 
 import httpx
 
-from . import chat, clips_api, signals
+from . import chat, clips_api, director, media, signals
 from .config import Settings
+from .gemini import GeminiError, QuotaExhausted
 from .media import MediaError
 from .parsing import format_timestamp as ts
 from .platforms import (Channel, LatestVod, Vod, detect_channel, detect_vod, list_vods,
                         timestamp_link)
-from .scoring import Moment, StreamSignals, find_moments, score, timeline
+from .scoring import Moment, StreamSignals, chat_sample, find_moments, score, timeline
 from .store import Scan, Store, Watch
 
 log = logging.getLogger("clipbot.scout")
@@ -49,6 +50,10 @@ def moment_text(rank: int, vod: Vod, m: Moment) -> str:
     if m.replayed:
         details.append("📈 most replayed")
     lines = [f"#{rank} 🔥 {ts(m.peak)}  (window {ts(m.start)}–{ts(m.end)})"]
+    if m.picks:
+        best = m.picks[0]
+        lines.append(f"👀 {best['what_happened']} ({best['score']}/100)"
+                     + (f" +{len(m.picks) - 1} more" if len(m.picks) > 1 else ""))
     if details:
         lines.append(" · ".join(details))
     if m.top_tokens:
@@ -133,9 +138,19 @@ class Scout:
             if not (sig.messages or sig.loudness_db or sig.markers or sig.heatmap):
                 raise ScanError("no signal could be read (" + "; ".join(notes) + ").")
             scored = score(sig)
-            moments = find_moments(sig, top=s.scan_top, before=s.scan_before_seconds,
-                                   after=s.scan_after_seconds, scored=scored)
+            directing = bool(s.director and s.gemini_api_key)
+            moments = find_moments(sig, top=s.scan_candidates if directing else s.scan_top,
+                                   before=s.scan_before_seconds, after=s.scan_after_seconds, scored=scored)
             self.store.save_timeline(scan.id, timeline(sig, *scored))
+            if directing and moments:
+                try:
+                    watched = len(moments)
+                    moments = await self.direct_scan(scan, title, sig, moments, work)
+                    notes.append(f"Gemini watched {watched} moment(s), kept {len(moments)}")
+                except (GeminiError, MediaError) as e:
+                    log.warning("scan %s: the Director failed: %s", scan.id, e, extra={"scan_id": scan.id})
+                    notes.append(f"Gemini skipped ({'quota used up' if isinstance(e, QuotaExhausted) else str(e)[:120]})")
+                    moments = moments[:s.scan_top]
         except (ScanError, MediaError, httpx.HTTPError, KeyError, ValueError) as e:
             log.warning("scan %s failed: %s", scan.id, e, extra={"scan_id": scan.id})
             self.store.update_scan(scan.id, status="failed", error=str(e)[:2000])
@@ -153,9 +168,7 @@ class Scout:
                                          "▶️ opens the VOD there so you can check first.")
         rows = []
         for rank, m in enumerate(moments, 1):
-            row = self.store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info={
-                "chat_ratio": m.chat_ratio, "loud": m.loud, "clips": m.clips,
-                "clip_views": m.clip_views, "replayed": m.replayed, "top_tokens": m.top_tokens})
+            row = self.store.add_moment(scan.id, rank, m.peak, m.start, m.end, m.score, info=m.info())
             rows.append(row)
             self.store.enqueue_event({
                 "event": "choice", "chat_id": scan.chat_id, "text": moment_text(rank, vod, m),
@@ -173,8 +186,10 @@ class Scout:
             return []
         jobs = []
         for row in rows[:watch.auto_clip]:
+            picks = row.details.get("picks") or None
             job = self.store.create_job(scan.chat_id, scan.source_url, row.start, row.end,
-                                        self.settings.scan_clips_per_moment, template=watch.template)
+                                        len(picks) if picks else self.settings.scan_clips_per_moment,
+                                        template=watch.template, preset=picks)
             self.store.claim_moment(row.id, job.id)
             jobs.append((row.rank, job))
         self.pipeline.wake()
@@ -184,6 +199,47 @@ class Scout:
                                   + ". The clips arrive here when they're done.")
         log.info("scan %s: auto-clipping %d moment(s)", scan.id, len(jobs), extra={"scan_id": scan.id})
         return [job for _, job in jobs]
+
+    async def direct_scan(self, scan: Scan, title: str, sig: StreamSignals, moments: list[Moment],
+                          work) -> list[Moment]:
+        """Gemini watches each candidate (a small 360p copy of its window) and keeps the ones with a
+        real clip in them, best first, each window narrowed around its clips. The job that clips a
+        moment watches its own download again to cut exactly (pipeline.direct_job)."""
+        s = self.settings
+        watch = self.store.get_watch(scan.watch_id) if scan.watch_id else None
+        windows = []
+        for i, m in enumerate(moments, 1):
+            folder = work / f"w{i}"
+            try:
+                low = await media.download_section(scan.source_url, m.start, m.end, folder, s.cookies_file,
+                                                   max_height=360, name="window")
+                proxy = await media.make_proxy(low, folder / "proxy.mp4")
+            except MediaError as e:
+                log.info("scan %s: candidate %d not downloaded: %s", scan.id, i, e, extra={"scan_id": scan.id})
+                continue
+            windows.append(director.Window(f"w{i}", proxy, m.start, m.end,
+                                           chat=chat_sample(sig.messages or [], m.start, m.end),
+                                           clip_titles=m.clip_titles, signals=director.signals_text(m.info())))
+        if not windows:
+            raise MediaError("none of the moments could be downloaded for Gemini")
+        key = f"{watch.platform}/{watch.channel}" if watch else ""
+        examples, skipped = director.learned(self.store, key)
+        ctx = director.Context(streamer=f"{watch.channel} ({watch.platform.title()})" if watch else "",
+                               title=title, notes=(watch.notes or "") if watch else "", examples=examples,
+                               skipped=skipped, min_len=s.clip_min_seconds, max_len=s.clip_max_seconds)
+        picks = await director.direct(s, windows, ctx)
+        kept = []
+        for i, m in enumerate(moments, 1):
+            mine = sorted((p for p in picks if p.window == f"w{i}"), key=lambda p: p.score, reverse=True)
+            if not mine:
+                continue
+            m.picks = [p.to_dict() for p in mine]
+            # The job only needs the clips and a little around them (its own Director pass refines the cut).
+            m.start = max(0.0, min(p.start for p in mine) - 20)
+            m.end = min(sig.duration, max(p.end for p in mine) + 20)
+            kept.append(m)
+        kept.sort(key=lambda m: m.picks[0]["score"], reverse=True)
+        return kept[:s.scan_top]
 
     async def gather(self, vod: Vod, info: dict, duration: float, work,
                      scan_id: Optional[str] = None) -> tuple[StreamSignals, list[str]]:
@@ -253,10 +309,14 @@ class Scout:
             return "Unknown moment", None
         if moment.job_id:
             return "Already queued", None
-        start, end, clips = moment.start, moment.end, self.settings.scan_clips_per_moment
-        if mode == "2":
+        picks = moment.details.get("picks") or None
+        start, end = moment.start, moment.end
+        clips = len(picks) if picks else self.settings.scan_clips_per_moment
+        note = None
+        if mode == "2":       # wider: Gemini picks the two best clips around what it saw
             start, end, clips = max(0.0, start - 60), min(scan.duration or end + 60, end + 60), 2
-        job = self.store.create_job(chat_id, scan.source_url, start, end, clips)
+            note, picks = moment.details.get("what_happened"), None
+        job = self.store.create_job(chat_id, scan.source_url, start, end, clips, note=note, preset=picks)
         self.store.claim_moment(moment.id, job.id)
         self.pipeline.wake()
         return "Queued", (f"👍 Job {job.id} queued: {clips} clip(s) from {ts(start)}–{ts(end)} "

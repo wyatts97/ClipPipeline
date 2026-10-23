@@ -20,7 +20,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import FileResponse, StreamingResponse
 from pydantic import BaseModel
 
-from . import captions, editing, fonts, media, render, storage, templates
+from . import captions, director, editing, fonts, media, render, storage, templates
 from .config import Settings
 from .parsing import format_timestamp, parse_timestamp
 from .platforms import Channel, channel_url, detect_channel, detect_vod, timestamp_link
@@ -134,6 +134,10 @@ def job_out(store: Store, job: Job) -> dict[str, Any]:
         "retried_by": retry.id if retry else None, "openshorts_job": job.openshorts_job,
         "clip_count": len(store.clips_for_job(job.id)) if job.status == "done" else 0,
         "template": job.template,
+        "note": job.note,
+        # The Director's clips: what it saw in the range (VOD seconds), or the scan's hints until then.
+        "picks": [{k: p.get(k) for k in ("start", "end", "score", "category", "what_happened")}
+                  for p in job.preset_picks()],
     }
 
 
@@ -162,6 +166,7 @@ def clip_out(settings: Settings, clip: Clip, job: Optional[Job], store: Optional
         "can_render": clip.status == "pending" and clean.is_file(), "credit": meta.get("credit"),
         "edited": edited(clip),
         "hook_rendered": meta.get("hook_rendered"),
+        "what_happened": meta.get("what_happened"),    # the Director's words for the clip
         # Whether a render draws the hook: the clip's own switch, else its template's and AUTO_HOOK.
         "hook_on": bool(own_hook.get("enabled", hook_look["enabled"] and settings.auto_hook)),
         "word_count": len(clip.word_list()),
@@ -481,6 +486,7 @@ class JobIn(BaseModel):
     end: Union[str, float, None] = None
     clips: Optional[int] = None
     template: Optional[str] = None
+    note: Optional[str] = None        # what to look for ("friend smashes the monitor")
 
 
 def _job_or_404(store: Store, job_id: str) -> Job:
@@ -529,7 +535,8 @@ async def create_job(body: JobIn, request: Request):
         raise HTTPException(422, "Clips must be between 1 and 15.")
     if body.template and store.get_template(body.template) is None:
         raise HTTPException(422, "No such template.")
-    job = store.create_job(default_chat(settings), url, start, end, clips, template=body.template or None)
+    job = store.create_job(default_chat(settings), url, start, end, clips, template=body.template or None,
+                           note=(body.note or "").strip()[:300] or None)
     request.app.state.pipeline.wake()
     return job_out(store, job)
 
@@ -541,7 +548,8 @@ async def retry_job(job_id: str, request: Request):
     if job.status not in ("failed", "cancelled"):
         raise HTTPException(409, "Only failed or cancelled jobs can be retried.")
     new = store.create_job(job.chat_id, job.source_url, job.range_start, job.range_end, job.target_clips,
-                           retry_of=job.id, template=job.template)
+                           retry_of=job.id, template=job.template, note=job.note,
+                           preset=job.preset_picks() or None)
     request.app.state.pipeline.wake()
     return job_out(store, new)
 
@@ -564,6 +572,32 @@ async def delete_job_files(job_id: str, request: Request):
     except ValueError as e:
         raise HTTPException(409, str(e))
     return {"freed": freed}
+
+
+@router.delete("/jobs/{job_id}", dependencies=authed)
+async def delete_job(job_id: str, request: Request):
+    """A failed or cancelled job, gone: its files and its record."""
+    settings, store = settings_of(request), store_of(request)
+    job = _job_or_404(store, job_id)
+    try:
+        freed = storage.delete_job(settings, store, job)
+    except ValueError as e:
+        raise HTTPException(409, str(e))
+    return {"freed": freed}
+
+
+@router.post("/jobs/clear-failed", dependencies=authed)
+async def clear_failed_jobs(request: Request):
+    """Every failed and cancelled job, except ones holding approved clips."""
+    settings, store = settings_of(request), store_of(request)
+    deleted = freed = 0
+    for job in store.jobs_with_status("failed", "cancelled"):
+        try:
+            freed += storage.delete_job(settings, store, job)
+            deleted += 1
+        except ValueError:
+            continue
+    return {"deleted": deleted, "freed": freed}
 
 
 # ---- storage --------------------------------------------------------------------
@@ -1033,7 +1067,12 @@ async def hook_suggestions(clip_id: str, request: Request):
     clip = _clip_or_404(store, clip_id)
     if not settings.gemini_api_key:
         raise HTTPException(503, "Hook ideas need GEMINI_API_KEY for clipbot (docker compose up -d clipbot after setting it).")
-    hooks = await templates.suggest_hooks(settings, clip.word_list(), clip.title, clip.hook)
+    watch = request.app.state.pipeline.job_streamer(store.get_job(clip.job_id))[0] if store.get_job(clip.job_id) else None
+    examples, _ = director.learned(store, (clip.meta or {}).get("streamer") or "")
+    hooks = await templates.suggest_hooks(
+        settings, clip.word_list(), clip.title, clip.hook, what_happened=(clip.meta or {}).get("what_happened") or "",
+        streamer=f"{watch.channel} ({watch.platform.title()})" if watch else "",
+        notes=(watch.notes or "") if watch else "", examples=[e["hook"] for e in examples if e["hook"]][:6])
     if hooks is None:
         raise HTTPException(502, "Gemini didn't answer. Try again in a moment.")
     return {"suggestions": hooks}
@@ -1070,6 +1109,7 @@ class StreamerEdit(BaseModel):
     auto_scan: Optional[bool] = None
     auto_clip: Optional[int] = None
     template: Optional[str] = None    # "" = the default template
+    notes: Optional[str] = None       # who's who, nicknames, running jokes ("" = none)
 
 
 class BackfillIn(BaseModel):
@@ -1094,7 +1134,8 @@ def streamer_out(store: Store, watch: Watch) -> dict[str, Any]:
             "label": f"{watch.platform}/{watch.channel}", "url": channel_url(Channel(watch.platform, watch.channel)),
             "auto_scan": bool(watch.auto_scan), "auto_clip": watch.auto_clip, "template": watch.template,
             "template_name": (template or {}).get("name"), "checked": watch.checked,
-            "check_error": watch.check_error, "created": watch.created, "vods": vods}
+            "check_error": watch.check_error, "created": watch.created, "notes": watch.notes or "",
+            "vods": vods}
 
 
 def _watch_or_404(store: Store, watch_id: str) -> Watch:
@@ -1147,6 +1188,8 @@ async def edit_streamer(watch_id: str, body: StreamerEdit, request: Request):
         fields["auto_clip"] = max(0, min(10, body.auto_clip))
     if body.template is not None:
         fields["template"] = _check_template(store, body.template)
+    if body.notes is not None:
+        fields["notes"] = body.notes.strip()[:2000] or None
     if fields:
         store.update_watch(watch_id, **fields)
     return streamer_out(store, store.get_watch(watch_id))
@@ -1203,6 +1246,7 @@ class ScanClipIn(BaseModel):
     clips: int = 1
     moment_id: Optional[str] = None
     template: Optional[str] = None
+    note: Optional[str] = None
 
 
 def _scan_or_404(store: Store, scan_id: str) -> Scan:
@@ -1258,8 +1302,13 @@ async def clip_from_scan(scan_id: str, body: ScanClipIn, request: Request):
         raise HTTPException(409, "That moment already has a job.")
     if body.template and store.get_template(body.template) is None:
         raise HTTPException(422, "No such template.")
+    # The moment as Gemini found it: its picks guide the exact cut. A different range (wider) gets
+    # what Gemini saw as the note instead, and Gemini picks the clips in it.
+    found = moment.details if moment and moment.scan_id == scan.id else {}
+    picks = found.get("picks") if moment and (start, end) == (moment.start, moment.end) else None
+    note = (body.note or "").strip()[:300] or (None if picks else found.get("what_happened"))
     job = store.create_job(scan.chat_id or default_chat(settings), scan.source_url, start, end, body.clips,
-                           template=body.template or None)
+                           template=body.template or None, preset=picks or None, note=note)
     if moment and moment.scan_id == scan.id:
         store.claim_moment(moment.id, job.id)
     request.app.state.pipeline.wake()

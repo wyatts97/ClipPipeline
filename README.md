@@ -193,8 +193,8 @@ From now on the bot ignores every other chat.
 | **Review** | A review station: clip list, big player, editable title, hook text and TikTok/Instagram captions. **✨ Suggest** asks Gemini for fresh hook lines; **Put this hook on the video** re-renders the clip with the new one. **A** approves, **S** skips, **J/K** move between clips. Edits are saved before a decision, and edits to approved clips update their `.json`. Same result as the Telegram buttons; whichever you use first wins. Under **Look**, switch the clip's template or drop sound effects at the playhead, then **Re-render**: the new version is sent to Telegram again with fresh ✅/❌ buttons. **Post it yourself** downloads the clip and copies its TikTok, Instagram and YouTube text (what publishing would post, credit line included). The **Approved** tab downloads all approved clips as one zip, with their `.json` files. |
 | **Editor** | Review → **Open the editor**: a timeline with the waveform, cuts, captions, sound effects and zooms over a live preview ([below](#clip-editor)). |
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
-| **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log and the clips it made; retry failed or cancelled jobs, cancel running ones. **New job** takes a link plus optional in/out timecodes. |
-| **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, template. |
+| **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log, what Gemini picked and the clips it made; retry failed or cancelled jobs, cancel running ones, delete failed and cancelled ones (🗑 per job, or **Clear failed**). **New job** takes a link plus optional in/out timecodes and what to look for. |
+| **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, template, and **notes for clipping** (who's who, nicknames, running jokes) that Gemini reads for every clip. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out, then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
 | **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
 | **Storage** | Free disk, what takes the space, and every job with files left: **Delete files** per job or **Clean up finished jobs**. |
@@ -210,6 +210,7 @@ in `ALLOWED_CHAT_IDS`). Signing in lasts 30 days; changing `DASHBOARD_PASSWORD` 
 | `<link>` | Clips the whole video |
 | `<link> 1:02:00-1:12:30` | Downloads and clips only that range (also `62:00-72:30`, `1h2m-1h12m`) |
 | `<link> clips=5` | Number of clips (1-15, default `TARGET_CLIPS`) |
+| `<link> 1:02:00-1:12:00 find: his friend smashes the monitor` | What to look for: Gemini watches the range for it (the rest of the message after `find:`) |
 | `<link> t=meme` | Use that template instead of the default ([templates](#templates-captions-music-and-sound-effects)) |
 | `/scan <VOD link>` | Finds the stream's best moments and sends each with 🎬 buttons ([below](#finding-moments-scan-and-watch)) |
 | `/watch <channel link>` | Scans every new VOD of that channel when the stream ends |
@@ -230,13 +231,41 @@ Defaults live in `.env` (`TARGET_CLIPS`, `CLIP_MIN/MAX_SECONDS`, `OPENSHORTS_LAY
 **Layouts for streams:** `auto` lets Gemini pick per video. If you keep getting a plain center crop on
 facecam + gameplay streams, try `OPENSHORTS_LAYOUTS=screencast` (screen over the presenter).
 
+## How clips are picked: the Director
+
+OpenShorts on its own picks clips from the transcript, so it misses what people do rather than say
+(a monitor going through the wall, a fail, a face), and writes copy for podcasts. With `GEMINI_API_KEY`
+set, clipbot's **Director** does the picking instead: Gemini watches the video with its sound (a small
+360p copy, one frame a second) together with:
+
+- chat during it and the titles viewers gave their own clips (Twitch);
+- the stream's title and your **notes** about the streamer (Streamers page);
+- what you asked for: `find: …` in Telegram, or **What to look for** in New job;
+- your taste: the hooks and titles of clips you approved lately (and what you rewrote), and what
+  happened in clips you skipped.
+
+It returns each clip's exact start and end (setup to payoff, no dead air, within
+`CLIP_MIN/MAX_SECONDS`), what happens, a score, and the hook, title and captions in a clip-channel
+voice (no "POV:", "wait for it" or emoji spam). OpenShorts then only reframes, transcribes and
+renders those clips (a small patch in `openshorts/patches`, applied by `scripts/fetch-openshorts.sh`).
+Telegram's clip messages and the Review page show "what happened" for each clip.
+
+It runs on Gemini's **free tier**: a scan is about four requests (the candidates are watched four at a
+time), a range about one per 20 minutes. clipbot paces requests under the per-minute limit and, when
+the day's free quota is used up, says so in Telegram and lets OpenShorts pick as before. Google may use
+free-tier inputs to improve its products; the VODs are public anyway. `DIRECTOR=false` turns it off;
+`DIRECTOR_MODEL` picks another free model.
+
 ## Finding moments: /scan and /watch
 
 `/scan https://www.twitch.tv/videos/123456789` scores the whole stream in 5-second steps, each signal
-compared with that stretch of the stream's own normal level, and sends the top `SCAN_TOP` moments:
+compared with that stretch of the stream's own normal level. The best `SCAN_CANDIDATES` (15) windows go
+to the Director, which keeps the ones with a real clip in them, best first, up to `SCAN_TOP` (10)
+moments (without a Gemini key, the top `SCAN_TOP` by signals):
 
 ```
-#1 🔥 2:30:32  (window 2:29:02–2:31:18)
+#1 🔥 2:30:32  (window 2:29:32–2:31:10)
+👀 Kevin rips the monitor off the desk and throws it (92/100)
 chat 10× normal · 🔊 loud · ✂️ 3 viewer clips (1.2k views)
 💬 KEKW ×28 · Clap ×12 · ??? ×6
 ▶️ https://www.twitch.tv/videos/123456789?t=2h29m2s
@@ -244,9 +273,11 @@ chat 10× normal · 🔊 loud · ✂️ 3 viewer clips (1.2k views)
 ```
 
 - **▶️** opens the VOD at the window, so you can check the moment before spending CPU on it.
-- **🎬 Clip it** queues a normal range job for the window (`SCAN_CLIPS_PER_MOMENT` clips, default 1).
+- **🎬 Clip it** queues a range job for the window: one clip per moment Gemini found there (without
+  the Director, `SCAN_CLIPS_PER_MOMENT`). The job watches its own download again to cut exactly.
 - **➕ Wider ×2** adds a minute on each side and asks for 2 clips, for moments with a build-up.
-- The window starts `SCAN_BEFORE_SECONDS` (90) before the chat peak, because chat reacts after the moment.
+- A candidate window starts `SCAN_BEFORE_SECONDS` (120) before the chat peak, because chat reacts after
+  the moment; once Gemini has found the clips, the window is narrowed around them.
 
 What each platform gives the scan:
 
@@ -265,7 +296,7 @@ last 2 minutes are ignored.
 Measured on this setup's code against real VODs: a 2h51m Twitch VOD scanned in ~3 minutes (chat +
 audio), a 44-minute YouTube replay in 15 s, an 11-hour Kick VOD's viewer clips in seconds (audio
 adds a download of the 160p video). Scans mostly download; they use little CPU compared with an
-OpenShorts job.
+OpenShorts job. The Director adds 15 small 360p downloads and a few Gemini requests.
 
 **`/watch https://twitch.tv/<name>`** (or `kick.com/<name>`, `youtube.com/@handle`) checks the channel
 every `WATCH_INTERVAL_MINUTES`. When the newest VOD stops growing between two checks, the stream is
@@ -446,7 +477,13 @@ scripts/fetch-openshorts.sh main && docker compose build openshorts && docker co
 ```
 
 The second line moves OpenShorts off the pinned commit. If clipbot can no longer talk to it,
-go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild.
+go back with `scripts/fetch-openshorts.sh` (no argument) and rebuild. The script also applies this
+repo's patches (`openshorts/patches`) and stops with an error when one no longer fits a newer commit.
+
+**From a version before the Director:** `git pull`, then
+`scripts/fetch-openshorts.sh && docker compose build clipbot openshorts && docker compose up -d`. The
+OpenShorts rebuild adds the patch that cuts the clips Gemini chose; until then the Director's clips
+are ignored and OpenShorts picks its own.
 
 **From a version before templates:** clips now get their captions from clipbot (the Standard template
 looks like before). Rebuild clipbot: `docker compose build clipbot && docker compose up -d clipbot`.

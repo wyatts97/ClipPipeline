@@ -200,6 +200,12 @@ function Station({ clip, onNext, onPrev, isLast }: { clip: Clip; onNext: () => v
           </p>
         </div>
 
+        {clip.what_happened && (
+          <p className="rounded-md border border-border bg-card px-3 py-2 text-sm">
+            <span className="text-muted-foreground">Gemini saw: </span>{clip.what_happened}
+          </p>
+        )}
+
         <div className="space-y-4">
           <div className="space-y-1.5">
             <Label htmlFor="title">Title</Label>

@@ -24,7 +24,18 @@ export interface Job {
   clip_count: number
   template: string | null
   last_log?: string | null
+  /** What to look for, for the Director ("friend smashes the monitor"). */
+  note: string | null
+  /** The Director's clips (VOD seconds): what it chose, or a scan's hints until the job runs. */
+  picks: JobPick[]
 }
+
+export type PickCategory = "funny" | "fail" | "rage" | "chaos" | "reaction" | "clutch" | "wholesome" | "story"
+
+export interface JobPick { start: number; end: number; score: number; category: PickCategory; what_happened: string }
+
+/** A clip the Director found in a scan window (VOD seconds), with its copy. */
+export interface MomentPick extends JobPick { why: string; hook: string; title: string }
 
 export interface LogItem {
   id: number
@@ -85,6 +96,8 @@ export interface Clip {
   hook_rendered: string | null
   /** Whether a render draws the hook (the clip's own switch, else the template's and AUTO_HOOK). */
   hook_on: boolean
+  /** What happens in the clip, in the Director's words (null: OpenShorts picked it). */
+  what_happened: string | null
 }
 
 export interface Word { w: string; s: number; e: number }
@@ -130,6 +143,7 @@ export interface Streamer {
   checked: number | null
   check_error: string | null
   created: number
+  notes: string
   vods: StreamerVod[]
 }
 
@@ -244,6 +258,10 @@ export interface MomentDetails {
   clip_views?: number
   replayed?: boolean
   top_tokens?: [string, number][]
+  clip_titles?: string[]
+  picks?: MomentPick[]
+  what_happened?: string
+  director_score?: number
 }
 
 export interface Moment {
@@ -458,10 +476,14 @@ export const api = {
 
   jobs: (status?: string) => request<{ items: Job[] }>(`/api/jobs${query({ status, limit: 200 })}`),
   job: (id: string) => request<JobDetail>(`/api/jobs/${id}`),
-  createJob: (body: { url: string; start?: string; end?: string; clips?: number; template?: string }) => post<Job>("/api/jobs", body),
+  createJob: (body: { url: string; start?: string; end?: string; clips?: number; template?: string; note?: string }) =>
+    post<Job>("/api/jobs", body),
   retryJob: (id: string) => post<Job>(`/api/jobs/${id}/retry`),
   cancelJob: (id: string) => post<Job>(`/api/jobs/${id}/cancel`),
   deleteJobFiles: (id: string) => post<{ freed: number }>(`/api/jobs/${id}/delete-files`),
+  /** A failed or cancelled job, gone: its files and its record. */
+  deleteJob: (id: string) => request<{ freed: number }>(`/api/jobs/${id}`, { method: "DELETE" }),
+  clearFailedJobs: () => post<{ deleted: number; freed: number }>("/api/jobs/clear-failed"),
 
   storage: () => request<StorageReport>("/api/storage"),
   cleanup: () => post<{ jobs: number; freed: number }>("/api/storage/cleanup"),
@@ -482,7 +504,7 @@ export const api = {
   streamers: () => request<{ items: Streamer[]; interval_minutes: number }>("/api/streamers"),
   addStreamer: (body: { url: string; auto_scan: boolean; auto_clip: number; template?: string | null; backfill: number }) =>
     post<Streamer>("/api/streamers", body),
-  editStreamer: (id: string, body: { auto_scan?: boolean; auto_clip?: number; template?: string }) =>
+  editStreamer: (id: string, body: { auto_scan?: boolean; auto_clip?: number; template?: string; notes?: string }) =>
     request<Streamer>(`/api/streamers/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   removeStreamer: (id: string) => request<{ ok: boolean }>(`/api/streamers/${id}`, { method: "DELETE" }),
   refreshStreamer: (id: string) => post<Streamer>(`/api/streamers/${id}/refresh`),
@@ -507,7 +529,7 @@ export const api = {
   scan: (id: string) => request<ScanDetail>(`/api/scans/${id}`),
   createScan: (url: string) => post<Scan>("/api/scans", { url }),
   rescan: (id: string) => post<Scan>(`/api/scans/${id}/rescan`),
-  clipFromScan: (id: string, body: { start: number | string; end: number | string; clips: number; moment_id?: string }) =>
+  clipFromScan: (id: string, body: { start: number | string; end: number | string; clips: number; moment_id?: string; note?: string }) =>
     post<Job>(`/api/scans/${id}/clip`, body),
 
   logs: (params: { level?: LogLevel; source?: string; q?: string; before?: number | null }) =>

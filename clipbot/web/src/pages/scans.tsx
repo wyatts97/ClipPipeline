@@ -261,6 +261,14 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                 {m.rank}
               </button>
               <div className="min-w-0 text-sm">
+                {d.what_happened && (
+                  <p className="mb-0.5 font-medium">
+                    {d.what_happened}
+                    <span className="ml-2 font-normal text-muted-foreground tabular-nums" title="How well Gemini thinks it would do (0-100)">
+                      {d.director_score}/100{(d.picks?.length ?? 0) > 1 ? ` · ${d.picks!.length} clips` : ""}
+                    </span>
+                  </p>
+                )}
                 <button onClick={() => onPick(m)} className="text-left hover:underline">
                   Peak at <span className="timecode font-medium">{tc(m.peak)}</span>
                   <span className="ml-2 text-muted-foreground timecode">window {tc(m.start)}–{tc(m.end)}</span>
@@ -269,6 +277,9 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                   {reasons.join(", ")}
                   {d.top_tokens?.length ? <span className="ml-2 text-foreground/80">“{d.top_tokens.map(([t, n]) => `${t} ×${n}`).join("  ")}”</span> : null}
                 </p>
+                {d.clip_titles?.length ? (
+                  <p className="mt-0.5 truncate text-xs text-muted-foreground">Viewers clipped it as: {d.clip_titles.map((t) => `“${t}”`).join(", ")}</p>
+                ) : null}
               </div>
               <div className="flex flex-wrap items-center gap-2">
                 {m.job ? (
@@ -276,7 +287,7 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                 ) : (
                   <>
                     <Button size="sm" disabled={clip.isPending}
-                      onClick={() => clip.mutate({ start: m.start, end: m.end, clips: 1, moment_id: m.id })}>Clip it</Button>
+                      onClick={() => clip.mutate({ start: m.start, end: m.end, clips: d.picks?.length || 1, moment_id: m.id })}>Clip it</Button>
                     <Button size="sm" variant="outline" disabled={clip.isPending}
                       onClick={() => clip.mutate({ start: Math.max(0, m.start - 60), end: Math.min(scan.duration ?? m.end + 60, m.end + 60), clips: 2, moment_id: m.id })}>
                       Wider ×2

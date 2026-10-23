@@ -80,6 +80,27 @@ def freeable(usage: dict[str, int]) -> int:
     return usage["openshorts"] + usage["rejected"]
 
 
+def delete_job(settings: Settings, store: Store, job: Job) -> int:
+    """Delete a failed or cancelled job for good: its files (as delete_job_files, plus any clips it
+    left behind), then its record. Returns the bytes freed."""
+    if job.status not in ("failed", "cancelled"):
+        raise ValueError("Only failed or cancelled jobs can be deleted.")
+    clips = store.clips_for_job(job.id)
+    if any(c.status == "approved" for c in clips):
+        raise ValueError("This job has approved clips; delete its files instead.")
+    freed = delete_job_files(settings, store, job)
+    for clip in clips:
+        for path in (clip.path, clip.preview_path,
+                     settings.data_dir / "clean" / f"{job.id}_{clip.idx}.mp4",
+                     settings.data_dir / "thumbs" / f"{job.id}_{clip.idx}.jpg"):
+            if path and Path(path).is_file():
+                freed += size_of(Path(path))
+                Path(path).unlink(missing_ok=True)
+    store.delete_job(job.id)
+    log.info("job %s: deleted", job.id)
+    return freed
+
+
 def purge_requested(settings: Settings, os_job: Optional[str]) -> bool:
     return bool(os_job) and (settings.data_dir / "purge" / os_job).exists()
 

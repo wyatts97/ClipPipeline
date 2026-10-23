@@ -201,6 +201,10 @@ def test_streamer_api(dash):
     sid = s["id"]
     edited = dash.patch(f"/api/streamers/{sid}", json={"auto_scan": False, "auto_clip": 50, "template": ""}).json()
     assert (edited["auto_scan"], edited["auto_clip"], edited["template"]) == (False, 10, None)
+    assert edited["notes"] == ""
+    notes = dash.patch(f"/api/streamers/{sid}", json={"notes": "  Kevin = roommate, breaks stuff  "}).json()
+    assert notes["notes"] == "Kevin = roommate, breaks stuff" and notes["auto_scan"] is False
+    assert dash.patch(f"/api/streamers/{sid}", json={"notes": ""}).json()["notes"] == ""
     assert dash.post(f"/api/streamers/{sid}/scan", json={"vod_id": "300"}).status_code == 409     # live
     assert dash.post(f"/api/streamers/{sid}/scan", json={"vod_id": "nope"}).status_code == 404
     scan = dash.post(f"/api/streamers/{sid}/scan", json={"vod_id": "100"}).json()

@@ -48,9 +48,10 @@ class Settings:
     preview_max_mb: int
     preview_height: int
     # /scan and /watch
-    scan_top: int = 5
-    scan_before_seconds: int = 90
-    scan_after_seconds: int = 45
+    scan_top: int = 10                 # moments a scan keeps
+    scan_candidates: int = 15          # windows the Director watches to find them
+    scan_before_seconds: int = 120
+    scan_after_seconds: int = 60
     scan_clips_per_moment: int = 1
     scan_audio: bool = True
     scan_hype_words: frozenset[str] = frozenset()
@@ -73,6 +74,11 @@ class Settings:
     gemini_api_key: str = ""
     gemini_model: str = "gemini-3.1-flash-lite"
     gemini_api_url: str = "https://generativelanguage.googleapis.com"
+    # the Director: Gemini watches candidate moments (and ranges you send) and picks the exact clips
+    director: bool = True
+    director_model: str = "gemini-3.1-flash-lite"
+    director_batch_tokens: int = 120_000   # per request: a few windows at about 100 tokens a second
+    director_tpm: int = 200_000            # stay under the free tier's tokens-a-minute cap
     # web dashboard
     dashboard_password: str = ""
     n8n_url: str = "http://n8n:5678"
@@ -113,9 +119,10 @@ class Settings:
             max_range_minutes=_int("MAX_RANGE_MINUTES", 90),
             preview_max_mb=_int("PREVIEW_MAX_MB", 45),
             preview_height=_int("PREVIEW_HEIGHT", 960),
-            scan_top=_int("SCAN_TOP", 5),
-            scan_before_seconds=_int("SCAN_BEFORE_SECONDS", 90),
-            scan_after_seconds=_int("SCAN_AFTER_SECONDS", 45),
+            scan_top=_int("SCAN_TOP", 10),
+            scan_candidates=_int("SCAN_CANDIDATES", 15),
+            scan_before_seconds=_int("SCAN_BEFORE_SECONDS", 120),
+            scan_after_seconds=_int("SCAN_AFTER_SECONDS", 60),
             scan_clips_per_moment=_int("SCAN_CLIPS_PER_MOMENT", 1),
             scan_audio=_bool("SCAN_AUDIO", True),
             scan_hype_words=frozenset(w.strip().lower() for w in
@@ -137,6 +144,13 @@ class Settings:
             timezone=os.environ.get("TZ", "UTC").strip() or "UTC",
             gemini_api_key=os.environ.get("GEMINI_API_KEY", "").strip(),
             gemini_model=os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite",
+            gemini_api_url=(os.environ.get("GEMINI_API_URL", "").strip().rstrip("/")
+                            or "https://generativelanguage.googleapis.com"),
+            director=_bool("DIRECTOR", True),
+            director_model=(os.environ.get("DIRECTOR_MODEL", "").strip()
+                            or os.environ.get("GEMINI_MODEL", "").strip() or "gemini-3.1-flash-lite"),
+            director_batch_tokens=_int("DIRECTOR_BATCH_TOKENS", 120_000),
+            director_tpm=_int("DIRECTOR_TPM", 200_000),
             dashboard_password=os.environ.get("DASHBOARD_PASSWORD", ""),
             n8n_url=os.environ.get("N8N_URL", "http://n8n:5678").rstrip("/"),
             n8n_api_key=os.environ.get("N8N_API_KEY", "").strip(),

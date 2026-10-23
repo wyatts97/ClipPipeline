@@ -42,8 +42,9 @@ https://youtu.be/VIDEO_ID clips=5
 • A time range (h:mm:ss-h:mm:ss) processes only that part. Much faster on this server, so use it for long streams.
 • clips=N sets how many clips to make (1-15).
 • t=<template> picks the look: captions, music, sound effects (e.g. t=meme). /templates lists them.
+• find: <what happens> at the end tells Gemini what to look for in the range (e.g. find: his friend smashes the monitor).
 
-🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips) and sends each with a 🎬 button.
+🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips; Gemini watches each) and sends each with a 🎬 button.
 👀 /watch <channel link> scans every new VOD when the stream ends. /watching lists them, /unwatch <channel> stops.
 📋 /status lists your recent jobs and scans.
 🧹 /cleanup offers to delete the sources and leftovers of finished jobs.
@@ -216,13 +217,14 @@ async def handle_message(app: FastAPI, settings: Settings, chat_id: int, text: s
             return f"⚠️ There's no template called {cmd.template}. /templates lists them."
 
     job = store.create_job(chat_id, cmd.url, cmd.start, cmd.end,
-                           cmd.target_clips or settings.target_clips, template=template_id)
+                           cmd.target_clips or settings.target_clips, template=template_id, note=cmd.note)
     app.state.pipeline.wake()
     position = store.queue_position(job.id)
     part = (f"{format_timestamp(cmd.start)}–{format_timestamp(cmd.end)} "
             f"({format_timestamp(cmd.end - cmd.start)})" if cmd.start is not None else "the whole video")
     ahead = f" {position - 1} job(s) ahead of it." if position > 1 else ""
     look = f" in the {store.get_template(template_id)['name']} template" if template_id else ""
+    look += f", looking for: {cmd.note}" if cmd.note else ""
     return (f"👍 Job {job.id} queued: {job.target_clips} clip(s) from {part}{look}.{ahead}\n"
             "Clips arrive here when OpenShorts is done. On CPU that can take a while.")
 

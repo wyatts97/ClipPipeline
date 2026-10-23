@@ -100,6 +100,8 @@ services:
       # Stream VODs are often < 720p or flagged low quality; don't stop to ask.
       QUALITY_GATE_MIN_HEIGHT: "0"
       RATE_LIMIT_ENABLED: "0"
+      # clipbot's Director sends sections that hug the clips it chose (openshorts/patches).
+      MIN_SOURCE_SECONDS: "15"
       YOUTUBE_COOKIES: ${YOUTUBE_COOKIES:-}
       # How long OpenShorts keeps a job's source and work files. The clip editor can extend or
       # reframe a clip only while they're kept.
@@ -130,9 +132,10 @@ services:
       MAX_RANGE_MINUTES: ${MAX_RANGE_MINUTES:-90}
       AUTO_RETRY: ${AUTO_RETRY:-true}
       # /scan and /watch
-      SCAN_TOP: ${SCAN_TOP:-5}
-      SCAN_BEFORE_SECONDS: ${SCAN_BEFORE_SECONDS:-90}
-      SCAN_AFTER_SECONDS: ${SCAN_AFTER_SECONDS:-45}
+      SCAN_TOP: ${SCAN_TOP:-10}
+      SCAN_CANDIDATES: ${SCAN_CANDIDATES:-15}
+      SCAN_BEFORE_SECONDS: ${SCAN_BEFORE_SECONDS:-120}
+      SCAN_AFTER_SECONDS: ${SCAN_AFTER_SECONDS:-60}
       SCAN_CLIPS_PER_MOMENT: ${SCAN_CLIPS_PER_MOMENT:-1}
       SCAN_AUDIO: ${SCAN_AUDIO:-true}
       SCAN_HYPE_WORDS: ${SCAN_HYPE_WORDS:-}
@@ -150,9 +153,12 @@ services:
       PUBLISH_TO: ${PUBLISH_TO:-youtube,tiktok,instagram}
       TIKTOK_POST_MODE: ${TIKTOK_POST_MODE:-UPLOAD}
       YOUTUBE_VISIBILITY: ${YOUTUBE_VISIBILITY:-public}
-      # templates: Gemini picks the punchlines for "on punchlines" sound effects
+      # Gemini: the Director (watches moments and ranges, picks the exact clips, writes their copy),
+      # hook ideas and moment sound effects. The free tier is enough.
       GEMINI_API_KEY: ${GEMINI_API_KEY:-}
       GEMINI_MODEL: ${GEMINI_MODEL:-}
+      DIRECTOR: ${DIRECTOR:-true}
+      DIRECTOR_MODEL: ${DIRECTOR_MODEL:-}
     volumes:
       - ./data:/data                              # pending/ approved/ rejected/ live here
       - openshorts_output:/openshorts-output:ro   # read-only: sizes for the Storage page;

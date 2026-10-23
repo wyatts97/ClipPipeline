@@ -69,6 +69,38 @@ def test_delete_asks_the_janitor_and_drops_skipped_clips(env):
     assert storage.cleanup_candidates(settings, store) == []        # not offered twice
 
 
+def test_deleting_a_failed_job_removes_it_and_its_files(env):
+    settings, store = env
+    job = make_job(settings, store, status="failed")
+    pending = add_clip(settings, store, job, 0, "pending")
+    rejected = add_clip(settings, store, job, 1, "rejected")
+    retry = store.create_job(111, job.source_url, 0.0, 600.0, 2, retry_of=job.id)
+    scan = store.create_scan(111, job.source_url)
+    moment = store.add_moment(scan.id, 1, 300, 210, 345, 5.0)
+    assert store.claim_moment(moment.id, job.id)
+    store.enqueue_event({"event": "message", "chat_id": 111, "job_id": job.id, "text": "failed"})
+    store.enqueue_event({"event": "message", "chat_id": 111, "job_id": retry.id, "text": "queued"})
+    store.add_log(time.time(), "WARNING", "pipeline", "boom", job_id=job.id)
+    store.add_log(time.time(), "INFO", "pipeline", "other", job_id=retry.id)
+
+    assert storage.delete_job(settings, store, job) == 30 * MB       # OpenShorts' 26 MB + both clips
+    assert store.get_job(job.id) is None and store.clips_for_job(job.id) == []
+    assert not Path(pending.path).exists() and not Path(rejected.path).exists()
+    assert (settings.data_dir / "purge" / OS_JOB).is_file()
+    assert store.get_job(retry.id).retry_of is None                  # the retry stands on its own
+    assert store.moments_for_scan(scan.id)[0].job_id is None         # the moment can be clipped again
+    assert [e["payload"]["job_id"] for e in store.outbox()] == [retry.id]
+    assert [line["message"] for line in store.query_logs()] == ["other"]
+
+    done = make_job(settings, store, status="done", os_job=OTHER_OS_JOB)
+    with pytest.raises(ValueError, match="failed or cancelled"):
+        storage.delete_job(settings, store, done)
+    kept = make_job(settings, store, status="cancelled", os_job="1b5c7e2a-1f3d-4c6b-9a8e-123456789abc")
+    add_clip(settings, store, kept, 0, "approved")
+    with pytest.raises(ValueError, match="approved"):
+        storage.delete_job(settings, store, kept)
+
+
 def test_running_jobs_keep_their_files(env):
     settings, store = env
     job = make_job(settings, store, status="processing")

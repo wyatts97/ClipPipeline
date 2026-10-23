@@ -80,26 +80,45 @@ async def make_thumbnail(src: Path, dst: Path, height: int = 480) -> Path:
 
 
 async def download_section(url: str, start: float, end: float, out_dir: Path,
-                           cookies: Optional[Path] = None) -> Path:
-    """Download only [start, end] of a video with yt-dlp (cuts at the nearest keyframes)."""
+                           cookies: Optional[Path] = None, max_height: int = 1080,
+                           name: str = "source") -> Path:
+    """Download only [start, end] of a video with yt-dlp (cuts at the nearest keyframes).
+    max_height=360 gets a small copy, enough for Gemini to watch."""
     out_dir.mkdir(parents=True, exist_ok=True)
-    for old in out_dir.glob("source.*"):
+    for old in out_dir.glob(f"{name}.*"):
         old.unlink()
+    h = max_height
     cmd = [
         "yt-dlp", "--no-playlist", "--no-progress",
-        "-f", "bv*[height<=1080]+ba/b[height<=1080]/bv*+ba/b",
+        "-f", f"bv*[height<={h}]+ba/b[height<={h}]/bv*+ba/b" if h >= 720 else f"b[height<={h}]/bv*[height<={h}]+ba/wv*+ba/w",
         "--download-sections", f"*{start:.0f}-{end:.0f}",
         "--merge-output-format", "mp4",
-        "-o", str(out_dir / "source.%(ext)s"),
+        "-o", str(out_dir / f"{name}.%(ext)s"),
     ]
     if cookies and cookies.exists():
         cmd += ["--cookies", str(cookies)]
     cmd.append(url)
     await run(cmd, timeout=3 * 3600)
-    files = [p for p in out_dir.glob("source.*") if p.suffix not in (".part", ".ytdl")]
+    files = [p for p in out_dir.glob(f"{name}.*") if p.suffix not in (".part", ".ytdl")]
     if not files:
         raise MediaError("yt-dlp finished but wrote no file")
     return max(files, key=lambda p: p.stat().st_size)
+
+
+async def make_proxy(src: Path, dst: Path, start: float = 0.0, duration: Optional[float] = None,
+                     height: int = 360) -> Path:
+    """A small copy for Gemini to watch: one frame a second (all it samples), 360p, mono speech-rate
+    audio. Encodes fast and uploads in seconds."""
+    cmd = ["ffmpeg", "-y", "-v", "error"]
+    if start > 0:
+        cmd += ["-ss", f"{start:.3f}"]
+    cmd += ["-i", str(src)]
+    if duration:
+        cmd += ["-t", f"{duration:.3f}"]
+    cmd += ["-vf", f"fps=1,scale=-2:min(ih\\,{height})", "-c:v", "libx264", "-preset", "veryfast", "-crf", "32",
+            "-c:a", "aac", "-ac", "1", "-ar", "16000", "-b:a", "32k", "-movflags", "+faststart", str(dst)]
+    await run(cmd, timeout=1800)
+    return dst
 
 
 def slugify(text: Optional[str], max_len: int = 50) -> str:

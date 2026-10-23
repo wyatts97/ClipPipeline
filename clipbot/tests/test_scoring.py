@@ -5,7 +5,7 @@ import pytest
 
 from app.chat import ChatMessage
 from app.clips_api import ClipMarker
-from app.scoring import StreamSignals, find_moments, is_greeting, is_hype
+from app.scoring import StreamSignals, chat_sample, find_moments, is_greeting, is_hype
 
 
 @pytest.mark.parametrize("text", ["KEKW", "cohhLUL", "???", "LMAOOOOO", "hahahaha", "😂😂", "clip it",
@@ -82,9 +82,21 @@ def test_audio_only():
 
 def test_viewer_clip_marks_a_quiet_stream():
     moments = find_moments(StreamSignals(3600, loudness_db=[-30.0] * 3600,
-                                         markers=[ClipMarker(900, 30, 5000)]), top=3)
+                                         markers=[ClipMarker(900, 30, 5000, "bro smashed the monitor"),
+                                                  ClipMarker(905, 30, 9000, "KEVIN NOOO"),
+                                                  ClipMarker(910, 30, 10, "Bro smashed the monitor")]), top=3)
     assert 895 <= moments[0].peak <= 935
-    assert moments[0].clips == 1 and moments[0].clip_views == 5000
+    assert moments[0].clips == 3 and moments[0].clip_views == 14010
+    assert moments[0].clip_titles == ["KEVIN NOOO", "bro smashed the monitor"]   # most viewed first, no repeats
+
+
+def test_chat_sample_folds_repeats_and_keeps_what_was_said():
+    msgs = ([ChatMessage(100 + i * 0.1, f"u{i}", "KEKW") for i in range(14)]
+            + [ChatMessage(101, "a", "hi"), ChatMessage(102, "b", "he really just threw the monitor off the desk"),
+               ChatMessage(103, "c", "  kekw "), ChatMessage(500, "d", "later")])
+    sample = chat_sample(msgs, 90, 120, limit=2)
+    assert sample == [(100.0, "KEKW", 15), (102, "he really just threw the monitor off the desk", 1)]
+    assert chat_sample(msgs, 0, 50) == []
 
 
 def test_youtube_most_replayed():

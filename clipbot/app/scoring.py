@@ -88,6 +88,17 @@ class Moment:
     clip_views: int = 0
     replayed: bool = False
     top_tokens: list[tuple[str, int]] = field(default_factory=list)
+    clip_titles: list[str] = field(default_factory=list)     # viewers' own clips here, most viewed first
+    picks: list[dict] = field(default_factory=list)          # the Director's clips here (director.Pick), best first
+
+    def info(self) -> dict:
+        """What's stored with the moment (moments.info) and shown about it."""
+        out = {"chat_ratio": self.chat_ratio, "loud": self.loud, "clips": self.clips, "clip_views": self.clip_views,
+               "replayed": self.replayed, "top_tokens": self.top_tokens, "clip_titles": self.clip_titles}
+        if self.picks:
+            out.update(picks=self.picks, what_happened=self.picks[0]["what_happened"],
+                       director_score=self.picks[0]["score"])
+        return out
 
 
 def rolling_robust_z(values: Sequence[float], half_window: int, floor: float,
@@ -261,5 +272,37 @@ def find_moments(sig: StreamSignals, top: int = 5, before: float = 90, after: fl
             moment.replayed = parts["z_heat"][i] >= 2.0
         inside = [mk for mk in sig.markers if start - 10 <= mk.t <= end]
         moment.clips, moment.clip_views = len(inside), sum(mk.views for mk in inside)
+        moment.clip_titles = clip_titles(inside)
         moments.append(moment)
     return moments
+
+
+def clip_titles(markers: Iterable[ClipMarker], k: int = 5) -> list[str]:
+    """The titles viewers gave their clips, most viewed first, without repeats."""
+    out: list[str] = []
+    for mk in sorted(markers, key=lambda m: m.views, reverse=True):
+        title = " ".join(mk.title.split())[:120]
+        if title and title.lower() not in (t.lower() for t in out):
+            out.append(title)
+    return out[:k]
+
+
+def chat_sample(messages: Sequence[ChatMessage], start: float, end: float,
+                limit: int = 40) -> list[tuple[float, str, int]]:
+    """What chat said between start and end, for a model to read: greetings dropped, repeats folded
+    into one line with a count (KEKW ×14), at most `limit` lines (the most repeated, then the longest,
+    which tend to say what happened), in time order. [(t, text, count)]."""
+    seen: dict[str, list] = {}
+    for m in messages:
+        if not start <= m.t <= end:
+            continue
+        text = " ".join((m.text or "").split())[:200]
+        if not text or is_greeting(text):
+            continue
+        key = text.lower()
+        if key in seen:
+            seen[key][2] += 1
+        else:
+            seen[key] = [m.t, text, 1]
+    lines = sorted(seen.values(), key=lambda line: (-line[2], -len(line[1])))[:limit]
+    return [(round(t, 1), text, n) for t, text, n in sorted(lines, key=lambda line: line[0])]

@@ -133,7 +133,8 @@ def test_twitch_clip_markers():
         if path == "/helix/clips":
             assert request.url.params["ended_at"] == "2026-10-16T00:02:01Z"
             return httpx.Response(200, json={"data": [
-                {"video_id": "555", "vod_offset": 1234, "duration": 28.5, "view_count": 900},
+                {"video_id": "555", "vod_offset": 1234, "duration": 28.5, "view_count": 900,
+                 "title": " he SMASHED it "},
                 {"video_id": "555", "vod_offset": None, "duration": 30, "view_count": 50},
                 {"video_id": "999", "vod_offset": 10, "duration": 30, "view_count": 50},
             ], "pagination": {}})
@@ -143,4 +144,4 @@ def test_twitch_clip_markers():
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             return await clips_api.twitch_clip_markers(client, "555", "cid", "secret")
 
-    assert [(m.t, m.duration, m.views) for m in asyncio.run(go())] == [(1234.0, 28.5, 900)]
+    assert [(m.t, m.duration, m.views, m.title) for m in asyncio.run(go())] == [(1234.0, 28.5, 900, "he SMASHED it")]

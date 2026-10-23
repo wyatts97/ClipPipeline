@@ -95,6 +95,8 @@ def main() -> None:
                        "N8N_EVENTS_URL": "http://127.0.0.1:5678/webhook/clipbot-events",
                        "CLIPBOT_SELF_URL": "http://127.0.0.1:8080", "ALLOWED_CHAT_IDS": str(CHAT),
                        "POLL_SECONDS": "1",
+                       # The Director, against the fake Gemini (fake_services.py).
+                       "GEMINI_API_KEY": "e2e-key", "GEMINI_API_URL": "http://127.0.0.1:8002",
                        # yt-dlp lives next to this Python (venv Scripts/bin).
                        "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ.get("PATH", "")}
         (work / "data").mkdir()
@@ -182,10 +184,13 @@ def main() -> None:
                              for c in telegram_calls("sendMessage")), "scan queued reply")
         summary = wait_for(lambda: [c for c in telegram_calls("sendMessage")
                                     if "Scan done" in c["body"].get("text", "")], "scan summary", 120)[-1]["body"]
-        assert "audio" in summary["text"], summary
+        assert "audio" in summary["text"] and "Gemini watched" in summary["text"], summary
         choice = wait_for(lambda: [c for c in telegram_calls("sendMessage")
                                    if c["body"].get("text", "").startswith("#1 🔥")], "moment message")[-1]["body"]
         assert "3:0" in choice["text"].splitlines()[0] and "🔊 loud" in choice["text"], choice["text"]
+        assert "👀 the streamer yells at the screen (91/100) +1 more" in choice["text"], choice["text"]
+        watched = [c["body"] for c in telegram_calls("gemini") if c["body"]["kind"] == "director"]
+        assert watched and all(c["videos"] for c in watched), watched
         markup = choice["reply_markup"]
         buttons = (json.loads(markup) if isinstance(markup, str) else markup)["inline_keyboard"][0]
         assert [b["text"] for b in buttons] == ["🎬 Clip it", "➕ Wider ×2"], buttons
@@ -200,6 +205,14 @@ def main() -> None:
         uploaded = wait_for(lambda: telegram_calls("upload"), "range upload to OpenShorts", 120)[-1]["body"]
         assert uploaded["bytes"] > 10_000, uploaded
         wait_for(lambda: len(telegram_calls("sendVideo")) >= videos_before + 2, "clips from the moment", 120)
+        presets = telegram_calls("process")[-1]["body"]["preset_clips"]
+        assert [c["what_happened"] for c in presets] == ["the streamer yells at the screen", "chat spams the same joke"]
+        refine = [c["body"] for c in telegram_calls("gemini") if c["body"]["kind"] == "director"][-1]
+        assert "already spotted" in refine["prompt"], refine["prompt"][:400]       # the scan's picks as hints
+        captions = [c["body"]["caption"] for c in telegram_calls("sendVideo")[videos_before:]]
+        assert any("👀 the streamer yells at the screen" in c for c in captions), captions
+        assert any(c["body"]["kind"] == "delete" for c in telegram_calls("gemini"))   # uploads cleaned up
+        print("✓ Gemini watched the moment, OpenShorts cut its picks (preset_clips), clips say what happened")
         press(buttons[0]["callback_data"], "q5")
         wait_for(lambda: [c for c in telegram_calls("answerCallbackQuery") if c["body"]["text"] == "Already queued"],
                  "second 🎬 tap")

@@ -133,9 +133,10 @@ def test_bulk_reject(dash, sample_video):
 def test_jobs_create_cancel_retry(dash):
     login(dash)
     created = dash.post("/api/jobs", json={"url": "https://www.twitch.tv/videos/9", "start": "1:00:00",
-                                           "end": "1:05:00", "clips": 2})
+                                           "end": "1:05:00", "clips": 2, "note": "friend smashes the monitor"})
     assert created.status_code == 201
     job = created.json()
+    assert job["note"] == "friend smashes the monitor" and job["picks"] == []
     assert job["range"] == {"start": 3600.0, "end": 3900.0} and job["status"] == "queued"
     assert dash.app.state.store.get_job(job["id"]).chat_id == 111  # notifications go to your chat
 
@@ -150,11 +151,24 @@ def test_jobs_create_cancel_retry(dash):
     assert dash.post(f"/api/jobs/{job['id']}/cancel").status_code == 409
     retry = dash.post(f"/api/jobs/{job['id']}/retry").json()
     assert retry["retry_of"] == job["id"] and retry["status"] == "queued"
+    assert retry["note"] == "friend smashes the monitor"                     # a retry looks for the same thing
     listed = {j["id"]: j for j in dash.get("/api/jobs").json()["items"]}
     assert listed[job["id"]]["retried_by"] == retry["id"]
     assert dash.post(f"/api/jobs/{retry['id']}/retry").status_code == 409
     detail = dash.get(f"/api/jobs/{job['id']}").json()
     assert any("cancelled" in line["message"] for line in detail["logs"])
+
+    # Delete: failed and cancelled only, one at a time or all at once.
+    assert dash.delete(f"/api/jobs/{retry['id']}").status_code == 409            # still queued
+    assert dash.delete(f"/api/jobs/{job['id']}").json() == {"freed": 0}
+    assert dash.get(f"/api/jobs/{job['id']}").status_code == 404
+    assert dash.get(f"/api/jobs/{retry['id']}").json()["retry_of"] is None
+    store = dash.app.state.store
+    for status in ("failed", "failed", "cancelled", "done"):
+        extra = store.create_job(111, "https://www.twitch.tv/videos/9", None, None, 1)
+        store.update_job(extra.id, status=status)
+    assert dash.post("/api/jobs/clear-failed").json() == {"deleted": 3, "freed": 0}
+    assert sorted(j["status"] for j in dash.get("/api/jobs").json()["items"]) == ["done", "queued"]
 
 
 def test_scan_detail_and_clip_from_timeline(dash):
@@ -162,7 +176,10 @@ def test_scan_detail_and_clip_from_timeline(dash):
     store = dash.app.state.store
     scan = store.create_scan(111, "https://www.twitch.tv/videos/555")
     store.update_scan(scan.id, status="done", title="Big stream", duration=3600.0, signals='["chat 10 msgs"]')
-    moment = store.add_moment(scan.id, 1, 1800, 1710, 1845, 6.2, info={"chat_ratio": 8.0, "loud": True})
+    picks = [{"start": 1760.0, "end": 1790.0, "score": 88, "category": "chaos", "what_happened": "Kevin throws the monitor",
+              "why": "", "hook": "kevin did it", "title": "T", "tiktok": "", "instagram": "", "window": "w1"}]
+    moment = store.add_moment(scan.id, 1, 1800, 1710, 1845, 6.2, info={"chat_ratio": 8.0, "loud": True, "picks": picks,
+                                                                     "what_happened": "Kevin throws the monitor"})
     store.save_timeline(scan.id, {"step": 5, "duration": 3600, "series": {"score": [0, 1, 6.2]}, "markers": []})
 
     data = dash.get(f"/api/scans/{scan.id}").json()
@@ -174,6 +191,12 @@ def test_scan_detail_and_clip_from_timeline(dash):
     job = dash.post(f"/api/scans/{scan.id}/clip", json={"start": 1700, "end": "30:00", "clips": 2,
                                                        "moment_id": moment.id}).json()
     assert job["range"] == {"start": 1700.0, "end": 1800.0} and job["target_clips"] == 2
+    assert job["note"] == "Kevin throws the monitor" and job["picks"] == []        # another range: Gemini picks
+    exact = store.add_moment(scan.id, 2, 2400, 2310, 2445, 5.0, info={"picks": picks})
+    exact_job = dash.post(f"/api/scans/{scan.id}/clip", json={"start": 2310, "end": 2445, "clips": 1,
+                                                             "moment_id": exact.id, "note": " the monitor "}).json()
+    assert exact_job["note"] == "the monitor" and exact_job["picks"] == [{"start": 1760.0, "end": 1790.0, "score": 88,
+                                                              "category": "chaos", "what_happened": "Kevin throws the monitor"}]
     assert dash.get(f"/api/scans/{scan.id}").json()["moments"][0]["job"]["id"] == job["id"]
     assert dash.post(f"/api/scans/{scan.id}/clip", json={"start": 1700, "end": 1800,
                                                         "moment_id": moment.id}).status_code == 409

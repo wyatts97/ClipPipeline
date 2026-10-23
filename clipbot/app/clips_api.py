@@ -25,6 +25,7 @@ class ClipMarker:
     t: float          # where the clip starts, seconds into the VOD
     duration: float
     views: int
+    title: str = ""   # what the viewer called it: often says what happened ("bro smashed the monitor")
 
 
 def _parse_time(value: str) -> datetime:
@@ -68,7 +69,8 @@ async def kick_clip_markers(client: httpx.AsyncClient, slug: str, livestream_id:
             made = (_parse_time(clip["created_at"]) - start).total_seconds()
             duration = float(clip.get("duration") or 30)
             markers.append(ClipMarker(max(0.0, made - duration), duration,
-                                      int(clip.get("view_count") or clip.get("views") or 0)))
+                                      int(clip.get("view_count") or clip.get("views") or 0),
+                                      str(clip.get("title") or "").strip()))
         cursor = data.get("nextCursor")
         if not clips or not cursor or _parse_time(clips[-1]["created_at"]) < start:
             break
@@ -114,7 +116,7 @@ async def twitch_clip_markers(client: httpx.AsyncClient, vod_id: str, client_id:
         for clip in body.get("data") or []:
             if str(clip.get("video_id")) == str(vod_id) and clip.get("vod_offset") is not None:
                 markers.append(ClipMarker(float(clip["vod_offset"]), float(clip.get("duration") or 30),
-                                          int(clip.get("view_count") or 0)))
+                                          int(clip.get("view_count") or 0), str(clip.get("title") or "").strip()))
         cursor = (body.get("pagination") or {}).get("cursor")
         if not cursor:
             break

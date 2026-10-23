@@ -246,7 +246,7 @@ def test_hook_api(dash, monkeypatch):
     assert dash.post(f"/api/clips/{clip.id}/hook-suggestions").status_code == 503      # no Gemini key
     dash.app.state.settings = dataclasses.replace(dash.app.state.settings, gemini_api_key="g")
 
-    async def ideas(settings, words, title=None, current=None, n=5, client=None):
+    async def ideas(settings, words, title=None, current=None, n=5, client=None, **context):
         assert current == "Old hook"
         return ["One", "Two"]
 
