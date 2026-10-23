@@ -175,6 +175,8 @@ export interface Streamer {
   check_error: string | null
   created: number
   notes: string
+  /** How its scans rank moments. */
+  mode: ScanMode
   vods: StreamerVod[]
 }
 
@@ -285,8 +287,13 @@ export interface TemplatesResponse {
   auto_hook: boolean
 }
 
+/** How a scan ranks moments: chat, loudness and the rest ("signals"), or the clips viewers made,
+ * most viewed first ("viewers"). */
+export type ScanMode = "signals" | "viewers"
+
 export interface Scan {
   id: string
+  mode: ScanMode
   status: ScanStatus
   source_url: string
   title: string | null
@@ -311,6 +318,8 @@ export interface MomentDetails {
   picks?: MomentPick[]
   what_happened?: string
   director_score?: number
+  /** "viewers": a moment found from the clips viewers made (its pick is the most viewed one). */
+  source?: "viewers"
 }
 
 export interface Moment {
@@ -329,7 +338,7 @@ export interface Timeline {
   step: number
   duration: number
   series: Partial<Record<"score" | "chat" | "hype" | "audio" | "clips" | "replayed", number[]>>
-  markers: { t: number; duration: number; views: number }[]
+  markers: { t: number; duration: number; views: number; title?: string }[]
 }
 
 export interface ScanDetail extends Scan {
@@ -558,9 +567,9 @@ export const api = {
   renderClip: (id: string, body: { template?: string; sfx?: HandEffect[] }) => post<Clip>(`/api/clips/${id}/render`, body),
 
   streamers: () => request<{ items: Streamer[]; interval_minutes: number }>("/api/streamers"),
-  addStreamer: (body: { url: string; auto_scan: boolean; auto_clip: number; template?: string | null; backfill: number }) =>
+  addStreamer: (body: { url: string; auto_scan: boolean; auto_clip: number; template?: string | null; backfill: number; mode?: ScanMode }) =>
     post<Streamer>("/api/streamers", body),
-  editStreamer: (id: string, body: { auto_scan?: boolean; auto_clip?: number; template?: string; notes?: string }) =>
+  editStreamer: (id: string, body: { auto_scan?: boolean; auto_clip?: number; template?: string; notes?: string; mode?: ScanMode }) =>
     request<Streamer>(`/api/streamers/${id}`, { method: "PATCH", body: JSON.stringify(body) }),
   removeStreamer: (id: string) => request<{ ok: boolean }>(`/api/streamers/${id}`, { method: "DELETE" }),
   refreshStreamer: (id: string) => post<Streamer>(`/api/streamers/${id}/refresh`),
@@ -594,8 +603,11 @@ export const api = {
 
   scans: () => request<{ items: Scan[] }>("/api/scans"),
   scan: (id: string) => request<ScanDetail>(`/api/scans/${id}`),
-  createScan: (url: string) => post<Scan>("/api/scans", { url }),
-  rescan: (id: string) => post<Scan>(`/api/scans/${id}/rescan`),
+  createScan: (url: string, mode: ScanMode = "signals") => post<Scan>("/api/scans", { url, mode }),
+  /** Scan the same VOD again: as it was, or ranked the other way. */
+  rescan: (id: string, mode?: ScanMode) => post<Scan>(`/api/scans/${id}/rescan`, mode ? { mode } : undefined),
+  /** Jobs for the top moments that have none yet, each cut as found. */
+  clipTop: (id: string, count: number) => post<{ jobs: Job[] }>(`/api/scans/${id}/clip-top`, { count }),
   clipFromScan: (id: string, body: { start: number | string; end: number | string; clips: number; moment_id?: string; note?: string }) =>
     post<Job>(`/api/scans/${id}/clip`, body),
 

@@ -157,7 +157,8 @@ MIGRATIONS = (("jobs", "retry_of", "TEXT"), ("moments", "info", "TEXT"), ("jobs"
               ("watches", "auto_scan", "INTEGER NOT NULL DEFAULT 1"),
               ("watches", "auto_clip", "INTEGER NOT NULL DEFAULT 0"),
               ("watches", "template", "TEXT"), ("watches", "checked", "REAL"), ("watches", "check_error", "TEXT"),
-              ("watches", "notes", "TEXT"), ("jobs", "note", "TEXT"), ("jobs", "preset", "TEXT"))
+              ("watches", "notes", "TEXT"), ("jobs", "note", "TEXT"), ("jobs", "preset", "TEXT"),
+              ("scans", "mode", "TEXT"), ("watches", "mode", "TEXT"))
 LOG_KEEP_DAYS = 14
 LOG_KEEP_ROWS = 20000
 
@@ -231,6 +232,7 @@ class Scan:
     created: float
     updated: float
     watch_id: Optional[str] = None   # the streamer whose VOD this is (auto-clip settings)
+    mode: Optional[str] = None       # "viewers": the most-viewed viewer clips first; None: chat, loudness...
 
 
 @dataclass
@@ -296,6 +298,7 @@ class Watch:
     checked: Optional[float] = None    # last time its VOD list was read
     check_error: Optional[str] = None
     notes: Optional[str] = None        # who's who, nicknames, running jokes: the Director reads them
+    mode: Optional[str] = None         # how its scans rank moments ("viewers": viewer clips first)
 
 
 @dataclass
@@ -480,14 +483,15 @@ class Store:
                 (status, path, time.time(), clip_id))
 
     # ---- scans and their moments ----------------------------------------
-    def create_scan(self, chat_id: int, source_url: str, watch_id: Optional[str] = None) -> Scan:
+    def create_scan(self, chat_id: int, source_url: str, watch_id: Optional[str] = None,
+                    mode: Optional[str] = None) -> Scan:
         now = time.time()
-        scan = Scan(new_id(), chat_id, source_url, "queued", None, None, None, None, now, now, watch_id)
+        scan = Scan(new_id(), chat_id, source_url, "queued", None, None, None, None, now, now, watch_id, mode)
         with self._lock:
             self._db.execute(
                 "INSERT INTO scans (id, chat_id, source_url, status, title, duration, signals, error, created, "
-                "updated, watch_id) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (scan.id, chat_id, source_url, "queued", None, None, None, None, now, now, watch_id))
+                "updated, watch_id, mode) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (scan.id, chat_id, source_url, "queued", None, None, None, None, now, now, watch_id, mode))
         return scan
 
     def scans_for_url(self, source_url: str) -> list[Scan]:

@@ -192,7 +192,7 @@ def scan_out(store: Store, scan: Scan) -> dict[str, Any]:
         "id": scan.id, "status": scan.status, "source_url": scan.source_url, "title": scan.title,
         "duration": scan.duration, "error": scan.error, "created": scan.created, "updated": scan.updated,
         "signals": json.loads(scan.signals) if scan.signals else [], "platform": vod.platform,
-        "vod_id": vod.vod_id, "moment_count": len(store.moments_for_scan(scan.id)),
+        "vod_id": vod.vod_id, "moment_count": len(store.moments_for_scan(scan.id)), "mode": scan.mode or "signals",
     }
 
 
@@ -1315,6 +1315,7 @@ class StreamerIn(BaseModel):
     auto_clip: int = 0
     template: Optional[str] = None
     backfill: int = 0             # also scan this many of the latest VODs now
+    mode: Optional[str] = None    # "viewers": its scans put the most-viewed viewer clips first
 
 
 class StreamerEdit(BaseModel):
@@ -1322,6 +1323,7 @@ class StreamerEdit(BaseModel):
     auto_clip: Optional[int] = None
     template: Optional[str] = None    # "" = the default template
     notes: Optional[str] = None       # who's who, nicknames, running jokes ("" = none)
+    mode: Optional[str] = None        # "viewers" or "signals"
 
 
 class BackfillIn(BaseModel):
@@ -1347,7 +1349,7 @@ def streamer_out(store: Store, watch: Watch) -> dict[str, Any]:
             "auto_scan": bool(watch.auto_scan), "auto_clip": watch.auto_clip, "template": watch.template,
             "template_name": (template or {}).get("name"), "checked": watch.checked,
             "check_error": watch.check_error, "created": watch.created, "notes": watch.notes or "",
-            "vods": vods}
+            "mode": watch.mode or "signals", "vods": vods}
 
 
 def _watch_or_404(store: Store, watch_id: str) -> Watch:
@@ -1379,7 +1381,8 @@ async def add_streamer(body: StreamerIn, request: Request):
     template = _check_template(store, body.template)
     scout = request.app.state.scout
     try:
-        watch, _ = await scout.add_streamer(default_chat(settings), channel, body.auto_scan, body.auto_clip, template)
+        watch, _ = await scout.add_streamer(default_chat(settings), channel, body.auto_scan, body.auto_clip, template,
+                                            _mode(body.mode))
     except ValueError as e:
         raise HTTPException(409, str(e))
     except (media.MediaError, httpx.HTTPError) as e:
@@ -1402,6 +1405,8 @@ async def edit_streamer(watch_id: str, body: StreamerEdit, request: Request):
         fields["template"] = _check_template(store, body.template)
     if body.notes is not None:
         fields["notes"] = body.notes.strip()[:2000] or None
+    if body.mode is not None:
+        fields["mode"] = _mode(body.mode)
     if fields:
         store.update_watch(watch_id, **fields)
     return streamer_out(store, store.get_watch(watch_id))
@@ -1448,8 +1453,28 @@ async def scan_streamer_vod(watch_id: str, body: VodScanIn, request: Request):
 
 
 # ---- scans ----------------------------------------------------------------------
+SCAN_MODES = ("signals", "viewers")
+
+
+def _mode(value: Optional[str]) -> Optional[str]:
+    """A scan mode as stored: "viewers" (viewer clips first) or None (chat, loudness...)."""
+    if value is not None and value not in SCAN_MODES:
+        raise HTTPException(422, "The mode is signals or viewers.")
+    return "viewers" if value == "viewers" else None
+
+
 class ScanIn(BaseModel):
     url: str
+    mode: Optional[str] = None     # "viewers": the most-viewed viewer clips first
+
+
+class RescanIn(BaseModel):
+    mode: Optional[str] = None     # None: as the scan was
+
+
+class ClipTopIn(BaseModel):
+    count: int = 5
+    template: Optional[str] = None
 
 
 class ScanClipIn(BaseModel):
@@ -1493,15 +1518,33 @@ async def create_scan(body: ScanIn, request: Request):
     url = body.url.strip()
     if not url.lower().startswith(("http://", "https://")):
         raise HTTPException(422, "Paste a full VOD link starting with https://")
-    scan = request.app.state.scout.queue_scan(default_chat(settings), url)
+    scan = request.app.state.scout.queue_scan(default_chat(settings), url, mode=_mode(body.mode) or "signals")
     return scan_out(store, scan)
 
 
 @router.post("/scans/{scan_id}/rescan", dependencies=authed, status_code=201)
-async def rescan(scan_id: str, request: Request):
+async def rescan(scan_id: str, request: Request, body: Optional[RescanIn] = None):
     store = store_of(request)
     scan = _scan_or_404(store, scan_id)
-    return scan_out(store, request.app.state.scout.queue_scan(scan.chat_id, scan.source_url))
+    mode = _mode(body.mode) if body and body.mode else scan.mode
+    return scan_out(store, request.app.state.scout.queue_scan(scan.chat_id, scan.source_url, scan.watch_id,
+                                                               mode or "signals"))
+
+
+@router.post("/scans/{scan_id}/clip-top", dependencies=authed, status_code=201)
+async def clip_top(scan_id: str, body: ClipTopIn, request: Request):
+    """Clip the scan's top moments that have no job yet, each cut as found."""
+    store = store_of(request)
+    scan = _scan_or_404(store, scan_id)
+    if not 1 <= body.count <= 15:
+        raise HTTPException(422, "Clip between 1 and 15 moments.")
+    if body.template and store.get_template(body.template) is None:
+        raise HTTPException(422, "No such template.")
+    free = [m for m in store.moments_for_scan(scan.id) if not m.job_id][:body.count]
+    if not free:
+        raise HTTPException(409, "Every moment already has a job.")
+    jobs = request.app.state.scout.clip_moments(scan, free, body.template or None)
+    return {"jobs": [job_out(store, job) for _, job in jobs]}
 
 
 @router.post("/scans/{scan_id}/clip", dependencies=authed, status_code=201)

@@ -17,7 +17,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Skeleton } from "@/components/ui/skeleton"
 import { Textarea } from "@/components/ui/textarea"
-import { api, type Streamer, type StreamerVod, type Template } from "@/lib/api"
+import { api, type ScanMode, type Streamer, type StreamerVod, type Template } from "@/lib/api"
 import { ago, tc } from "@/lib/format"
 
 const PLATFORM = { twitch: "Twitch", youtube: "YouTube", kick: "Kick" } as const
@@ -84,12 +84,13 @@ function AddStreamer({ templates }: { templates: Template[] }) {
   const [autoClip, setAutoClip] = useState(0)
   const [template, setTemplate] = useState("")
   const [backfill, setBackfill] = useState(2)
+  const [mode, setMode] = useState<ScanMode>("signals")
   const add = useMutation({
-    mutationFn: () => api.addStreamer({ url, auto_scan: autoScan, auto_clip: autoClip, template: template || null, backfill }),
+    mutationFn: () => api.addStreamer({ url, auto_scan: autoScan, auto_clip: autoClip, template: template || null, backfill, mode }),
     onSuccess: (s) => { toast.success(`Watching ${s.label}`); setUrl(""); refresh() },
   })
   return (
-    <form className="grid grid-cols-1 gap-4 rounded-md border border-border bg-card p-4 md:grid-cols-[minmax(0,2fr)_repeat(3,minmax(0,1fr))_auto] md:items-end"
+    <form className="grid grid-cols-1 gap-4 rounded-md border border-border bg-card p-4 md:grid-cols-[minmax(0,2fr)_repeat(4,minmax(0,1fr))_auto] md:items-end"
       onSubmit={(e) => { e.preventDefault(); if (url.trim()) add.mutate() }}>
       <div className="space-y-1.5">
         <Label htmlFor="streamer-url">Channel</Label>
@@ -108,6 +109,13 @@ function AddStreamer({ templates }: { templates: Template[] }) {
         <NativeSelect id="streamer-autoclip" value={autoClip} onChange={(e) => setAutoClip(Number(e.target.value))}>
           <option value={0}>Off: send moments</option>
           {[1, 2, 3, 5].map((n) => <option key={n} value={n}>Top {n} moment{n > 1 ? "s" : ""}</option>)}
+        </NativeSelect>
+      </div>
+      <div className="space-y-1.5">
+        <Label htmlFor="streamer-mode">Moments first</Label>
+        <NativeSelect id="streamer-mode" value={mode} onChange={(e) => setMode(e.target.value as ScanMode)}>
+          <option value="signals">Chat and loudness</option>
+          <option value="viewers">Viewer clips</option>
         </NativeSelect>
       </div>
       <div className="space-y-1.5">
@@ -179,6 +187,12 @@ function StreamerCard({ streamer: s, templates }: { streamer: Streamer; template
             onChange={(e) => edit.mutate({ id: s.id, body: { auto_clip: Number(e.target.value) } })}>
             <option value={0}>Off</option>
             {[1, 2, 3, 5].map((n) => <option key={n} value={n}>Top {n}</option>)}
+          </NativeSelect>
+          <NativeSelect aria-label="Moments first" className="h-8 w-auto" value={s.mode}
+            title="How its scans rank moments (and what auto-clip clips)"
+            onChange={(e) => edit.mutate({ id: s.id, body: { mode: e.target.value as ScanMode } })}>
+            <option value="signals">Chat and loudness</option>
+            <option value="viewers">Viewer clips first</option>
           </NativeSelect>
           <NativeSelect aria-label="Template" className="h-8 w-auto" value={s.template ?? ""}
             onChange={(e) => edit.mutate({ id: s.id, body: { template: e.target.value } })}>

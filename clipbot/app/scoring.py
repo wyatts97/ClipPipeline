@@ -90,6 +90,7 @@ class Moment:
     top_tokens: list[tuple[str, int]] = field(default_factory=list)
     clip_titles: list[str] = field(default_factory=list)     # viewers' own clips here, most viewed first
     picks: list[dict] = field(default_factory=list)          # the Director's clips here (director.Pick), best first
+    source: str = "signals"                                  # "viewers": found from the clips viewers made
 
     def info(self) -> dict:
         """What's stored with the moment (moments.info) and shown about it."""
@@ -98,6 +99,8 @@ class Moment:
         if self.picks:
             out.update(picks=self.picks, what_happened=self.picks[0]["what_happened"],
                        director_score=self.picks[0]["score"])
+        if self.source != "signals":
+            out["source"] = self.source
         return out
 
 
@@ -238,7 +241,7 @@ def timeline(sig: StreamSignals, scores: Sequence[float], parts: dict[str, list[
         if key in parts and any(parts[key]):
             series[name] = pool(parts[key])
     return {"step": BUCKET * group, "duration": sig.duration, "series": series,
-            "markers": [{"t": m.t, "duration": m.duration, "views": m.views} for m in sig.markers[:500]]}
+            "markers": [{"t": m.t, "duration": m.duration, "views": m.views, "title": m.title} for m in sig.markers[:500]]}
 
 
 def find_moments(sig: StreamSignals, top: int = 5, before: float = 90, after: float = 45,
@@ -273,6 +276,43 @@ def find_moments(sig: StreamSignals, top: int = 5, before: float = 90, after: fl
         inside = [mk for mk in sig.markers if start - 10 <= mk.t <= end]
         moment.clips, moment.clip_views = len(inside), sum(mk.views for mk in inside)
         moment.clip_titles = clip_titles(inside)
+        moments.append(moment)
+    return moments
+
+
+VIEWER_CLIP = "viewer clip"   # the category of a pick that is a clip a viewer made
+
+
+def viewer_moments(markers: Sequence[ClipMarker], duration: float, top: int = 10, min_len: float = 15,
+                   before: float = 10, after: float = 8) -> list[Moment]:
+    """Moments straight from the clips viewers made, most viewed first. Clips of the same moment
+    (overlapping, or less than 10 s apart) count as one, ranked by their views together, then by how
+    many people clipped it. Each moment's pick is its most viewed clip, cut as the viewer made it
+    (at least min_len long); the window around it leaves the Director a little room either side."""
+    groups: list[list[ClipMarker]] = []
+    for mk in sorted((m for m in markers if 0 <= m.t < duration), key=lambda m: m.t):
+        if groups and mk.t <= max(m.t + m.duration for m in groups[-1]) + 10:
+            groups[-1].append(mk)
+        else:
+            groups.append([mk])
+    groups.sort(key=lambda g: (sum(m.views for m in g), len(g)), reverse=True)
+    moments = []
+    for g in groups[:top]:
+        best = max(g, key=lambda m: m.views)
+        start, end = best.t, min(duration, best.t + max(1.0, best.duration))
+        if end - start < min_len:                   # too short for a short: grow it around its middle
+            mid = (start + end) / 2
+            start, end = max(0.0, mid - min_len / 2), min(duration, mid + min_len / 2)
+        views = sum(m.views for m in g)
+        title = " ".join(best.title.split())[:120] or "a clip viewers made"
+        window_start, window_end = max(0.0, start - before), min(duration, end + after)
+        moment = Moment(peak=round(start, 1), start=round(window_start, 1), end=round(window_end, 1),
+                        score=round(1 + math.log10(1 + views), 2), clips=len(g), clip_views=views,
+                        clip_titles=clip_titles(g), source="viewers")
+        moment.picks = [{"start": round(start, 2), "end": round(end, 2),
+                         "score": min(99, 40 + round(15 * math.log10(1 + views))), "category": VIEWER_CLIP,
+                         "what_happened": title, "why": f"{len(g)} viewer clip{'s' if len(g) > 1 else ''}, {views} views",
+                         "hook": title, "title": title, "tiktok": title, "instagram": title, "window": ""}]
         moments.append(moment)
     return moments
 

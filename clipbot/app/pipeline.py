@@ -164,7 +164,7 @@ class Pipeline:
                                                       tmp_dir, self.settings.cookies_file)
                 if self.cancelled(job.id):
                     return
-                presets = await self.direct_job(job, source, tmp_dir / "director")
+                presets = await self.direct_job(job, source, tmp_dir / "director") or self.viewer_presets(job)
                 if self.cancelled(job.id):
                     return
                 if presets:
@@ -274,6 +274,16 @@ class Pipeline:
             f"{format_timestamp(p.start + offset)} {p.what_happened[:80]} ({p.score})" for p in picks),
             extra={"job_id": job.id})
         return [preset_clip(p) for p in picks]
+
+    def viewer_presets(self, job: Job) -> Optional[list[dict[str, Any]]]:
+        """Without the Director, a job made from viewer clips cuts each one as the viewer made it (with
+        their title as its copy) instead of letting OpenShorts pick from the transcript."""
+        picks = [director.Pick.from_dict(p) for p in job.preset_picks() if p.get("category") == scoring.VIEWER_CLIP]
+        if not picks:
+            return None
+        offset = job.range_start or 0.0
+        log.info("job %s: cutting %d viewer clip(s) as made", job.id, len(picks), extra={"job_id": job.id})
+        return [preset_clip(p.shifted(-offset)) for p in picks]
 
     def cancelled(self, job_id: str) -> bool:
         job = self.store.get_job(job_id)

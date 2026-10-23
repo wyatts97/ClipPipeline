@@ -44,7 +44,7 @@ https://youtu.be/VIDEO_ID clips=5
 • t=<template> picks the look: captions, music, sound effects (e.g. t=meme). /templates lists them.
 • find: <what happens> at the end tells Gemini what to look for in the range (e.g. find: his friend smashes the monitor).
 
-🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips; Gemini watches each) and sends each with a 🎬 button.
+🔎 /scan <VOD link> finds a stream's best moments (chat spikes, hype, loudness, viewer clips; Gemini watches each) and sends each with a 🎬 button. /scan <VOD link> viewers puts the most-viewed clips viewers made first.
 👀 /watch <channel link> scans every new VOD when the stream ends. /watching lists them, /unwatch <channel> stops.
 📋 /status lists your recent jobs and scans.
 🧹 /cleanup offers to delete the sources and leftovers of finished jobs.
@@ -194,9 +194,12 @@ async def handle_message(app: FastAPI, settings: Settings, chat_id: int, text: s
             lines.append(line)
         return "Recent:\n" + "\n".join(lines)
     if cmd.kind == "scan":
-        scan = scout.queue_scan(chat_id, cmd.url)
+        scan = scout.queue_scan(chat_id, cmd.url, mode=cmd.arg or "signals")
         waiting = len(store.scans_with_status("queued", "running"))
         ahead = f" {waiting - 1} scan(s) ahead of it." if waiting > 1 else ""
+        if cmd.arg == "viewers":
+            return (f"🔎 Scan {scan.id} queued.{ahead} The clips viewers made come first, most viewed first; "
+                    "🎬 clips one as they made it. Chat and loudness fill in if there are few.")
         return (f"🔎 Scan {scan.id} queued.{ahead} I'll read the chat replay, loudness and viewer clips, "
                 "then send the top moments. A long stream takes a few minutes.")
     if cmd.kind == "watch":

@@ -25,7 +25,7 @@ from .media import MediaError
 from .parsing import format_timestamp as ts
 from .platforms import (Channel, LatestVod, Vod, detect_channel, detect_vod, list_vods,
                         timestamp_link)
-from .scoring import Moment, StreamSignals, chat_sample, find_moments, score, timeline
+from .scoring import Moment, StreamSignals, chat_sample, find_moments, score, timeline, viewer_moments
 from .store import Scan, Store, Watch
 
 log = logging.getLogger("clipbot.scout")
@@ -40,6 +40,13 @@ def _views(n: int) -> str:
 
 
 def moment_text(rank: int, vod: Vod, m: Moment) -> str:
+    if m.source == "viewers":
+        lines = [f"#{rank} ✂️ “{m.picks[0]['what_happened']}”  at {ts(m.picks[0]['start'])}",
+                 f"{m.clips} viewer clip{'s' if m.clips > 1 else ''} · {_views(m.clip_views)} views"]
+        if len(m.clip_titles) > 1:
+            lines.append("Also called: " + ", ".join(f"“{t}”" for t in m.clip_titles[1:3]))
+        lines.append(f"▶️ {timestamp_link(vod, m.start)}")
+        return "\n".join(lines)
     details = []
     if m.chat_ratio is not None:
         details.append(f"chat {m.chat_ratio:g}× normal")
@@ -101,8 +108,12 @@ class Scout:
         self.store.enqueue_event({"event": "message", "chat_id": chat_id, "text": text})
 
     # ---- scanning ------------------------------------------------------------
-    def queue_scan(self, chat_id: int, url: str, watch_id: Optional[str] = None) -> Scan:
-        scan = self.store.create_scan(chat_id, url, watch_id)
+    def queue_scan(self, chat_id: int, url: str, watch_id: Optional[str] = None, mode: Optional[str] = None) -> Scan:
+        """mode "viewers": the most-viewed viewer clips first (a streamer's scans use its own setting)."""
+        watch = self.store.get_watch(watch_id) if mode is None else None
+        if watch:
+            mode = watch.mode
+        scan =self.store.create_scan(chat_id, url, watch_id, mode if mode == "viewers" else None)
         self.wake()
         return scan
 
@@ -138,10 +149,18 @@ class Scout:
             if not (sig.messages or sig.loudness_db or sig.markers or sig.heatmap):
                 raise ScanError("no signal could be read (" + "; ".join(notes) + ").")
             scored = score(sig)
-            directing = bool(s.director and s.gemini_api_key)
+            self.store.save_timeline(scan.id, timeline(sig, *scored))
+            viewers = []
+            if scan.mode == "viewers":
+                viewers = viewer_moments(sig.markers, duration, top=s.scan_top, min_len=s.clip_min_seconds)
+                notes.append(f"viewer clips first: {len(viewers)} moment(s) from viewer clips" if viewers
+                             else "viewer clips first, but there were none, so chat and loudness picked")
+            # Viewers already chose their moments: only the rest (if any) is found and watched as usual.
+            directing = bool(s.director and s.gemini_api_key) and len(viewers) < s.scan_top
             moments = find_moments(sig, top=s.scan_candidates if directing else s.scan_top,
                                    before=s.scan_before_seconds, after=s.scan_after_seconds, scored=scored)
-            self.store.save_timeline(scan.id, timeline(sig, *scored))
+            if viewers:
+                moments = [m for m in moments if not any(m.start < v.end and v.start < m.end for v in viewers)]
             if directing and moments:
                 try:
                     watched = len(moments)
@@ -151,6 +170,7 @@ class Scout:
                     log.warning("scan %s: the Director failed: %s", scan.id, e, extra={"scan_id": scan.id})
                     notes.append(f"Gemini skipped ({'quota used up' if isinstance(e, QuotaExhausted) else str(e)[:120]})")
                     moments = moments[:s.scan_top]
+            moments = (viewers + moments)[:s.scan_top]
         except (ScanError, MediaError, httpx.HTTPError, KeyError, ValueError) as e:
             log.warning("scan %s failed: %s", scan.id, e, extra={"scan_id": scan.id})
             self.store.update_scan(scan.id, status="failed", error=str(e)[:2000])
@@ -184,21 +204,29 @@ class Scout:
         watch = self.store.get_watch(scan.watch_id)
         if not watch or watch.auto_clip <= 0 or not rows:
             return []
-        jobs = []
-        for row in rows[:watch.auto_clip]:
-            picks = row.details.get("picks") or None
-            job = self.store.create_job(scan.chat_id, scan.source_url, row.start, row.end,
-                                        len(picks) if picks else self.settings.scan_clips_per_moment,
-                                        template=watch.template, preset=picks)
-            self.store.claim_moment(row.id, job.id)
-            jobs.append((row.rank, job))
-        self.pipeline.wake()
+        jobs = self.clip_moments(scan, rows[:watch.auto_clip], watch.template)
         self._event(scan.chat_id, f"🤖 Auto-clipping the top {len(jobs)} moment(s) for "
                                   f"{watch.platform}/{watch.channel}: "
                                   + ", ".join(f"#{rank} → job {job.id}" for rank, job in jobs)
                                   + ". The clips arrive here when they're done.")
         log.info("scan %s: auto-clipping %d moment(s)", scan.id, len(jobs), extra={"scan_id": scan.id})
         return [job for _, job in jobs]
+
+    def clip_moments(self, scan: Scan, rows: list, template: Optional[str] = None) -> list:
+        """A job for each moment that has none yet, cut as found (its picks); [(rank, job)]."""
+        jobs = []
+        for row in rows:
+            if row.job_id:
+                continue
+            picks = row.details.get("picks") or None
+            job = self.store.create_job(scan.chat_id, scan.source_url, row.start, row.end,
+                                        len(picks) if picks else self.settings.scan_clips_per_moment,
+                                        template=template, preset=picks)
+            self.store.claim_moment(row.id, job.id)
+            jobs.append((row.rank, job))
+        if jobs:
+            self.pipeline.wake()
+        return jobs
 
     async def direct_scan(self, scan: Scan, title: str, sig: StreamSignals, moments: list[Moment],
                           work) -> list[Moment]:
@@ -324,7 +352,7 @@ class Scout:
 
     # ---- watching -------------------------------------------------------------
     async def add_streamer(self, chat_id: int, channel: Channel, auto_scan: bool = True, auto_clip: int = 0,
-                           template: Optional[str] = None) -> tuple[Watch, Optional[LatestVod]]:
+                           template: Optional[str] = None, mode: Optional[str] = None) -> tuple[Watch, Optional[LatestVod]]:
         """Watch a channel. Raises ValueError when it's watched already, and the listing errors."""
         vods = await list_vods(channel, self.http)
         latest = vods[0] if vods else None
@@ -334,7 +362,8 @@ class Scout:
         if not watch:
             raise ValueError(f"Already watching {channel.label}.")
         self.store.update_watch(watch.id, auto_scan=int(auto_scan), auto_clip=max(0, min(10, auto_clip)),
-                                template=template, checked=time.time(), check_error=None)
+                                template=template, checked=time.time(), check_error=None,
+                                mode="viewers" if mode == "viewers" else None)
         self.store.save_vods(watch.id, vods)
         if latest:
             # Remember its length: if it grows by the next check, it was live and gets scanned too.
@@ -360,7 +389,7 @@ class Scout:
                 break
             if vod.live or any(s.status != "failed" for s in self.store.scans_for_url(vod.url)):
                 continue
-            scans.append(self.queue_scan(watch.chat_id, vod.url, watch.id))
+            scans.append(self.queue_scan(watch.chat_id, vod.url, watch.id, watch.mode))
         return scans
 
     async def add_watch(self, chat_id: int, text: str) -> str:
@@ -430,7 +459,7 @@ class Scout:
         if not w.auto_scan:
             log.info("watch %s: new VOD %s (auto-scan is off)", channel.label, latest.url)
             return None
-        scan = self.queue_scan(w.chat_id, latest.url, w.id)
+        scan = self.queue_scan(w.chat_id, latest.url, w.id, w.mode)
         self._event(w.chat_id, f"📺 {channel.label} finished a {ts(latest.duration or 0)} stream. "
                                f"Scanning it (scan {scan.id})…\n{latest.url}")
         return scan

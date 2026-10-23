@@ -35,7 +35,7 @@ from app.openshorts import OpenShorts  # noqa: E402
 from app.platforms import LatestVod  # noqa: E402
 from app.postiz import Postiz  # noqa: E402
 from app.publisher import Publisher  # noqa: E402
-from app.scoring import StreamSignals, find_moments, score, timeline  # noqa: E402
+from app.scoring import StreamSignals, find_moments, score, timeline, viewer_moments  # noqa: E402
 from app.store import Store  # noqa: E402
 
 DATA = Path(__file__).with_name(".data")
@@ -82,7 +82,8 @@ def synthetic_stream(duration: int) -> StreamSignals:
     for at in (2270, 6715, 9425):
         for s in range(at, at + 9):
             loud[s] = -9 + rng.random()
-    markers = [ClipMarker(2262, 30, 4100), ClipMarker(2275, 25, 380), ClipMarker(6700, 30, 1250), ClipMarker(9410, 28, 90)]
+    markers = [ClipMarker(2262, 30, 4100, "he really rage quit"), ClipMarker(2275, 25, 380, "NO WAY"),
+               ClipMarker(6700, 30, 1250, "boss one-shot him"), ClipMarker(9410, 28, 90, "wifi died lol")]
     return StreamSignals(duration, messages=msgs, loudness_db=loud, markers=markers)
 
 
@@ -213,6 +214,14 @@ async def seed(settings: Settings) -> None:
         if rank == 1:
             store.claim_moment(row.id, done.id)
     store.save_timeline(scan.id, timeline(sig, *scored))
+    # The same stream scanned with viewer clips first.
+    viewers = store.create_scan(CHAT, vod, mode="viewers")
+    store.update_scan(viewers.id, status="done", title="VALOR MORTIS! Enshrouded starts SOON (After Valor Mortis!)",
+                      duration=float(sig.duration),
+                      signals='["chat 9,812 msgs", "audio", "4 viewer clips", "viewer clips first: 3 moment(s) from viewer clips"]')
+    for rank, m in enumerate(viewer_moments(sig.markers, sig.duration), 1):
+        store.add_moment(viewers.id, rank, m.peak, m.start, m.end, m.score, info=m.info())
+    store.save_timeline(viewers.id, timeline(sig, *scored))
     running = store.create_scan(CHAT, "https://www.youtube.com/watch?v=zn1dXa6W7t4")
     store.update_scan(running.id, status="running")
     bad = store.create_scan(CHAT, "https://kick.com/somebody/videos/11111111-2222-3333-4444-555555555555")

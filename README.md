@@ -194,7 +194,7 @@ From now on the bot ignores every other chat.
 | **Editor** | Review → **Open the editor**: a timeline with the waveform, cuts, captions, sound effects and zooms over a live preview ([below](#clip-editor)). |
 | **Templates** | Your templates with a live caption preview, an editor (font, colors, effect, words per line, music, sound effects, credit line), and the sound and font library: upload, play, delete. |
 | **Jobs** | Every job with status, source, range and clip count. Open one for its error, live OpenShorts log, clipbot log, what Gemini picked and the clips it made; retry failed or cancelled jobs, cancel running ones, delete failed and cancelled ones (🗑 per job, or **Clear failed**). **New job** takes a link plus optional in/out timecodes and what to look for. |
-| **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, template, and **notes for clipping** (who's who, nicknames, running jokes) that Gemini reads for every clip. |
+| **Streamers** | The channels you clip and their latest VODs: scanned or not (with the moments found), live ones, **Scan** per VOD, **Scan the latest N**, and per streamer: scan new streams on/off, auto-clip the top N moments, **moments first** (chat and loudness, or viewer clips), template, and **notes for clipping** (who's who, nicknames, running jokes) that Gemini reads for every clip. |
 | **Scans** | The stream as a heat timeline: the score climbs from indigo to amber, with chat, hype, loudness and viewer-clip lanes below and the ranked moments marked. Click a moment, click anywhere to drop a 2:15 window, or drag to choose your own in/out (20 s or longer), pick how many clips (1–5, or type up to 15), then **Clip this range**. Each moment also has **Clip it**, **Wider ×2** and **Watch** (opens the VOD at that point). |
 | **Publishing** | What's scheduled and when, per channel, with **Post now**, **Move** and **Unschedule**; clips that failed to schedule (with the reason and **Retry**); approved clips that aren't scheduled; posted clips with links. |
 | **Storage** | Free disk, what takes the space, and every job with files left: **Delete files** per job or **Clean up finished jobs**. |
@@ -213,6 +213,7 @@ in `ALLOWED_CHAT_IDS`). Signing in lasts 30 days; changing `DASHBOARD_PASSWORD` 
 | `<link> 1:02:00-1:12:00 find: his friend smashes the monitor` | What to look for: Gemini watches the range for it (the rest of the message after `find:`) |
 | `<link> t=meme` | Use that template instead of the default ([templates](#templates-captions-music-and-sound-effects)) |
 | `/scan <VOD link>` | Finds the stream's best moments and sends each with 🎬 buttons ([below](#finding-moments-scan-and-watch)) |
+| `/scan <VOD link> viewers` | The same, with the clips viewers made first, most viewed first ([viewer clips first](#viewer-clips-first)) |
 | `/watch <channel link>` | Scans every new VOD of that channel when the stream ends |
 | `/watching`, `/unwatch <channel>` | List / stop watched channels |
 | `/status` | Your recent jobs and scans |
@@ -311,12 +312,35 @@ The dashboard's **Streamers** page does the same with more control. Add a channe
   jobs by themselves, in the template you pick. The clips arrive in Telegram and Review like any
   other, so the whole stream → clips step needs no taps.
 - **Scan new streams:** switch it off to only list the VODs and scan by hand.
+- **Moments first:** chat and loudness (the default), or **viewer clips**: its scans, and so its
+  auto-clip, put the most-viewed clips viewers made first (see below).
 
 The VOD list refreshes every check (or **Check now**); each VOD shows whether it's live, scanned
 (click through to its moments) or not.
 
 Limits: sub-only Twitch VODs have no public chat (the scan says "chat unavailable" and uses the rest).
 Kick's `?t=` links may open at the start of the VOD.
+
+### Viewer clips first
+
+People clip what was actually funny, so a scan can rank moments by the clips viewers made instead:
+`/scan <VOD link> viewers`, **✂️ Viewer clips** in the dashboard's **New scan**, **✂️ Viewer clips
+first** on a finished scan (scans it again that way), or **Moments first: viewer clips** for a
+streamer.
+
+- Clips of the same moment (overlapping, or less than 10 s apart) count as one, ranked by their views
+  together, then by how many people clipped it. Each moment shows what viewers called it:
+  `#1 ✂️ “he smashed the monitor”  at 2:30:12 · 3 viewer clips · 4.1k views`.
+- **🎬 Clip it** clips that moment's most viewed clip. With Gemini on, it trims it and writes the
+  hook, title and captions, with the viewer's title as a hint; without, the clip is cut exactly as
+  the viewer made it, with their title as its copy.
+- If the stream has fewer than `SCAN_TOP` clipped moments, chat and loudness fill the rest (watched
+  by Gemini as usual). With none at all, the scan says so and ranks by chat and loudness.
+- **Clip them** above the moments queues the top N (that have no job yet) in one go; a streamer's
+  auto-clip does the same by itself.
+
+Twitch needs `TWITCH_CLIENT_ID` and `TWITCH_CLIENT_SECRET` (a free app at dev.twitch.tv/console/apps)
+and only sees clips made while the VOD exists; Kick works without a key. YouTube has no viewer clips.
 
 ## Clip editor
 

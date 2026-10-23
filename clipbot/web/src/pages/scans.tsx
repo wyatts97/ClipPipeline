@@ -12,7 +12,8 @@ import { Dialog, DialogContent, DialogDescription, DialogFooter, DialogHeader, D
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { ToggleGroup, ToggleGroupItem } from "@/components/ui/toggle-group"
-import { api, type Moment, type Scan, type ScanDetail } from "@/lib/api"
+import { NativeSelect } from "@/components/native-select"
+import { api, type Moment, type Scan, type ScanDetail, type ScanMode } from "@/lib/api"
 import { ago, parseTc, platformName, sourceLabel, tc, timestampLink } from "@/lib/format"
 
 export function ScansPage() {
@@ -83,7 +84,7 @@ function ScanView({ scanId }: { scanId: string }) {
   useEffect(() => { setSelection(null); setActiveMoment(null) }, [scanId])
 
   const rescan = useMutation({
-    mutationFn: () => api.rescan(scanId),
+    mutationFn: (mode?: ScanMode) => api.rescan(scanId, mode),
     onSuccess: (s) => {
       toast.success(`Scan ${s.id} queued`)
       qc.invalidateQueries({ queryKey: ["scans"] })
@@ -110,8 +111,15 @@ function ScanView({ scanId }: { scanId: string }) {
           {d.signals.length > 0 && (
             <p className="mt-1 text-sm text-muted-foreground">Read from {d.signals.join(", ")}</p>
           )}
+          {d.mode === "viewers" && <p className="mt-1 text-sm text-primary">✂️ Viewer clips first: the clips viewers made, most viewed first</p>}
         </div>
-        <Button variant="outline" onClick={() => rescan.mutate()} disabled={rescan.isPending || isActive(d.status)}>Scan again</Button>
+        <div className="flex flex-wrap gap-2">
+          <Button variant="ghost" onClick={() => rescan.mutate(d.mode === "viewers" ? "signals" : "viewers")} disabled={rescan.isPending || isActive(d.status)}
+            title={d.mode === "viewers" ? "Scan again, ranked by chat and loudness" : "Scan again with the most-viewed viewer clips first"}>
+            {d.mode === "viewers" ? "Rank by chat instead" : "✂️ Viewer clips first"}
+          </Button>
+          <Button variant="outline" onClick={() => rescan.mutate(undefined)} disabled={rescan.isPending || isActive(d.status)}>Scan again</Button>
+        </div>
       </header>
 
       {isActive(d.status) && (
@@ -248,13 +256,36 @@ function SelectionPanel({ scan, selection, setSelection, moment }: {
 }
 
 function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMoment: string | null; onPick: (m: Moment) => void }) {
+  const qc = useQueryClient()
   const clip = useClipFromScan(scan.id)
+  const free = scan.moments.filter((m) => !m.job).length
+  const [count, setCount] = useState(3)
+  const top = useMutation({
+    mutationFn: () => api.clipTop(scan.id, Math.min(count, free)),
+    onSuccess: (r) => {
+      toast.success(`${r.jobs.length} job${r.jobs.length > 1 ? "s" : ""} queued`)
+      qc.invalidateQueries({ queryKey: ["scan", scan.id] })
+      qc.invalidateQueries({ queryKey: ["jobs"] })
+    },
+    onError: (e) => toast.error(e.message),
+  })
   if (!scan.moments.length) {
     return <p className="text-sm text-muted-foreground">Nothing stood out above this stream's normal level. Drag on the timeline to clip a range yourself.</p>
   }
   return (
     <section>
-      <h3 className="mb-2 font-medium">Top moments</h3>
+      <div className="mb-2 flex flex-wrap items-center gap-2">
+        <h3 className="mr-auto font-medium">Top moments</h3>
+        {free > 0 && (
+          <>
+            <NativeSelect aria-label="How many to clip" className="h-8 w-auto" value={Math.min(count, free)} onChange={(e) => setCount(Number(e.target.value))}>
+              {[...new Set([1, 2, 3, 5, 10, free])].filter((n) => n <= free).sort((a, b) => a - b)
+                .map((n) => <option key={n} value={n}>{n === free && n > 1 ? `All ${n}` : `Top ${n}`}</option>)}
+            </NativeSelect>
+            <Button size="sm" variant="outline" disabled={top.isPending} onClick={() => top.mutate()}>Clip them</Button>
+          </>
+        )}
+      </div>
       <ol className="divide-y divide-border rounded-md border border-border bg-card">
         {scan.moments.map((m) => {
           const d = m.details
@@ -273,7 +304,14 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                 {m.rank}
               </button>
               <div className="min-w-0 text-sm">
-                {d.what_happened && (
+                {d.source === "viewers" ? (
+                  <p className="mb-0.5 font-medium">
+                    ✂️ “{d.what_happened}”
+                    <span className="ml-2 font-normal text-muted-foreground tabular-nums">
+                      {d.clips} viewer clip{(d.clips ?? 0) > 1 ? "s" : ""} · {views(d.clip_views ?? 0)} views
+                    </span>
+                  </p>
+                ) : d.what_happened && (
                   <p className="mb-0.5 font-medium">
                     {d.what_happened}
                     <span className="ml-2 font-normal text-muted-foreground tabular-nums" title="How well Gemini thinks it would do (0-100)">
@@ -285,11 +323,15 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                   Peak at <span className="timecode font-medium">{tc(m.peak)}</span>
                   <span className="ml-2 text-muted-foreground timecode">window {tc(m.start)}–{tc(m.end)}</span>
                 </button>
-                <p className="mt-0.5 text-muted-foreground">
+                <p className={cn("mt-0.5 text-muted-foreground", d.source === "viewers" && "hidden")}>
                   {reasons.join(", ")}
                   {d.top_tokens?.length ? <span className="ml-2 text-foreground/80">“{d.top_tokens.map(([t, n]) => `${t} ×${n}`).join("  ")}”</span> : null}
                 </p>
-                {d.clip_titles?.length ? (
+                {d.source === "viewers" ? (
+                  (d.clip_titles?.length ?? 0) > 1 && (
+                    <p className="mt-0.5 truncate text-xs text-muted-foreground">Also called: {d.clip_titles!.slice(1).map((t) => `“${t}”`).join(", ")}</p>
+                  )
+                ) : d.clip_titles?.length ? (
                   <p className="mt-0.5 truncate text-xs text-muted-foreground">Viewers clipped it as: {d.clip_titles.map((t) => `“${t}”`).join(", ")}</p>
                 ) : null}
               </div>
@@ -299,6 +341,7 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
                 ) : (
                   <>
                     <Button size="sm" disabled={clip.isPending}
+                      title={d.source === "viewers" ? "The most viewed viewer clip here, trimmed by Gemini (as made without it)" : undefined}
                       onClick={() => clip.mutate({ start: m.start, end: m.end, clips: d.picks?.length || 1, moment_id: m.id })}>Clip it</Button>
                     <Button size="sm" variant="outline" disabled={clip.isPending}
                       onClick={() => clip.mutate({ start: Math.max(0, m.start - 60), end: Math.min(scan.duration ?? m.end + 60, m.end + 60), clips: 2, moment_id: m.id })}>
@@ -318,12 +361,15 @@ function Moments({ scan, activeMoment, onPick }: { scan: ScanDetail; activeMomen
   )
 }
 
+const views = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
+
 function NewScanDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   const qc = useQueryClient()
   const navigate = useNavigate()
   const [url, setUrl] = useState("")
+  const [mode, setMode] = useState<ScanMode>("signals")
   const create = useMutation({
-    mutationFn: () => api.createScan(url),
+    mutationFn: () => api.createScan(url, mode),
     onSuccess: (scan) => {
       toast.success(`Scan ${scan.id} queued`)
       qc.invalidateQueries({ queryKey: ["scans"] })
@@ -339,9 +385,23 @@ function NewScanDialog({ open, onOpenChange }: { open: boolean; onOpenChange: (o
           <DialogTitle>New scan</DialogTitle>
           <DialogDescription>Paste a finished stream: a Twitch or Kick VOD, or a YouTube stream replay.</DialogDescription>
         </DialogHeader>
-        <form id="new-scan" onSubmit={(e) => { e.preventDefault(); create.mutate() }} className="space-y-1.5">
-          <Label htmlFor="scan-url">VOD link</Label>
-          <Input id="scan-url" autoFocus placeholder="https://www.twitch.tv/videos/…" value={url} onChange={(e) => setUrl(e.target.value)} />
+        <form id="new-scan" onSubmit={(e) => { e.preventDefault(); create.mutate() }} className="space-y-4">
+          <div className="space-y-1.5">
+            <Label htmlFor="scan-url">VOD link</Label>
+            <Input id="scan-url" autoFocus placeholder="https://www.twitch.tv/videos/…" value={url} onChange={(e) => setUrl(e.target.value)} />
+          </div>
+          <div className="space-y-1.5">
+            <Label>Moments first</Label>
+            <ToggleGroup type="single" variant="outline" size="sm" value={mode} onValueChange={(v) => v && setMode(v as ScanMode)}>
+              <ToggleGroupItem value="signals">Chat and loudness</ToggleGroupItem>
+              <ToggleGroupItem value="viewers">✂️ Viewer clips</ToggleGroupItem>
+            </ToggleGroup>
+            <p className="text-xs text-muted-foreground">
+              {mode === "viewers"
+                ? "The clips viewers made, most viewed first; Clip it cuts each as the viewer did. Twitch needs TWITCH_CLIENT_ID and TWITCH_CLIENT_SECRET; Kick works as is. Chat and loudness fill in when there are few."
+                : "Chat spikes, hype, loudness and viewer clips together; Gemini watches the best."}
+            </p>
+          </div>
         </form>
         <DialogFooter>
           <Button variant="outline" onClick={() => onOpenChange(false)}>Cancel</Button>

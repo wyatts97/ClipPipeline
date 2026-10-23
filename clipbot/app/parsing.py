@@ -4,6 +4,7 @@ Accepted forms (anything else gets the help text):
     /start, /help
     /status
     /scan <url>                   find the best moments of a VOD
+    /scan <url> viewers           ...the clips viewers made first, most viewed first
     /watch <channel>, /unwatch <channel>, /watching
     /cleanup                      offer to delete the files of finished jobs
     /templates                    list the clip templates
@@ -26,6 +27,7 @@ RANGE_RE = re.compile(
     rf"(?<![\w:])({_TIME})\s*(?:-|–|—|to)\s*({_TIME})(?![\w:])", re.IGNORECASE)
 CLIPS_RE = re.compile(r"\b(?:clips?|n)\s*[=:]\s*(\d{1,2})\b", re.IGNORECASE)
 TEMPLATE_RE = re.compile(r"\b(?:t|template|style)\s*[=:]\s*([\w-]{1,40})", re.IGNORECASE)
+VIEWERS_RE = re.compile(r"\b(?:viewers?|viewer[ -]?clips?|vc)\b", re.IGNORECASE)
 NOTE_RE = re.compile(r"\b(?:find|look\s+for|about|note)\s*[=:]\s*(.+)$", re.IGNORECASE | re.DOTALL)
 _HMS_RE = re.compile(r"^(?:(\d+)h)?(?:(\d+)m)?(?:(\d+)s)?$", re.IGNORECASE)
 
@@ -101,7 +103,8 @@ def parse_message(text: str, max_range_minutes: int = 90, min_range_seconds: int
             match = URL_RE.search(arg)
             if not match:
                 return Command("invalid", error="Usage: /scan <VOD link>")
-            return Command("scan", url=_clean_url(match.group(0)))
+            rest = arg[:match.start()] + " " + arg[match.end():]
+            return Command("scan", url=_clean_url(match.group(0)), arg="viewers" if VIEWERS_RE.search(rest) else None)
 
     url_match = URL_RE.search(text)
     if not url_match:

@@ -188,7 +188,9 @@ export function HeatTimeline({ timeline, moments, selection, onSelect, activeMom
             <rect x={LABEL_W} y={laneTop(lanes.length)} width={plotW} height={LANE_H} fill="var(--muted)" />
             {timeline.markers.map((mk, i) => (
               <rect key={i} x={x(mk.t)} y={laneTop(lanes.length)} width={Math.max(2, x(mk.t + mk.duration) - x(mk.t))}
-                height={LANE_H} fill="var(--chart-5)" opacity={Math.min(1, 0.35 + Math.log10(1 + mk.views) / 4)} />
+                height={LANE_H} fill="var(--chart-5)" opacity={Math.min(1, 0.35 + Math.log10(1 + mk.views) / 4)}>
+                <title>{mk.title ? `“${mk.title}” · ` : ""}{mk.views} views · {tc(mk.t)}</title>
+              </rect>
             ))}
           </g>
         )}
